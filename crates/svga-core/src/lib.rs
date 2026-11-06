@@ -7,7 +7,9 @@
 pub mod command;
 pub mod decode;
 pub mod fifo;
+pub mod regs;
 
 pub use command::Command;
 pub use decode::{Decode, DecodeError, Limits, WordSource, decode};
 pub use fifo::{FifoError, FifoMemory, Pass, Snapshot, StopReason, run};
+pub use regs::{Config, Effect, Mode, Registers};

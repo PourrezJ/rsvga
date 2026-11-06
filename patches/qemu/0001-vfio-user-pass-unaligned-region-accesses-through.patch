@@ -1,0 +1,96 @@
+From: rsvga
+Subject: [PATCH] vfio-user: pass unaligned region accesses through
+
+Some device interfaces rely on unaligned accesses. The VMware SVGA II
+register interface is the prominent example: drivers select a register
+with a 32-bit write to I/O BAR offset 0, then read or write its value
+with a 32-bit access at offset 1. QEMU's own vmware-svga device accepts
+this (vmsvga_io_ops sets .unaligned = true), but vfio_region_ops does
+not, so memory_region_access_valid() rejects the value access and a
+vfio-user server emulating such a device never sees it.
+
+A vfio-user server receives each access as an (offset, size) pair and
+can decode it however the device requires, so let the socket backend
+declare a new VFIO_IO_CAP_UNALIGNED capability and use region ops that
+accept unaligned accesses and forward them as a single access. The
+kernel vfio backend does not set the capability: its behaviour is
+unchanged.
+
+Tested with QEMU 11.1.2 and rsvga (an out-of-process VMware SVGA II
+device): register reads through the value port return the device's
+values instead of being dropped.
+
+diff --git a/hw/vfio-user/device.c b/hw/vfio-user/device.c
+index 1a01e748cd43..11ba4e05489c 100644
+--- a/hw/vfio-user/device.c
++++ b/hw/vfio-user/device.c
+@@ -519,6 +519,8 @@ static int vfio_user_device_io_region_write(VFIODevice *vbasedev, uint8_t index,
+  * Socket-based io_ops
+  */
+ VFIODeviceIOOps vfio_user_device_io_ops_sock = {
++    /* The server receives each access's offset and size verbatim. */
++    .capabilities = VFIO_IO_CAP_UNALIGNED,
+     .device_feature = vfio_user_device_io_device_feature,
+     .get_region_info = vfio_user_device_io_get_region_info,
+     .get_irq_info = vfio_user_device_io_get_irq_info,
+diff --git a/hw/vfio/region.c b/hw/vfio/region.c
+index 54ad11a6c8ed..06a8d201902d 100644
+--- a/hw/vfio/region.c
++++ b/hw/vfio/region.c
+@@ -149,6 +149,26 @@ static const MemoryRegionOps vfio_region_ops = {
+     },
+ };
+ 
++/*
++ * Same as vfio_region_ops, for backends with VFIO_IO_CAP_UNALIGNED: unaligned
++ * accesses are passed through as a single access instead of being rejected.
++ */
++static const MemoryRegionOps vfio_region_ops_unaligned = {
++    .read = vfio_region_read,
++    .write = vfio_region_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++        .unaligned = true,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++        .unaligned = true,
++    },
++};
++
+ static int vfio_mmap_compare_offset(const void *a, const void *b)
+ {
+     const VFIOMmap *mmap_a = a;
+@@ -249,7 +269,10 @@ int vfio_region_setup(Object *obj, VFIODevice *vbasedev, VFIORegion *region,
+ 
+     if (region->size) {
+         region->mem = g_new0(MemoryRegion, 1);
+-        memory_region_init_io(region->mem, obj, &vfio_region_ops,
++        memory_region_init_io(region->mem, obj,
++                              vbasedev->io_ops->capabilities &
++                              VFIO_IO_CAP_UNALIGNED ?
++                              &vfio_region_ops_unaligned : &vfio_region_ops,
+                               region, name, region->size);
+ 
+         if (!vbasedev->no_mmap &&
+diff --git a/include/hw/vfio/vfio-device.h b/include/hw/vfio/vfio-device.h
+index 8472420d3fac..845b2343eb1d 100644
+--- a/include/hw/vfio/vfio-device.h
++++ b/include/hw/vfio/vfio-device.h
+@@ -176,6 +176,13 @@ extern VFIODeviceList vfio_device_list;
+  * VFIO backend I/O operation capabilities
+  */
+ #define VFIO_IO_CAP_DMA_BUF        (1ULL << 0)
++/*
++ * The backend accepts region accesses at any offset, for any supported size,
++ * and forwards them unchanged.  Some device interfaces rely on unaligned
++ * accesses, e.g. the VMware SVGA II value port at I/O BAR offset 1, which
++ * real devices decode but the generic MemoryRegion code would reject.
++ */
++#define VFIO_IO_CAP_UNALIGNED      (1ULL << 1)
+ 
+ /*
+  * How devices communicate with the server.  The default option is through

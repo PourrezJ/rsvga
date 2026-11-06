@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/svga-proto", "crates/svga-core"]
+members = ["crates/svga-proto", "crates/svga-core", "crates/vfio-user", "crates/rsvga-server"]
 exclude = ["fuzz"]
 
 [workspace.package]

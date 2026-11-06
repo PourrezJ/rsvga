@@ -27,7 +27,8 @@ GPU de l'hôte   : RX 6950 XT, via /dev/dri/renderD*
 | `svga-proto` | Constantes du protocole VMware, transcrites des en-têtes MIT du *SVGA Device Developer Kit*. `no_std`, sans code. | M0 |
 | `svga-core` | Logique pure du périphérique : FIFO, décodage des commandes, registres, objets. Sans I/O et sans `unsafe`. | M0 → M2 |
 | `svga-render` | Moteur Vulkan et traducteur de shaders VGPU10 (bytecode SM4/SM5) vers SPIR-V. | M3 → M4 |
-| `rsvga-server` | Binaire : serveur vfio-user, mmap de la mémoire invitée, IRQ, sandbox, fenêtre. | M1 |
+| `vfio-user` | Protocole vfio-user côté serveur : messages, passage de descripteurs, boucle de requêtes. Sans `unsafe`. | M1 |
+| `rsvga-server` | Binaire : config PCI, BAR partagés (memfd scellés), exécution de la FIFO, capture PNG, fenêtre. Seul `shm.rs` contient de l'`unsafe`. | M1 |
 
 ## Règles de sécurité
 
@@ -45,11 +46,25 @@ GPU de l'hôte   : RX 6950 XT, via /dev/dri/renderD*
 | Jalon | Contenu | Critère de réussite |
 |---|---|---|
 | **M0 : fondations** (fait) | Protocole, FIFO validée, décodeur des commandes 2D et de l'encadrement 3D, tests, fuzzing. | `cargo test` vert, cible de fuzz qui tourne. |
-| **M1 : bureau 2D** | Serveur vfio-user, registres SVGA, VRAM et FIFO en mémoire partagée, mode graphique, `UPDATE` affiché dans une fenêtre. | OVMF puis Windows affichés avec le pilote VMware, en 2D. |
+| **M1 : bureau 2D** (en cours) | Serveur vfio-user, registres SVGA, VRAM et FIFO en mémoire partagée, mode graphique, `UPDATE` affiché dans une fenêtre. | OVMF puis Windows affichés avec le pilote VMware, en 2D. |
 | **M2 : pilote WDDM** | Objets « guest-backed » (MOB, OTables), command buffers, Screen Targets, curseur, fences et IRQ. | Bureau Windows 11 à la résolution native, redimensionnement. |
 | **M3 : 3D de base** | Contexte DX, ressources, vues, clear/copy/draw, traducteur VGPU10 → SPIR-V (VS/PS). | Triangle D3D11, `dxdiag` sans erreur. |
 | **M4 : D3D11 complet** | GS/HS/DS/CS, stream output, requêtes, MSAA, capacités FL 11_0. | 3DMark et jeux DX11. |
 | **M5 : intégration** | Sandbox, patchs QEMU proposés upstream, paquet Debian. | Installation en une commande. |
+
+## État de M1 (2026-11-06)
+
+Testé avec le QEMU 11.1.2 de trixie-backports (extrait localement, sans installation), q35, KVM et OVMF :
+
+- **Ce qui marche** : QEMU se connecte à `rsvga` et négocie la version. Il lit l'espace PCI, assigne les BAR (I/O en 0x6060, VRAM en 0x80000000, FIFO en 0x84000000) et mappe VRAM et FIFO directement dans le guest via KVM (`info mtree` : `ramd ... KVM`). Il partage la RAM du guest (fenêtres DMA avec fd).
+- **Blocage 1, accès non alignés (résolu par patch)** : le protocole SVGA II lit et écrit le port de valeur en `base+1`, en 32 bits, donc non aligné. QEMU rejette ces accès sur les régions vfio, car `vfio_region_ops` (`hw/vfio/region.c`) n'a pas `.valid.unaligned`, alors que sa carte `vmware-svga` intégrée l'a. Vérifié au moniteur : les écritures d'index (alignées) arrivent, celles du port de valeur jamais. Solutions :
+  1. un patch QEMU d'une ligne (`.unaligned = true` pour les régions vfio), à proposer upstream ;
+  2. émuler plutôt **SVGA3** (PCI `15ad:0406`), dont les registres sont en MMIO aligné.
+
+  Vérifié dans VMware Tools 13.1.5 (build 25544008) : l'INF du pilote Windows 10/11 x64 (`vm3d.inf`, 9.17.11.0004) ne déclare que `PCI\VEN_15AD&DEV_0405`. Seul l'ancien paquet Windows 7 (9.17.06.0005, 2023) déclare aussi `DEV_0406`. **Décision : SVGA II d'abord (avec le patch QEMU), SVGA3 ensuite comme second modèle**, utile pour Linux (`vmwgfx` gère les deux) et peut-être pour Windows avec ce vieux pilote. Le cœur reste commun aux deux modèles.
+
+  **Résolu** par [`patches/qemu/0001-vfio-user-pass-unaligned-region-accesses-through.patch`](patches/qemu/0001-vfio-user-pass-unaligned-region-accesses-through.patch) (33 lignes). Le transport vfio-user déclare une nouvelle capacité `VFIO_IO_CAP_UNALIGNED` et ses régions acceptent les accès non alignés ; le vfio du noyau ne change pas. `scripts/build-qemu.sh` construit ce QEMU dans `target/qemu/install`. `scripts/smoke-qemu.py` le vérifie : avec le QEMU non patché, chaque lecture par le port de valeur renvoie 0 ; avec le QEMU patché, l'ID, la VRAM, le changement de mode 800×600×32 et la capture sont corrects.
+- **Blocage 2, firmware** : l'OVMF de Debian (edk2 2025.02) pilote les cartes VMware comme des cartes Bochs, via les ports VBE 0x1CE/0x1CF (`QemuVideoDxe/Driver.c` : « VMWare SVGA is handled like Bochs »). vfio ne transmet pas ces ports. Solution : fournir notre propre pilote GOP UEFI dans la ROM de la carte (région 6 de vfio-user), qui parlera les vrais registres SVGA.
 
 ## Questions ouvertes
 
