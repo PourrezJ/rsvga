@@ -21,7 +21,19 @@ impl Svga {
     /// Copies the visible framebuffer into `frame`. Returns the mode, or
     /// `None` when SVGA mode is off (the frame is left untouched).
     pub fn capture(&self, frame: &mut Frame) -> Option<Mode> {
-        let mode = self.lock().regs.mode()?;
+        let state = self.lock();
+        if state.twod.capture(frame) {
+            // Screen objects replace the legacy framebuffer when defined.
+            return Some(Mode {
+                width: frame.width as u32,
+                height: frame.height as u32,
+                bits_per_pixel: 32,
+                pitch: frame.width as u32 * 4,
+                offset: 0,
+            });
+        }
+        let mode = state.regs.mode()?;
+        drop(state);
         let (width, height) = (mode.width as usize, mode.height as usize);
         frame.width = width;
         frame.height = height;

@@ -6,7 +6,7 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M1 en cours**. Avec le QEMU patché (une petite modification de vfio-user), le firmware UEFI puis Windows 11 s'affichent sur rsvga grâce à son propre pilote UEFI ; le pilote VMware de Windows reste à brancher. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M1 atteint**. Avec le QEMU patché (une petite modification de vfio-user), le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel** (2D, framebuffer, interruptions). Prochaine étape : M2 (Screen Objects, GMR, curseur), puis la 3D. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
@@ -54,6 +54,16 @@ scripts/smoke-qemu.py
 scripts/smoke-qemu.py --firmware
 ```
 
+## Lancer Windows sur rsvga
+
+Une fois QEMU, le pilote UEFI et rsvga (avec fenêtre) construits, `scripts/run-windows.sh` démarre une VM Windows dans la fenêtre de rsvga. Le disque passe toujours par une couche qcow2 temporaire (`target/vm/overlay.qcow2`), si bien que l'image d'origine n'est jamais écrite :
+
+```bash
+scripts/run-windows.sh --disk /chemin/windows.qcow2 --vars /chemin/OVMF_VARS_4M.fd
+```
+
+Le pilote VMware se trouve dans les VMware Tools : il faut extraire `vm3d.inf` et ses fichiers, puis lancer `pnputil /add-driver vm3d.inf /install` dans Windows.
+
 ## Lancer la carte
 
 ```bash
@@ -71,7 +81,17 @@ Côté QEMU, la RAM du guest doit être partagée (memfd), et la carte s'ajoute 
 -device '{"driver":"vfio-user-pci","socket":{"type":"unix","path":"/run/user/1000/rsvga.sock"}}'
 ```
 
-`--window` ouvre une fenêtre (compiler avec `--features window`). `RSVGA_TRACE=1` journalise chaque accès aux registres et à l'espace PCI.
+Fenêtre interactive (compiler avec `--features window`) : `--window` affiche l'écran du guest, et `--qmp CHEMIN` transmet clavier et souris à QEMU par son socket QMP (`-qmp unix:CHEMIN,server=on,wait=off` côté QEMU). Les touches sont envoyées par position physique : un clavier AZERTY sur l'hôte et dans Windows s'accordent touche pour touche. La souris passe en absolu, par une tablette USB (`-device qemu-xhci -device usb-tablet`).
+
+```bash
+cargo build --release -p rsvga-server --features window
+```
+
+```bash
+target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/rsvga-gop.efi --window --qmp $XDG_RUNTIME_DIR/qemu-qmp.sock
+```
+
+`RSVGA_TRACE=1` journalise chaque accès aux registres SVGA (par nom), chaque commande FIFO et, toutes les 5 secondes, l'état de la FIFO ; `RSVGA_TRACE=2` ajoute les accès bruts (espace PCI...).
 
 ## Ce qui existe
 

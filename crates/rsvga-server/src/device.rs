@@ -3,20 +3,35 @@
 
 use std::io;
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::Duration;
 
 use svga_core::command::{Command, Rect};
 use svga_core::{Config, Effect, FifoMemory, Limits, Mode, Registers, Snapshot, StopReason, run};
-use svga_proto::{cap, fifo, fifo_cap, port};
-use vfio_user::wire::{Errno, device_flags, pci_irq, pci_region, region_flags};
+use svga_proto::{cap, fifo, fifo_cap, irq, port};
+use vfio_user::wire::{
+    Errno, device_flags, irq_info_flags, irq_set_flags, pci_irq, pci_region, region_flags,
+};
 use vfio_user::{Device, DeviceInfo, DmaMapping, IrqInfo, IrqSet, RegionInfo};
 
+use crate::guest::GuestMemory;
+use crate::irq::Intx;
 use crate::log;
 use crate::pci::{CONFIG_SIZE, PciConfig};
 use crate::shm::SharedMem;
+use crate::twod::{Memory, TwoD};
 
 /// Device capabilities advertised in `SVGA_REG_CAPABILITIES` (M1: 2D only).
-pub const CAPABILITIES: u32 = cap::RECT_COPY | cap::EXTENDED_FIFO | cap::PITCHLOCK;
+pub const CAPABILITIES: u32 = cap::RECT_COPY | cap::EXTENDED_FIFO | cap::PITCHLOCK | cap::IRQMASK;
+/// GMR limits advertised to the guest (64 regions, 1 GiB of pages).
+pub const GMR_MAX_IDS: u32 = 64;
+/// Total pages across all GMRs.
+pub const GMR_MAX_PAGES: u32 = 256 * 1024;
+/// Guest memory usable through GMRs, in bytes.
+pub const GMR_MEMORY_SIZE: u32 = 1 << 30;
+
 /// FIFO capabilities written into `SVGA_FIFO_CAPABILITIES`.
 pub const FIFO_CAPABILITIES: u32 = fifo_cap::FENCE;
 
@@ -28,11 +43,54 @@ const MAX_PASSES: usize = 64;
 /// Size of the I/O port BAR.
 const IO_BAR_SIZE: u64 = 16;
 
-/// Logs every trapped access when set (`RSVGA_TRACE=1`).
-pub static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Trace level (`RSVGA_TRACE`): 1 logs every SVGA register access by name
+/// and every unsupported FIFO command; 2 also logs raw region accesses.
+pub static TRACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn trace_level() -> u8 {
+    TRACE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn tracing() -> bool {
-    TRACE.load(std::sync::atomic::Ordering::Relaxed)
+    trace_level() >= 2
+}
+
+/// Logs a trace line, folding identical consecutive lines (drivers poll).
+fn trace(line: String) {
+    static LAST: Mutex<(String, u64)> = Mutex::new((String::new(), 0));
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.0 == line {
+        last.1 += 1;
+        return;
+    }
+    if last.1 > 0 {
+        log!("  (previous line repeated {} more times)", last.1);
+    }
+    log!("{line}");
+    *last = (line, 0);
+}
+
+/// Short name of a command, for logs.
+fn command_name(command: &Command) -> String {
+    let text = format!("{command:?}");
+    text.split([' ', '(', '{'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn reg_label(index: u32) -> String {
+    use svga_proto::reg;
+    if let Some(name) = reg::name(index) {
+        return name.to_string();
+    }
+    if let Some(slot) = index.checked_sub(reg::SCRATCH_BASE) {
+        return format!("SCRATCH[{slot}]");
+    }
+    if let Some(slot) = index.checked_sub(reg::PALETTE_BASE) {
+        return format!("PALETTE[{slot}]");
+    }
+    format!("#{index}")
 }
 
 /// Device geometry chosen on the command line.
@@ -59,12 +117,6 @@ pub struct Stats {
     pub unsupported: u64,
 }
 
-struct DmaWindow {
-    address: u64,
-    size: u64,
-    _fd: Option<OwnedFd>,
-}
-
 /// Mutable device state, behind the device lock.
 pub struct State {
     /// The register file.
@@ -72,7 +124,14 @@ pub struct State {
     pci: PciConfig,
     fifo_error: Option<String>,
     last_mode: Option<Mode>,
-    dma: Vec<DmaWindow>,
+    /// Guest RAM shared by QEMU.
+    pub guest: GuestMemory,
+    /// GMRs and screen objects.
+    pub twod: TwoD,
+    /// The INTx line.
+    pub irq: Intx,
+    /// Stops the thread watching QEMU's INTx unmask eventfd.
+    unmask_watch: Option<Arc<AtomicBool>>,
     /// Counters.
     pub stats: Stats,
 }
@@ -124,13 +183,19 @@ impl Svga {
             max_width: opts.max_width,
             max_height: opts.max_height,
             capabilities: CAPABILITIES,
+            gmr_max_ids: GMR_MAX_IDS,
+            gmr_max_pages: GMR_MAX_PAGES,
+            memory_size: GMR_MEMORY_SIZE,
         });
         let state = State {
             regs,
             pci: PciConfig::new(opts.vram_size, opts.fifo_size, rom_bar),
             fifo_error: None,
             last_mode: None,
-            dma: Vec::new(),
+            guest: GuestMemory::default(),
+            twod: TwoD::new(GMR_MAX_IDS, GMR_MAX_PAGES, opts.max_width, opts.max_height),
+            irq: Intx::default(),
+            unmask_watch: None,
             stats: Stats::default(),
         };
         Ok(Arc::new(Self {
@@ -151,6 +216,28 @@ impl Svga {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// One-line summary of the FIFO registers, for traces.
+    pub fn fifo_status(&self) -> String {
+        let r = |i: u32| self.fifo.load_u32(reg_index(i));
+        let state = self.lock();
+        format!(
+            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | commands={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
+            r(fifo::MIN),
+            r(fifo::MAX),
+            r(fifo::NEXT_CMD),
+            r(fifo::STOP),
+            r(fifo::FENCE),
+            r(fifo::BUSY),
+            r(fifo::CAPABILITIES),
+            state.stats.commands,
+            state.fifo_error,
+            state.regs.irq_mask(),
+            state.irq.pending(),
+            state.irq.signals(),
+            state.irq.connected()
+        )
+    }
+
     /// The VRAM, for display.
     pub fn vram(&self) -> &SharedMem {
         &self.vram
@@ -159,12 +246,24 @@ impl Svga {
     fn fail(&self, state: &mut State, reason: String) {
         log!("FIFO stopped: {reason}");
         state.fifo_error = Some(reason);
+        let mask = state.regs.irq_mask();
+        state.irq.raise(irq::ERROR, mask);
     }
 
     fn apply(&self, state: &mut State, effect: Effect) {
         match effect {
-            Effect::None | Effect::IrqAck(_) => {}
+            Effect::None => {}
+            Effect::IrqAck(flags) => {
+                let mask = state.regs.irq_mask();
+                state.irq.ack(flags, mask);
+            }
+            Effect::IrqMask => {
+                let mask = state.regs.irq_mask();
+                state.irq.update(mask);
+            }
             Effect::ModeChanged => {
+                // Writing the legacy mode registers destroys screen objects.
+                state.twod.clear_screens();
                 let mode = state.regs.mode();
                 if mode != state.last_mode {
                     match mode {
@@ -216,8 +315,13 @@ impl Svga {
             let pass = run(&mut view, &self.limits, PASS_BUDGET, |command| {
                 commands.push(command)
             });
+            let progressed = !commands.is_empty();
             for command in commands {
                 self.execute(state, command);
+            }
+            if progressed {
+                let mask = state.regs.irq_mask();
+                state.irq.raise(irq::FIFO_PROGRESS, mask);
             }
             match pass.stop {
                 StopReason::Budget => continue,
@@ -230,6 +334,30 @@ impl Svga {
 
     fn execute(&self, state: &mut State, command: Command) {
         state.stats.commands = state.stats.commands.saturating_add(1);
+        if trace_level() >= 1 {
+            match &command {
+                Command::Fence(value) => trace(format!("FIFO Fence({value:#x})")),
+                other => trace(format!("FIFO {}", command_name(other))),
+            }
+        }
+        let State { twod, guest, .. } = state;
+        match twod.execute(
+            &command,
+            &Memory {
+                guest,
+                vram: &self.vram,
+            },
+        ) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                trace(format!(
+                    "2D command failed: {error} ({})",
+                    command_name(&command)
+                ));
+                return;
+            }
+        }
         match command {
             Command::Update(_) | Command::UpdateVerbose { .. } => {
                 // The display loop refreshes the whole framebuffer anyway.
@@ -242,14 +370,28 @@ impl Svga {
             }
             Command::Fence(value) => {
                 let mut view = FifoView(&self.fifo);
-                if Snapshot::capture(&view).is_ok_and(|snap| snap.has_register(fifo::FENCE)) {
-                    view.store(reg_index(fifo::FENCE), value);
+                let mut flags = irq::ANY_FENCE;
+                if let Ok(snap) = Snapshot::capture(&view) {
+                    if snap.has_register(fifo::FENCE) {
+                        view.store(reg_index(fifo::FENCE), value);
+                    }
+                    if snap.has_register(fifo::FENCE_GOAL)
+                        && view.load(reg_index(fifo::FENCE_GOAL)) == value
+                    {
+                        flags |= irq::FENCE_GOAL;
+                    }
                 }
+                let mask = state.regs.irq_mask();
+                state.irq.raise(flags, mask);
             }
             Command::Nop => {}
             Command::NopError => self.fail(state, "the guest sent NOP_ERROR".into()),
             other => {
-                if state.stats.unsupported == 0 {
+                if trace_level() >= 1 {
+                    let mut text = format!("{other:?}");
+                    text.truncate(240);
+                    trace(format!("FIFO unsupported: {text}"));
+                } else if state.stats.unsupported == 0 {
                     log!(
                         "ignoring unsupported command {other:?} (further ones are counted silently)"
                     );
@@ -291,6 +433,39 @@ impl Svga {
             self.vram.copy_within(src, target, row_bytes);
         }
     }
+}
+
+/// Watches the eventfd KVM signals when the guest EOIs the INTx line, and
+/// unmasks the line each time (re-signalling it if still asserted). Polls
+/// with a timeout so that setting the returned flag stops the thread.
+fn watch_unmask(svga: Arc<Svga>, fd: OwnedFd) -> Arc<AtomicBool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    thread::spawn(move || {
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 100_000_000,
+        };
+        while !flag.load(Ordering::Relaxed) {
+            let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+            match poll(&mut fds, Some(&timeout)) {
+                Ok(0) => {}
+                Ok(_) => {
+                    let mut counter = [0u8; 8];
+                    let _ = rustix::io::read(&fd, &mut counter);
+                    let mut state = svga.lock();
+                    let mask = state.regs.irq_mask();
+                    state.irq.unmask(mask);
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+    stop
 }
 
 /// The vfio-user face of the device.
@@ -342,8 +517,15 @@ impl Device for Handle {
     }
 
     fn irq_info(&self, index: u32) -> Option<IrqInfo> {
-        // No interrupts yet: the drivers poll when SVGA_CAP_IRQMASK is absent.
-        (index < pci_irq::COUNT).then_some(IrqInfo { flags: 0, count: 0 })
+        match index {
+            pci_irq::INTX => Some(IrqInfo {
+                flags: irq_info_flags::EVENTFD
+                    | irq_info_flags::MASKABLE
+                    | irq_info_flags::AUTOMASKED,
+                count: 1,
+            }),
+            _ => (index < pci_irq::COUNT).then_some(IrqInfo { flags: 0, count: 0 }),
+        }
     }
 
     fn region_read(&mut self, region: u32, offset: u64, data: &mut [u8]) -> Result<(), Errno> {
@@ -352,9 +534,14 @@ impl Device for Handle {
             pci_region::BAR0 => {
                 let state = svga.lock();
                 let value = match (offset, data.len()) {
-                    (0 | 1 | 2 | 8, 4) => state.regs.port_read(offset as u16),
+                    (8, 4) => state.irq.pending(),
+                    (0..=2, 4) => state.regs.port_read(offset as u16),
                     _ => u32::MAX,
                 };
+                if trace_level() >= 1 && offset == u64::from(port::VALUE) {
+                    let index = state.regs.port_read(port::INDEX);
+                    trace(format!("reg {} -> {value:#x}", reg_label(index)));
+                }
                 for (byte, value) in data.iter_mut().zip(value.to_le_bytes().into_iter().cycle()) {
                     *byte = value;
                 }
@@ -397,10 +584,18 @@ impl Device for Handle {
             pci_region::BAR0 => {
                 if let (0 | 1 | 2 | 8, Ok(bytes)) = (offset, <[u8; 4]>::try_from(data)) {
                     let mut state = svga.lock();
+                    if trace_level() >= 1 && offset == u64::from(port::VALUE) {
+                        let index = state.regs.port_read(port::INDEX);
+                        trace(format!(
+                            "reg {} <- {:#x}",
+                            reg_label(index),
+                            u32::from_le_bytes(bytes)
+                        ));
+                    }
                     let effect = state
                         .regs
                         .port_write(offset as u16, u32::from_le_bytes(bytes));
-                    if offset == u64::from(port::VALUE) {
+                    if offset == u64::from(port::VALUE) || offset == u64::from(port::IRQ_STATUS) {
                         svga.apply(&mut state, effect);
                     }
                 }
@@ -425,63 +620,106 @@ impl Device for Handle {
     }
 
     fn dma_map(&mut self, mapping: DmaMapping) -> Result<(), Errno> {
-        let end = mapping
-            .address
-            .checked_add(mapping.size)
-            .ok_or(Errno::EINVAL)?;
-        if mapping.size == 0 {
-            return Err(Errno::EINVAL);
-        }
+        let shared = mapping.fd.is_some();
+        let writable = mapping.flags & vfio_user::wire::dma_flags::WRITE != 0;
         let mut state = self.0.lock();
-        let overlaps = state
-            .dma
-            .iter()
-            .any(|w| mapping.address < w.address + w.size && w.address < end);
-        if overlaps {
-            return Err(Errno::EEXIST);
-        }
-        log!(
-            "DMA window {:#x}+{:#x}{}",
+        state.guest.add(
             mapping.address,
             mapping.size,
-            if mapping.fd.is_some() {
-                " (shared)"
-            } else {
-                ""
-            }
-        );
-        state.dma.push(DmaWindow {
-            address: mapping.address,
-            size: mapping.size,
-            _fd: mapping.fd,
-        });
+            mapping.fd,
+            mapping.offset,
+            writable,
+        )?;
+        if trace_level() >= 1 {
+            let kind = if shared { "shared" } else { "not shared" };
+            log!(
+                "DMA window {:#x}+{:#x} ({kind})",
+                mapping.address,
+                mapping.size
+            );
+        }
         Ok(())
     }
 
     fn dma_unmap(&mut self, address: u64, size: u64) -> Result<(), Errno> {
-        let mut state = self.0.lock();
-        let before = state.dma.len();
-        state
-            .dma
-            .retain(|w| !(w.address == address && w.size == size));
-        if state.dma.len() == before {
-            Err(Errno::EINVAL)
-        } else {
+        if self.0.lock().guest.remove(address, size) {
             Ok(())
+        } else {
+            Err(Errno::EINVAL)
         }
     }
 
     fn set_irqs(&mut self, set: IrqSet) -> Result<(), Errno> {
-        if set.count == 0 {
-            Ok(())
-        } else {
-            Err(Errno::EINVAL)
+        use irq_set_flags::{
+            ACTION_MASK, ACTION_TRIGGER, ACTION_UNMASK, DATA_BOOL, DATA_EVENTFD, DATA_NONE,
+        };
+        if set.index != pci_irq::INTX {
+            // Only INTx exists; disabling the others is a no-op.
+            return if set.count == 0 {
+                Ok(())
+            } else {
+                Err(Errno::EINVAL)
+            };
         }
+        if set.start != 0 || set.count > 1 {
+            return Err(Errno::EINVAL);
+        }
+        let data = set.flags & (DATA_NONE | DATA_BOOL | DATA_EVENTFD);
+        let action = set.flags & (ACTION_MASK | ACTION_UNMASK | ACTION_TRIGGER);
+        // DATA_BOOL carries one byte per sub-index: act only if it is set.
+        let selected = match data {
+            DATA_BOOL => set.data.first().is_some_and(|&b| b != 0),
+            _ => set.count == 1,
+        };
+        let mut fds = set.fds.into_iter();
+        let mut state = self.0.lock();
+        let mask = state.regs.irq_mask();
+        match (action, data) {
+            (ACTION_TRIGGER, DATA_EVENTFD) => {
+                let fd = if set.count == 1 {
+                    Some(fds.next().ok_or(Errno::EINVAL)?)
+                } else {
+                    None
+                };
+                if trace_level() >= 1 {
+                    log!(
+                        "INTx trigger eventfd {}",
+                        if fd.is_some() { "connected" } else { "removed" }
+                    );
+                }
+                state.irq.set_trigger(fd, mask);
+            }
+            (ACTION_TRIGGER, DATA_NONE) if set.count == 0 => state.irq.set_trigger(None, mask),
+            (ACTION_TRIGGER, DATA_NONE | DATA_BOOL) => {}
+            (ACTION_MASK, DATA_NONE | DATA_BOOL) => {
+                if selected {
+                    state.irq.mask();
+                }
+            }
+            (ACTION_UNMASK, DATA_NONE | DATA_BOOL) => {
+                if selected {
+                    state.irq.unmask(mask);
+                }
+            }
+            (ACTION_UNMASK, DATA_EVENTFD) => {
+                if let Some(stop) = state.unmask_watch.take() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                if set.count == 1 {
+                    let fd = fds.next().ok_or(Errno::EINVAL)?;
+                    state.unmask_watch = Some(watch_unmask(self.0.clone(), fd));
+                }
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), Errno> {
         let mut state = self.0.lock();
         state.regs.reset();
+        state.irq.reset();
+        state.twod.reset();
         state.fifo_error = None;
         state.last_mode = None;
         log!("device reset");
@@ -632,6 +870,47 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert_eq!(device().region_info(pci_region::ROM).unwrap().size, 0);
+    }
+
+    #[test]
+    fn fences_raise_the_intx_line() {
+        use rustix::event::{EventfdFlags, eventfd};
+        let mut h = device();
+        let fd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+        let trigger = IrqSet {
+            flags: irq_set_flags::ACTION_TRIGGER | irq_set_flags::DATA_EVENTFD,
+            index: pci_irq::INTX,
+            start: 0,
+            count: 1,
+            data: Vec::new(),
+            fds: vec![fd.try_clone().unwrap()],
+        };
+        h.set_irqs(trigger).unwrap();
+        set(&mut h, reg::IRQMASK, irq::ANY_FENCE);
+        enable_fifo(&mut h);
+        push(&h, &[cmd::FENCE, 7]);
+        set(&mut h, reg::SYNC, 1);
+        let mut counter = [0u8; 8];
+        assert_eq!(rustix::io::read(&fd, &mut counter), Ok(8), "line signalled");
+        let mut status = [0u8; 4];
+        h.region_read(0, 8, &mut status).unwrap();
+        assert_eq!(u32::from_le_bytes(status) & irq::ANY_FENCE, irq::ANY_FENCE);
+        // The guest acknowledges; an unmask then finds the line low.
+        h.region_write(0, 8, &irq::ANY_FENCE.to_le_bytes()).unwrap();
+        let unmask = IrqSet {
+            flags: irq_set_flags::ACTION_UNMASK | irq_set_flags::DATA_NONE,
+            index: pci_irq::INTX,
+            start: 0,
+            count: 1,
+            data: Vec::new(),
+            fds: Vec::new(),
+        };
+        h.set_irqs(unmask).unwrap();
+        assert!(
+            rustix::io::read(&fd, &mut counter).is_err(),
+            "no new signal"
+        );
+        assert_eq!(h.irq_info(pci_irq::INTX).unwrap().count, 1);
     }
 
     #[test]

@@ -47,6 +47,7 @@ impl PciConfig {
         space[0..2].copy_from_slice(&VENDOR_ID_VMWARE.to_le_bytes());
         space[2..4].copy_from_slice(&DEVICE_ID_SVGA2.to_le_bytes());
         space[0x0b] = 0x03; // class: display controller, subclass 0 (VGA)
+        space[0x3d] = 0x01; // interrupt pin A
         space[SUBSYSTEM_VENDOR..SUBSYSTEM_VENDOR + 2]
             .copy_from_slice(&VENDOR_ID_VMWARE.to_le_bytes());
         space[SUBSYSTEM_VENDOR + 2..SUBSYSTEM_VENDOR + 4]

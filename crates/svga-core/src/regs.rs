@@ -19,6 +19,13 @@ pub struct Config {
     pub max_height: u32,
     /// Value of [`reg::CAPABILITIES`].
     pub capabilities: u32,
+    /// Value of [`reg::GMR_MAX_IDS`] (0 without GMR support).
+    pub gmr_max_ids: u32,
+    /// Value of [`reg::GMRS_MAX_PAGES`].
+    pub gmr_max_pages: u32,
+    /// Value of [`reg::MEMORY_SIZE`]: guest memory usable through GMRs, in
+    /// bytes.
+    pub memory_size: u32,
 }
 
 /// Number of scratch registers exposed.
@@ -59,6 +66,8 @@ pub enum Effect {
     Sync,
     /// The guest acknowledged IRQ flags (written to the IRQ status port).
     IrqAck(u32),
+    /// The guest changed [`reg::IRQMASK`].
+    IrqMask,
 }
 
 /// The register file.
@@ -126,6 +135,11 @@ impl Registers {
     pub fn set_bar_addresses(&mut self, vram: u32, fifo: u32) {
         self.fb_start = vram;
         self.mem_start = fifo;
+    }
+
+    /// Interrupt sources the guest enabled ([`reg::IRQMASK`]).
+    pub fn irq_mask(&self) -> u32 {
+        self.irq_mask
     }
 
     /// Whether the guest enabled SVGA mode.
@@ -254,6 +268,9 @@ impl Registers {
             reg::IRQMASK => self.irq_mask,
             reg::NUM_GUEST_DISPLAYS..=reg::DISPLAY_HEIGHT => self.display_reg(index),
             reg::TRACES => self.traces,
+            reg::GMR_MAX_IDS => self.cfg.gmr_max_ids,
+            reg::GMRS_MAX_PAGES => self.cfg.gmr_max_pages,
+            reg::MEMORY_SIZE => self.cfg.memory_size,
             _ => 0,
         }
     }
@@ -340,7 +357,7 @@ impl Registers {
             }
             reg::IRQMASK => {
                 self.irq_mask = value;
-                Effect::None
+                Effect::IrqMask
             }
             reg::NUM_GUEST_DISPLAYS..=reg::DISPLAY_HEIGHT => {
                 let slot = index.wrapping_sub(reg::NUM_GUEST_DISPLAYS) as usize;
@@ -370,6 +387,9 @@ mod tests {
             max_width: 2560,
             max_height: 1600,
             capabilities: cap::EXTENDED_FIFO,
+            gmr_max_ids: 64,
+            gmr_max_pages: 65536,
+            memory_size: 256 << 20,
         })
     }
 

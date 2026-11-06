@@ -1,66 +1,72 @@
 //! Memory shared with the VMM (and therefore with the guest).
 //!
-//! This is the only module of the server allowed to use `unsafe`. The
-//! mapping is accessed exclusively through volatile, bounds-checked loads and
-//! stores: no Rust reference into it is ever created, because the guest may
+//! This is the only module of the server allowed to use `unsafe`. Mappings
+//! are accessed exclusively through volatile, bounds-checked loads and
+//! stores: no Rust reference into them is ever created, because the guest may
 //! change any byte at any time.
+//!
+//! Two kinds of mappings exist:
+//! - [`SharedMem`]: device memory we create (VRAM, FIFO) and hand to QEMU;
+//! - [`GuestWindow`]: guest RAM that QEMU hands to us (`DMA_MAP`).
+//!
+//! Both are backed by files sealed against shrinking: if the other side could
+//! truncate the file, touching the mapping would kill this process (SIGBUS).
 
 #![allow(unsafe_code)]
 
 use std::io;
+use std::ops::Deref;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 
-use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create};
+use rustix::fs::{
+    MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
+};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 
-/// A shared, fixed-size memfd mapped read-write in this process.
-pub struct SharedMem {
-    fd: OwnedFd,
+/// A mapped range, accessed only through volatile, bounds-checked operations.
+pub struct Mapping {
     ptr: NonNull<u8>,
     len: usize,
 }
 
 // SAFETY: the mapping is plain shared memory accessed only through volatile
 // operations; nothing in it is tied to a thread.
-unsafe impl Send for SharedMem {}
+unsafe impl Send for Mapping {}
 // SAFETY: as above; concurrent volatile accesses are what shared device
 // memory requires anyway.
-unsafe impl Sync for SharedMem {}
+unsafe impl Sync for Mapping {}
 
-impl SharedMem {
-    /// Creates `len` bytes of zeroed shared memory. The size is sealed, so no
-    /// other process can shrink the file and make our mapping fault.
-    pub fn new(name: &str, len: usize) -> io::Result<Self> {
+impl Mapping {
+    /// Maps `len` bytes of `fd` at `offset`, shared.
+    ///
+    /// # Safety
+    /// `fd` must hold at least `offset + len` bytes and be unable to shrink
+    /// for the lifetime of the mapping.
+    unsafe fn new(fd: BorrowedFd<'_>, offset: u64, len: usize, writable: bool) -> io::Result<Self> {
         if len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty shared memory",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty mapping"));
         }
-        let fd = memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
-        ftruncate(&fd, len as u64)?;
-        fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL)?;
-        // SAFETY: we map a file we just created with exactly `len` bytes and
-        // sealed its size; the kernel picks the address.
+        let prot = if writable {
+            ProtFlags::READ | ProtFlags::WRITE
+        } else {
+            ProtFlags::READ
+        };
+        // SAFETY: the caller guarantees the file covers the range and cannot
+        // shrink; the kernel picks the address.
         let ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
                 len,
-                ProtFlags::READ | ProtFlags::WRITE,
+                prot,
                 MapFlags::SHARED,
-                &fd,
-                0,
+                fd,
+                offset,
             )?
         };
         let ptr = NonNull::new(ptr.cast::<u8>())
             .ok_or_else(|| io::Error::other("mmap returned a null pointer"))?;
-        Ok(Self { fd, ptr, len })
-    }
-
-    /// The file to hand to the VMM for mapping.
-    pub fn fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        Ok(Self { ptr, len })
     }
 
     /// Size in bytes.
@@ -153,11 +159,80 @@ impl SharedMem {
     }
 }
 
-impl Drop for SharedMem {
+impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` describe the mapping created in `new`, and no
+        // SAFETY: `ptr`/`len` describe a mapping created in `new`, and no
         // pointer into it outlives `self`.
         let _ = unsafe { munmap(self.ptr.as_ptr().cast(), self.len) };
+    }
+}
+
+/// Device memory we allocate and share with QEMU: a fixed-size memfd.
+pub struct SharedMem {
+    fd: OwnedFd,
+    map: Mapping,
+}
+
+impl SharedMem {
+    /// Creates `len` bytes of zeroed shared memory, sealed so that no other
+    /// process can shrink (or grow) the file.
+    pub fn new(name: &str, len: usize) -> io::Result<Self> {
+        let fd = memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
+        ftruncate(&fd, len as u64)?;
+        fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL)?;
+        // SAFETY: the file has exactly `len` bytes and its size is sealed.
+        let map = unsafe { Mapping::new(fd.as_fd(), 0, len, true)? };
+        Ok(Self { fd, map })
+    }
+
+    /// The file to hand to the VMM for mapping.
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl Deref for SharedMem {
+    type Target = Mapping;
+    fn deref(&self) -> &Mapping {
+        &self.map
+    }
+}
+
+/// Guest RAM shared by QEMU through `DMA_MAP`.
+pub struct GuestWindow {
+    map: Mapping,
+}
+
+impl GuestWindow {
+    /// Maps `len` bytes at `offset` of a file received from QEMU. Refused
+    /// unless the file is sealed against shrinking and covers the range:
+    /// QEMU's memfd RAM backends are sealed by default (`seal=on`).
+    pub fn map(fd: &OwnedFd, offset: u64, len: u64, writable: bool) -> io::Result<Self> {
+        let seals = fcntl_get_seals(fd)
+            .map_err(|_| io::Error::other("guest memory is not a sealable memfd"))?;
+        if !seals.contains(SealFlags::SHRINK) {
+            return Err(io::Error::other(
+                "guest memory is not sealed against shrinking",
+            ));
+        }
+        let size = u64::try_from(fstat(fd)?.st_size).unwrap_or(0);
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::other("window overflows"))?;
+        if end > size {
+            return Err(io::Error::other("window is larger than its file"));
+        }
+        let len = usize::try_from(len).map_err(io::Error::other)?;
+        // SAFETY: the file covers [offset, offset + len) and cannot shrink.
+        let map = unsafe { Mapping::new(fd.as_fd(), offset, len, writable)? };
+        Ok(Self { map })
+    }
+}
+
+impl Deref for GuestWindow {
+    type Target = Mapping;
+    fn deref(&self) -> &Mapping {
+        &self.map
     }
 }
 
@@ -194,5 +269,26 @@ mod tests {
     fn the_size_is_sealed() {
         let mem = SharedMem::new("test", 4096).unwrap();
         assert!(ftruncate(mem.fd(), 0).is_err());
+        assert!(SharedMem::new("test", 0).is_err());
+    }
+
+    #[test]
+    fn guest_windows_must_be_sealed_and_in_bounds() {
+        let shared = SharedMem::new("test", 8192).unwrap();
+        let fd = shared.fd().try_clone_to_owned().unwrap();
+        shared.write(4096, b"guest");
+        let window = GuestWindow::map(&fd, 4096, 4096, false).unwrap();
+        let mut out = [0u8; 5];
+        assert!(window.read(0, &mut out));
+        assert_eq!(&out, b"guest");
+        assert!(
+            GuestWindow::map(&fd, 4096, 8192, false).is_err(),
+            "past the end"
+        );
+        assert!(GuestWindow::map(&fd, u64::MAX - 10, 4096, false).is_err());
+
+        let unsealed = memfd_create("unsealed", MemfdFlags::CLOEXEC).unwrap();
+        ftruncate(&unsealed, 4096).unwrap();
+        assert!(GuestWindow::map(&unsealed, 0, 4096, false).is_err());
     }
 }

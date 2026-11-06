@@ -8,9 +8,16 @@
 
 mod device;
 mod display;
+mod guest;
+mod irq;
 mod pci;
+#[cfg(any(feature = "window", test))]
+mod qmp;
 mod rom;
 mod shm;
+mod twod;
+#[cfg(feature = "window")]
+mod window;
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -41,17 +48,19 @@ struct Args {
     rom: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     window: bool,
+    qmp: Option<PathBuf>,
     options: Options,
 }
 
 const USAGE: &str = "usage: rsvga --socket PATH [--rom DRIVER.efi] [--vram-mb N] [--fifo-kb N] \
-                     [--snapshot FILE.png] [--window]";
+                     [--snapshot FILE.png] [--window [--qmp QEMU.sock]]";
 
 fn parse_args() -> Result<Args, String> {
     let mut socket = None;
     let mut rom = None;
     let mut snapshot = None;
     let mut window = false;
+    let mut qmp = None;
     let mut options = Options {
         vram_size: 64 << 20,
         fifo_size: 2 << 20,
@@ -66,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
             "--snapshot" => snapshot = Some(PathBuf::from(value()?)),
             "--rom" => rom = Some(PathBuf::from(value()?)),
             "--window" => window = true,
+            "--qmp" => qmp = Some(PathBuf::from(value()?)),
             "--vram-mb" => options.vram_size = size(&value()?, 20)?,
             "--fifo-kb" => options.fifo_size = size(&value()?, 10)?,
             "--help" | "-h" => return Err(USAGE.into()),
@@ -78,6 +88,7 @@ fn parse_args() -> Result<Args, String> {
         rom,
         snapshot,
         window,
+        qmp,
         options,
     })
 }
@@ -105,8 +116,11 @@ fn size(text: &str, shift: u32) -> Result<u32, String> {
 
 fn main() {
     START.get_or_init(Instant::now);
-    if std::env::var_os("RSVGA_TRACE").is_some_and(|v| v == "1") {
-        device::TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(level) = std::env::var("RSVGA_TRACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        device::TRACE.store(level, std::sync::atomic::Ordering::Relaxed);
     }
     let args = parse_args().unwrap_or_else(|message| {
         eprintln!("{message}");
@@ -161,39 +175,41 @@ fn main() {
         }
     });
 
-    display_loop(&svga, args.snapshot.as_deref(), args.window);
+    #[cfg(feature = "window")]
+    if args.window {
+        window::run(svga, args.snapshot, args.qmp);
+        return;
+    }
+    if args.qmp.is_some() {
+        log!("--qmp is only used with --window: no input will be forwarded");
+    }
+    display_loop(&svga, args.snapshot.as_deref());
 }
 
-/// Processes the FIFO and refreshes the outputs at about 60 Hz.
-fn display_loop(svga: &Svga, snapshot: Option<&std::path::Path>, window: bool) {
+/// Headless mode: processes the FIFO and refreshes the snapshot at about
+/// 60 Hz. With `--window`, [`window::run`] does the same from its event loop.
+fn display_loop(svga: &Svga, snapshot: Option<&std::path::Path>) {
     let mut frame = Frame::default();
     let mut last_snapshot = Instant::now();
-    #[cfg(feature = "window")]
-    let mut win = window.then(window::Window::open);
-    #[cfg(not(feature = "window"))]
-    let _ = window;
-
+    let mut last_status = Instant::now();
+    let tracing = std::env::var("RSVGA_TRACE").is_ok_and(|v| v != "0");
     loop {
+        if tracing && last_status.elapsed() >= Duration::from_secs(5) {
+            last_status = Instant::now();
+            log!("{}", svga.fifo_status());
+        }
         let started = Instant::now();
         {
             let mut state = svga.lock();
             svga.process_fifo(&mut state);
         }
         let mode = svga.capture(&mut frame);
-
-        if let Some(path) = snapshot {
-            if mode.is_some() && last_snapshot.elapsed() >= Duration::from_secs(1) {
+        if let (Some(path), Some(_)) = (snapshot, mode) {
+            if last_snapshot.elapsed() >= Duration::from_secs(1) {
                 last_snapshot = Instant::now();
                 if let Err(error) = save(path, &frame) {
                     log!("cannot write {}: {error}", path.display());
                 }
-            }
-        }
-        #[cfg(feature = "window")]
-        if let Some(win) = win.as_mut() {
-            if !win.show(mode.map(|_| &frame)) {
-                log!("window closed");
-                process::exit(0);
             }
         }
         thread::sleep(Duration::from_millis(16).saturating_sub(started.elapsed()));
@@ -202,48 +218,11 @@ fn display_loop(svga: &Svga, snapshot: Option<&std::path::Path>, window: bool) {
 
 /// Writes the PNG next to its destination, then renames it into place, so a
 /// reader never sees a half-written file.
-fn save(path: &std::path::Path, frame: &Frame) -> std::io::Result<()> {
+pub(crate) fn save(path: &std::path::Path, frame: &Frame) -> std::io::Result<()> {
     let partial = path.with_extension("png.partial");
     let mut file = std::io::BufWriter::new(fs::File::create(&partial)?);
     write_png(&mut file, frame)?;
     std::io::Write::flush(&mut file)?;
     drop(file);
     fs::rename(partial, path)
-}
-
-#[cfg(feature = "window")]
-mod window {
-    use minifb::{ScaleMode, WindowOptions};
-
-    use crate::display::Frame;
-
-    pub struct Window(minifb::Window);
-
-    impl Window {
-        pub fn open() -> Self {
-            let options = WindowOptions {
-                resize: true,
-                scale_mode: ScaleMode::AspectRatioStretch,
-                ..WindowOptions::default()
-            };
-            let window = minifb::Window::new("rsvga", 1024, 768, options).unwrap_or_else(|error| {
-                eprintln!("cannot open a window: {error}");
-                std::process::exit(1);
-            });
-            Self(window)
-        }
-
-        /// Shows `frame` (or a black screen); false once the user closed the window.
-        pub fn show(&mut self, frame: Option<&Frame>) -> bool {
-            if !self.0.is_open() {
-                return false;
-            }
-            let black = [0u32; 64 * 48];
-            let result = match frame {
-                Some(f) => self.0.update_with_buffer(&f.pixels, f.width, f.height),
-                None => self.0.update_with_buffer(&black, 64, 48),
-            };
-            result.is_ok()
-        }
-    }
 }

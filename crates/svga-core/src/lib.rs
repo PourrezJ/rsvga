@@ -7,7 +7,9 @@
 pub mod command;
 pub mod decode;
 pub mod fifo;
+pub mod gmr;
 pub mod regs;
+pub mod screen;
 
 pub use command::Command;
 pub use decode::{Decode, DecodeError, Limits, WordSource, decode};
