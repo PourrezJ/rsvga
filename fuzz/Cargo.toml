@@ -1,0 +1,30 @@
+[package]
+name = "rsvga-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+svga-core = { path = "../crates/svga-core" }
+svga-proto = { path = "../crates/svga-proto" }
+
+# Standalone: the root workspace excludes this directory.
+[workspace]
+
+[[bin]]
+name = "fifo"
+path = "fuzz_targets/fifo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

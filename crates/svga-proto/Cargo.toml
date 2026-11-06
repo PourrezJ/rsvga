@@ -1,0 +1,10 @@
+[package]
+name = "svga-proto"
+description = "Register-level constants of the VMware SVGA II virtual device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+
+[lints]
+workspace = true

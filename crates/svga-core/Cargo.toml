@@ -1,0 +1,13 @@
+[package]
+name = "svga-core"
+description = "Transport-independent, guest-facing logic of the rsvga device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+svga-proto = { path = "../svga-proto" }
+
+[lints]
+workspace = true
