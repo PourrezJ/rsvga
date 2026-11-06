@@ -1,0 +1,23 @@
+[package]
+name = "rsvga-gop"
+description = "UEFI GOP driver for the rsvga card, shipped in its option ROM"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Built for x86_64-unknown-uefi only: not part of the host workspace.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[dependencies]
+svga-proto = { path = "../../crates/svga-proto" }
+r-efi = "7.1.0"

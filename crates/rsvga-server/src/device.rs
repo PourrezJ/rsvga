@@ -83,6 +83,9 @@ pub struct Svga {
     fifo: SharedMem,
     state: Mutex<State>,
     limits: Limits,
+    /// Expansion ROM image (empty: no ROM) and the size of its BAR.
+    rom: Vec<u8>,
+    rom_bar: u32,
 }
 
 /// FIFO memory seen through the [`FifoMemory`] trait of `svga-core`.
@@ -105,8 +108,14 @@ fn reg_index(index: u32) -> usize {
 }
 
 impl Svga {
-    /// Allocates VRAM and FIFO memory and powers the device on.
-    pub fn new(opts: &Options) -> io::Result<Arc<Self>> {
+    /// Allocates VRAM and FIFO memory and powers the device on. `rom` is the
+    /// expansion ROM image (see [`crate::rom`]), or empty for none.
+    pub fn new(opts: &Options, rom: Vec<u8>) -> io::Result<Arc<Self>> {
+        let rom_bar = if rom.is_empty() {
+            0
+        } else {
+            crate::rom::bar_size(rom.len())
+        };
         let vram = SharedMem::new("rsvga-vram", opts.vram_size as usize)?;
         let fifo = SharedMem::new("rsvga-fifo", opts.fifo_size as usize)?;
         let regs = Registers::new(Config {
@@ -118,7 +127,7 @@ impl Svga {
         });
         let state = State {
             regs,
-            pci: PciConfig::new(opts.vram_size, opts.fifo_size),
+            pci: PciConfig::new(opts.vram_size, opts.fifo_size, rom_bar),
             fifo_error: None,
             last_mode: None,
             dma: Vec::new(),
@@ -129,6 +138,8 @@ impl Svga {
             fifo,
             state: Mutex::new(state),
             limits: Limits::default(),
+            rom,
+            rom_bar,
         }))
     }
 
@@ -316,6 +327,11 @@ impl Device for Handle {
                 size: CONFIG_SIZE as u64,
                 fd: None,
             },
+            pci_region::ROM if self.0.rom_bar != 0 => RegionInfo {
+                flags: region_flags::READ,
+                size: u64::from(self.0.rom_bar),
+                fd: None,
+            },
             pci_region::BAR3..=pci_region::ROM | pci_region::VGA => RegionInfo {
                 flags: 0,
                 size: 0,
@@ -351,6 +367,19 @@ impl Device for Handle {
                 .fifo
                 .read(usize::try_from(offset).map_err(|_| Errno::EINVAL)?, data),
             pci_region::CONFIG => svga.lock().pci.read(offset, data),
+            pci_region::ROM if svga.rom_bar != 0 => {
+                let fits = offset
+                    .checked_add(data.len() as u64)
+                    .is_some_and(|end| end <= u64::from(svga.rom_bar));
+                if fits {
+                    // Bytes past the image read as 0xff, like erased flash.
+                    let start = offset as usize;
+                    for (i, byte) in data.iter_mut().enumerate() {
+                        *byte = svga.rom.get(start + i).copied().unwrap_or(0xff);
+                    }
+                }
+                fits
+            }
             _ => false,
         };
         if tracing() && region != pci_region::BAR1 {
@@ -467,12 +496,15 @@ mod tests {
 
     fn device() -> Handle {
         Handle(
-            Svga::new(&Options {
-                vram_size: 16 << 20,
-                fifo_size: 64 << 10,
-                max_width: 2560,
-                max_height: 1600,
-            })
+            Svga::new(
+                &Options {
+                    vram_size: 16 << 20,
+                    fifo_size: 64 << 10,
+                    max_width: 2560,
+                    max_height: 1600,
+                },
+                Vec::new(),
+            )
             .unwrap(),
         )
     }
@@ -579,6 +611,27 @@ mod tests {
         h.0.fifo.store_u32(3, h.0.fifo.load_u32(2));
         set(&mut h, reg::CONFIG_DONE, 1);
         assert!(h.0.lock().fifo_error.is_none());
+    }
+
+    #[test]
+    fn the_rom_is_served_through_region_6() {
+        let opts = Options {
+            vram_size: 16 << 20,
+            fifo_size: 64 << 10,
+            max_width: 2560,
+            max_height: 1600,
+        };
+        let mut h = Handle(Svga::new(&opts, vec![0x55, 0xaa, 1]).unwrap());
+        let info = h.region_info(pci_region::ROM).unwrap();
+        assert_eq!((info.flags, info.size), (region_flags::READ, 2048));
+        let mut out = [0u8; 4];
+        h.region_read(pci_region::ROM, 0, &mut out).unwrap();
+        assert_eq!(out, [0x55, 0xaa, 1, 0xff]);
+        assert_eq!(
+            h.region_read(pci_region::ROM, 2046, &mut out),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(device().region_info(pci_region::ROM).unwrap().size, 0);
     }
 
     #[test]

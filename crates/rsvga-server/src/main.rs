@@ -9,6 +9,7 @@
 mod device;
 mod display;
 mod pci;
+mod rom;
 mod shm;
 
 use std::os::unix::net::UnixListener;
@@ -37,16 +38,18 @@ pub fn uptime() -> f64 {
 
 struct Args {
     socket: PathBuf,
+    rom: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     window: bool,
     options: Options,
 }
 
-const USAGE: &str =
-    "usage: rsvga --socket PATH [--vram-mb N] [--fifo-kb N] [--snapshot FILE.png] [--window]";
+const USAGE: &str = "usage: rsvga --socket PATH [--rom DRIVER.efi] [--vram-mb N] [--fifo-kb N] \
+                     [--snapshot FILE.png] [--window]";
 
 fn parse_args() -> Result<Args, String> {
     let mut socket = None;
+    let mut rom = None;
     let mut snapshot = None;
     let mut window = false;
     let mut options = Options {
@@ -61,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--snapshot" => snapshot = Some(PathBuf::from(value()?)),
+            "--rom" => rom = Some(PathBuf::from(value()?)),
             "--window" => window = true,
             "--vram-mb" => options.vram_size = size(&value()?, 20)?,
             "--fifo-kb" => options.fifo_size = size(&value()?, 10)?,
@@ -71,10 +75,23 @@ fn parse_args() -> Result<Args, String> {
     let socket = socket.ok_or_else(|| USAGE.to_string())?;
     Ok(Args {
         socket,
+        rom,
         snapshot,
         window,
         options,
     })
+}
+
+/// Reads a UEFI driver and packs it as the card's option ROM.
+fn load_rom(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let pe = fs::read(path).map_err(|error| error.to_string())?;
+    rom::build(
+        &pe,
+        svga_proto::pci::VENDOR_ID_VMWARE,
+        svga_proto::pci::DEVICE_ID_SVGA2,
+        0x03_0000,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Parses a power-of-two size given in units of `2^shift` bytes.
@@ -100,7 +117,17 @@ fn main() {
         process::exit(2);
     }
 
-    let svga = Svga::new(&args.options).unwrap_or_else(|error| {
+    let rom = match &args.rom {
+        None => Vec::new(),
+        Some(path) => load_rom(path).unwrap_or_else(|error| {
+            eprintln!("cannot use {} as option ROM: {error}", path.display());
+            process::exit(2);
+        }),
+    };
+    if !rom.is_empty() {
+        log!("option ROM: {} bytes", rom.len());
+    }
+    let svga = Svga::new(&args.options, rom).unwrap_or_else(|error| {
         eprintln!("cannot allocate device memory: {error}");
         process::exit(1);
     });

@@ -8,6 +8,7 @@ pub const CONFIG_SIZE: usize = 256;
 const COMMAND: usize = 0x04;
 const BAR0: usize = 0x10;
 const SUBSYSTEM_VENDOR: usize = 0x2c;
+const ROM_BAR: usize = 0x30;
 const INTERRUPT_LINE: usize = 0x3c;
 
 /// Writable bits of the command register: I/O, memory, bus master.
@@ -32,13 +33,16 @@ impl Bar {
 pub struct PciConfig {
     space: [u8; CONFIG_SIZE],
     bars: [Bar; 6],
+    rom_size: u32,
 }
 
 impl PciConfig {
     /// BAR 0: 16 bytes of I/O ports. BAR 1: prefetchable VRAM. BAR 2: FIFO.
-    /// Both memory sizes must be powers of two.
-    pub fn new(vram_size: u32, fifo_size: u32) -> Self {
+    /// Expansion ROM BAR: `rom_size` bytes, or none if 0. Memory sizes must
+    /// be powers of two.
+    pub fn new(vram_size: u32, fifo_size: u32, rom_size: u32) -> Self {
         assert!(vram_size.is_power_of_two() && fifo_size.is_power_of_two());
+        assert!(rom_size == 0 || (rom_size.is_power_of_two() && rom_size >= 2048));
         let mut space = [0u8; CONFIG_SIZE];
         space[0..2].copy_from_slice(&VENDOR_ID_VMWARE.to_le_bytes());
         space[2..4].copy_from_slice(&DEVICE_ID_SVGA2.to_le_bytes());
@@ -60,7 +64,11 @@ impl PciConfig {
             size: fifo_size,
             flags: 0x0,
         }; // 32-bit
-        let mut config = Self { space, bars };
+        let mut config = Self {
+            space,
+            bars,
+            rom_size,
+        };
         for index in 0..6 {
             config.store_bar(index, 0);
         }
@@ -87,6 +95,15 @@ impl PciConfig {
         }
     }
 
+    /// Bits of the ROM BAR that hold the address (plus bit 0, the enable).
+    fn rom_mask(&self) -> u32 {
+        if self.rom_size == 0 {
+            0
+        } else {
+            (!(self.rom_size - 1) & 0xffff_f800) | 1
+        }
+    }
+
     /// Reads `out.len()` bytes at `offset`; false if out of range.
     pub fn read(&self, offset: u64, out: &mut [u8]) -> bool {
         let Some(range) = range(offset, out.len()) else {
@@ -106,10 +123,17 @@ impl PciConfig {
                 COMMAND => self.space[at] = byte & COMMAND_WRITABLE.to_le_bytes()[0],
                 0x05 => self.space[at] = byte & COMMAND_WRITABLE.to_le_bytes()[1],
                 0x0c | 0x0d | INTERRUPT_LINE => self.space[at] = byte, // cache line, latency, IRQ line
-                0x10..=0x27 => self.space[at] = byte,
+                0x10..=0x27 | 0x30..=0x33 => self.space[at] = byte,
                 _ => {}
             }
         }
+        let rom = u32::from_le_bytes(
+            self.space[ROM_BAR..ROM_BAR + 4]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        let rom = rom & self.rom_mask();
+        self.space[ROM_BAR..ROM_BAR + 4].copy_from_slice(&rom.to_le_bytes());
         for index in 0..6 {
             let value = self.bar_value(index);
             self.store_bar(index, value);
@@ -136,7 +160,7 @@ mod tests {
 
     #[test]
     fn identity() {
-        let config = PciConfig::new(64 << 20, 2 << 20);
+        let config = PciConfig::new(64 << 20, 2 << 20, 0);
         assert_eq!(read32(&config, 0), 0x0405_15ad);
         assert_eq!(read32(&config, 8) >> 8, 0x03_0000);
         assert_eq!(read32(&config, 0x2c), 0x0405_15ad);
@@ -144,7 +168,7 @@ mod tests {
 
     #[test]
     fn bar_sizing_and_assignment() {
-        let mut config = PciConfig::new(64 << 20, 2 << 20);
+        let mut config = PciConfig::new(64 << 20, 2 << 20, 0);
         config.write(0x14, &u32::MAX.to_le_bytes());
         assert_eq!(read32(&config, 0x14), !((64u32 << 20) - 1) | 0x8);
         config.write(0x14, &0xe000_0000u32.to_le_bytes());
@@ -158,8 +182,20 @@ mod tests {
     }
 
     #[test]
+    fn rom_bar_sizing() {
+        let mut config = PciConfig::new(64 << 20, 2 << 20, 8192);
+        config.write(0x30, &0xffff_f800u32.to_le_bytes());
+        assert_eq!(read32(&config, 0x30), 0xffff_e000, "8 KiB ROM");
+        config.write(0x30, &0xfebf_e001u32.to_le_bytes());
+        assert_eq!(read32(&config, 0x30), 0xfebf_e001);
+        let mut none = PciConfig::new(64 << 20, 2 << 20, 0);
+        none.write(0x30, &u32::MAX.to_le_bytes());
+        assert_eq!(read32(&none, 0x30), 0, "no ROM");
+    }
+
+    #[test]
     fn read_only_fields_and_bounds() {
-        let mut config = PciConfig::new(64 << 20, 2 << 20);
+        let mut config = PciConfig::new(64 << 20, 2 << 20, 0);
         config.write(0, &[0xff; 4]);
         assert_eq!(read32(&config, 0), 0x0405_15ad);
         config.write(4, &[0xff, 0xff]);

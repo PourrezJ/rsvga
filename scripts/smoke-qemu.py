@@ -6,18 +6,24 @@ vfio-user, and uses the QEMU monitor's port I/O commands (`o`, `i`) to talk
 to the SVGA registers through the real KVM -> QEMU -> vfio-user path,
 including the unaligned 32-bit value port at BAR0 + 1.
 
-Usage: scripts/smoke-qemu.py [--qemu PATH] [--rsvga PATH] [--keep DIR]
+With --firmware, the card also serves its UEFI driver (target/firmware/
+rsvga-gop.efi) from its option ROM, and the test instead checks that OVMF
+draws its console through it.
+
+Usage: scripts/smoke-qemu.py [--firmware] [--qemu PATH] [--rsvga PATH] [--keep DIR]
 Exit status 0 means every check passed.
 """
 
 import argparse
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from functools import partial
 
 print = partial(print, flush=True)
@@ -73,11 +79,27 @@ def bar0(monitor):
     raise RuntimeError("the SVGA card has no I/O BAR in 'info pci'")
 
 
+def lit_pixels(png):
+    """Counts non-black bytes in one of rsvga's PNG snapshots."""
+    data, pos, idat = png.read_bytes(), 8, b""
+    while pos < len(data):
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        if data[pos + 4:pos + 8] == b"IDAT":
+            idat += data[pos + 8:pos + 8 + size]
+        pos += 12 + size
+    width = int.from_bytes(data[16:20], "big")
+    raw = zlib.decompress(idat)
+    rows = [raw[i + 1:i + 1 + 3 * width] for i in range(0, len(raw), 1 + 3 * width)]
+    return sum(1 for row in rows for byte in row if byte)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--qemu", default=ROOT / "target/qemu/install/bin/qemu-system-x86_64")
     parser.add_argument("--rsvga", default=ROOT / "target/release/rsvga")
     parser.add_argument("--keep", help="keep logs and the snapshot in this directory")
+    parser.add_argument("--firmware", action="store_true", help="test the UEFI driver in the option ROM")
+    parser.add_argument("--rom", default=ROOT / "target/firmware/rsvga-gop.efi")
     args = parser.parse_args()
 
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
@@ -86,8 +108,10 @@ def main():
     shutil.copy(OVMF_VARS, work / "vars.fd")
     snapshot = work / "frame.png"
 
-    rsvga = subprocess.Popen([str(args.rsvga), "--socket", str(sock), "--snapshot", str(snapshot)],
-                             stderr=open(work / "rsvga.log", "w"))
+    command = [str(args.rsvga), "--socket", str(sock), "--snapshot", str(snapshot)]
+    if args.firmware:
+        command += ["--rom", str(args.rom)]
+    rsvga = subprocess.Popen(command, stderr=open(work / "rsvga.log", "w"))
     for _ in range(50):
         if sock.exists():
             break
@@ -111,6 +135,9 @@ def main():
             failures.append(name)
 
     try:
+        if args.firmware:
+            firmware_checks(work / "rsvga.log", snapshot, failures)
+            return finish(failures)
         time.sleep(1.0)  # let OVMF enumerate PCI and assign the BARs
         monitor = Monitor(str(mon))
         for _ in range(50):
@@ -167,8 +194,33 @@ def main():
             shutil.copytree(work, args.keep, dirs_exist_ok=True)
         shutil.rmtree(work, ignore_errors=True)
 
+    return finish(failures)
+
+
+def finish(failures):
     print("PASS" if not failures else f"FAILED: {', '.join(failures)}")
     return 1 if failures else 0
+
+
+def firmware_checks(log_path, snapshot, failures):
+    """OVMF loads the ROM driver, which sets 1024x768; the console then picks
+    1280x800 and draws the shell banner into the framebuffer."""
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        log = log_path.read_text()
+        if "mode 1280x800 32 bpp" in log and snapshot.exists() and lit_pixels(snapshot) > 1000:
+            break
+        time.sleep(0.5)
+    log = log_path.read_text()
+    for name, ok in (
+        ("option ROM served", re.search(r"option ROM: \d+ bytes", log) is not None),
+        ("driver set its boot mode (1024x768)", "mode 1024x768 32 bpp" in log),
+        ("console mode (1280x800)", "mode 1280x800 32 bpp" in log),
+        ("console text drawn", snapshot.exists() and lit_pixels(snapshot) > 1000),
+    ):
+        print(f"{'ok  ' if ok else 'FAIL'} {name}")
+        if not ok:
+            failures.append(name)
 
 
 if __name__ == "__main__":

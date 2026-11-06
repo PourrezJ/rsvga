@@ -6,7 +6,9 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M1 en cours**. Avec le QEMU patché (une petite modification de vfio-user), un pilote peut lire et écrire les registres SVGA et changer de mode ; le firmware UEFI et le pilote Windows restent à brancher. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M1 en cours**. Avec le QEMU patché (une petite modification de vfio-user), le firmware UEFI puis Windows 11 s'affichent sur rsvga grâce à son propre pilote UEFI ; le pilote VMware de Windows reste à brancher. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+
+![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
 ## Compiler et tester
 
@@ -36,10 +38,20 @@ sudo apt install libpixman-1-dev libslirp-dev libgtk-3-dev libfdt-dev
 scripts/build-qemu.sh
 ```
 
-Test de bout en bout (rsvga + QEMU + OVMF, registres pilotés comme par un vrai pilote) :
+Pilote UEFI de la carte (servi depuis sa ROM, voir `--rom`) :
+
+```bash
+scripts/build-firmware.sh
+```
+
+Tests de bout en bout (rsvga + QEMU + OVMF) : registres pilotés comme par un vrai pilote, puis console UEFI affichée par notre pilote :
 
 ```bash
 scripts/smoke-qemu.py
+```
+
+```bash
+scripts/smoke-qemu.py --firmware
 ```
 
 ## Lancer la carte
@@ -49,7 +61,7 @@ cargo build --release -p rsvga-server
 ```
 
 ```bash
-target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --snapshot /tmp/rsvga.png
+target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/rsvga-gop.efi --snapshot /tmp/rsvga.png
 ```
 
 Côté QEMU, la RAM du guest doit être partagée (memfd), et la carte s'ajoute ainsi :
@@ -66,7 +78,8 @@ Côté QEMU, la RAM du guest doit être partagée (memfd), et la carte s'ajoute 
 - `svga-proto` : registres, FIFO, capacités et identifiants de commandes du protocole VMware SVGA II.
 - `svga-core` : FIFO validée, décodage de toutes les commandes 2D et de l'encadrement 3D, registres SVGA (modes, ID, palette...). Rust sûr, borné, protégé contre un invité qui modifierait une commande pendant sa lecture.
 - `vfio-user` : protocole vfio-user côté serveur, avec passage de descripteurs de fichiers.
-- `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, exécution de la FIFO, capture PNG, fenêtre optionnelle).
+- `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
+- `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
 - 60 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; deux cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
