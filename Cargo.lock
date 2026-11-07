@@ -1363,6 +1363,7 @@ dependencies = [
  "ash",
  "svga-core",
  "svga-proto",
+ "svga-shader",
 ]
 
 [[package]]

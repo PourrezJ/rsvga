@@ -15,8 +15,9 @@
 //! default options); a shader the translator refuses is logged with the
 //! reason.
 //!
-//! Draws, clears and copies between surfaces need the renderer: they are
-//! accepted and reported as [`Outcome::Deferred`] for now. Fences and
+//! Draws, clears and copies between surfaces are the renderer's: the
+//! context model accepts them as [`Outcome::Deferred`] and the device
+//! hands them to the GPU ([`crate::gpu`]) when there is one. Fences and
 //! queries complete at once.
 
 use std::collections::{BTreeMap, HashMap};
@@ -195,13 +196,11 @@ impl Context {
     }
 
     /// The code of shader `id`, once bound.
-    #[allow(dead_code, reason = "read by the renderer, next step of M3")]
     pub fn shader_code(&self, id: u32) -> Option<&Arc<[u8]>> {
         self.code.get(&id)
     }
 
     /// The SPIR-V of shader `id`, once bound (an error: why there is none).
-    #[allow(dead_code, reason = "read by the renderer, next step of M3")]
     pub fn shader_spirv(&self, id: u32) -> Option<&Result<Arc<svga_shader::Shader>, String>> {
         self.spirv.get(&id)
     }

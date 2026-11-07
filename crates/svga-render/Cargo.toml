@@ -10,6 +10,7 @@ license.workspace = true
 ash = "0.38"
 svga-core = { path = "../svga-core" }
 svga-proto = { path = "../svga-proto" }
+svga-shader = { path = "../svga-shader" }
 
 # Vulkan is reached through `unsafe` calls: every block says why it holds.
 [lints.rust]

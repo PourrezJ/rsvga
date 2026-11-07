@@ -7,6 +7,10 @@
 //! staging buffers. Operations are recorded into one command buffer and
 //! submitted at [`Renderer::flush`] (a download flushes first).
 //!
+//! Draws ([`Renderer::draw`], module `draw`) turn Direct3D 10 pipeline
+//! state into cached Vulkan pipelines, recorded with dynamic rendering and
+//! push descriptors.
+//!
 //! Every image stays in the `GENERAL` layout and operations are separated
 //! by full memory barriers: simple and correct, to be refined when
 //! drawing makes it worth it.
@@ -15,7 +19,13 @@
 //! `RSVGA_GPU` names another (part of its name, e.g. `6400` or
 //! `llvmpipe`).
 
+mod draw;
 pub mod format;
+
+pub use draw::{
+    Bound, Call, Draw, Resource, Target, VertexAttribute, VertexBuffer, default_blend,
+    default_depth_stencil, default_rasterizer,
+};
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -59,7 +69,7 @@ pub struct At {
     pub offset: [u32; 3],
 }
 
-enum Resource {
+enum Storage {
     Buffer {
         buffer: vk::Buffer,
         memory: vk::DeviceMemory,
@@ -77,9 +87,17 @@ enum Resource {
     },
 }
 
+/// Key of a cached image view: format, aspect, view type, mips and layers,
+/// swizzle (raw Vulkan values).
+type ViewKey = (i32, u32, i32, [u32; 4], [i32; 4]);
+
 struct Surface {
-    resource: Resource,
+    resource: Storage,
     layout: SurfaceLayout,
+    /// Image views made for draws, destroyed with the surface.
+    views: HashMap<ViewKey, vk::ImageView>,
+    /// Buffer views (format, offset, bytes), likewise.
+    buffer_views: HashMap<(i32, u64, u64), vk::BufferView>,
 }
 
 struct Staging {
@@ -103,6 +121,24 @@ pub struct Renderer {
     recording: bool,
     staging: Vec<Staging>,
     surfaces: HashMap<u32, Surface>,
+    a8: bool,
+    features: Features,
+    push: Option<ash::khr::push_descriptor::Device>,
+    draw: draw::Caches,
+}
+
+/// Optional device features in use.
+#[derive(Clone, Copy, Debug, Default)]
+struct Features {
+    /// Push descriptors and dynamic rendering: draws are possible.
+    draw: bool,
+    /// `BaseVertex`/`BaseInstance` in shaders.
+    draw_parameters: bool,
+    depth_clamp: bool,
+    maintenance5: bool,
+    anisotropy: bool,
+    /// `MIRROR_CLAMP_TO_EDGE` addressing (Direct3D's `MIRROR_ONCE`).
+    mirror_once: bool,
 }
 
 /// Preference of a device: higher is better.
@@ -212,14 +248,79 @@ impl Renderer {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
-        // SAFETY: a valid device create info for this physical device.
-        let device = match unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
-                None,
-            )
-        } {
+        // What Direct3D 10/11 needs, where the device has it.
+        // SAFETY: a device of this instance.
+        let extensions =
+            unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+        let has = |name: &std::ffi::CStr| {
+            extensions
+                .iter()
+                .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == name))
+        };
+        let push = has(ash::khr::push_descriptor::NAME);
+        let maintenance5 = has(ash::khr::maintenance5::NAME);
+        let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
+        let mut query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut v11)
+            .push_next(&mut v12)
+            .push_next(&mut v13);
+        if maintenance5 {
+            query = query.push_next(&mut m5);
+        }
+        // SAFETY: a device of this instance; the chain is well formed.
+        unsafe { instance.get_physical_device_features2(physical, &mut query) };
+        let have = query.features;
+        let core = vk::PhysicalDeviceFeatures {
+            robust_buffer_access: have.robust_buffer_access,
+            geometry_shader: have.geometry_shader,
+            independent_blend: have.independent_blend,
+            dual_src_blend: have.dual_src_blend,
+            logic_op: have.logic_op,
+            depth_clamp: have.depth_clamp,
+            depth_bias_clamp: have.depth_bias_clamp,
+            fill_mode_non_solid: have.fill_mode_non_solid,
+            sampler_anisotropy: have.sampler_anisotropy,
+            sample_rate_shading: have.sample_rate_shading,
+            image_cube_array: have.image_cube_array,
+            shader_clip_distance: have.shader_clip_distance,
+            ..Default::default()
+        };
+        let features = Features {
+            draw: push && v13.dynamic_rendering == vk::TRUE,
+            draw_parameters: v11.shader_draw_parameters == vk::TRUE,
+            depth_clamp: have.depth_clamp == vk::TRUE,
+            maintenance5: maintenance5 && m5.maintenance5 == vk::TRUE,
+            anisotropy: have.sampler_anisotropy == vk::TRUE,
+            mirror_once: v12.sampler_mirror_clamp_to_edge == vk::TRUE,
+        };
+        let mut v11_on = vk::PhysicalDeviceVulkan11Features::default()
+            .shader_draw_parameters(features.draw_parameters);
+        let mut v12_on = vk::PhysicalDeviceVulkan12Features::default()
+            .sampler_mirror_clamp_to_edge(features.mirror_once);
+        let mut v13_on = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(v13.dynamic_rendering == vk::TRUE);
+        let mut m5_on = vk::PhysicalDeviceMaintenance5FeaturesKHR::default().maintenance5(true);
+        let mut names = Vec::new();
+        if push {
+            names.push(ash::khr::push_descriptor::NAME.as_ptr());
+        }
+        let mut info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_features(&core)
+            .push_next(&mut v11_on)
+            .push_next(&mut v12_on)
+            .push_next(&mut v13_on);
+        if features.maintenance5 {
+            names.push(ash::khr::maintenance5::NAME.as_ptr());
+            info = info.push_next(&mut m5_on);
+        }
+        let info = info.enabled_extension_names(&names);
+        // SAFETY: a valid device create info for this physical device: only
+        // supported extensions and features.
+        let device = match unsafe { instance.create_device(physical, &info, None) } {
             Ok(d) => d,
             Err(e) => return fail(instance, format!("{device_name}: {e}")),
         };
@@ -259,6 +360,22 @@ impl Renderer {
         }
         .optimal_tiling_features
         .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT);
+        // A8_UNORM (maintenance5): DWM's glyph atlases keep their format.
+        let a8 = features.maintenance5 && {
+            // SAFETY: as above.
+            let props = unsafe {
+                instance.get_physical_device_format_properties(physical, vk::Format::A8_UNORM_KHR)
+            };
+            props.optimal_tiling_features.contains(
+                vk::FormatFeatureFlags::SAMPLED_IMAGE
+                    | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                    | vk::FormatFeatureFlags::TRANSFER_SRC
+                    | vk::FormatFeatureFlags::TRANSFER_DST,
+            )
+        };
+        let push = features
+            .draw
+            .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
         Ok(Self {
             _entry: entry,
             instance,
@@ -271,6 +388,10 @@ impl Renderer {
             memory,
             name: device_name,
             d24s8,
+            a8,
+            features,
+            push,
+            draw: draw::Caches::default(),
             recording: false,
             staging: Vec::new(),
             surfaces: HashMap::new(),
@@ -285,6 +406,16 @@ impl Renderer {
     /// Whether surface `sid` is on the GPU.
     pub fn has(&self, sid: u32) -> bool {
         self.surfaces.contains_key(&sid)
+    }
+
+    /// Whether the bytes of surface `sid` can go to the GPU and back
+    /// ([`Renderer::upload`], [`Renderer::download`]): not for converted
+    /// depth formats nor multisampled images.
+    pub fn copyable(&self, sid: u32) -> bool {
+        self.surfaces.get(&sid).is_some_and(|s| match s.resource {
+            Storage::Buffer { .. } => true,
+            Storage::Image { copyable, .. } => copyable,
+        })
     }
 
     fn memory_type(&self, bits: u32, wanted: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -419,7 +550,12 @@ impl Renderer {
     /// contents undefined. `flags`: `SVGA3D_SURFACE_*`.
     pub fn create(&mut self, sid: u32, layout: &SurfaceLayout, flags: u64) -> Result<(), Error> {
         self.destroy(sid)?;
-        let Some(kind) = format::kind(layout.format(), self.d24s8) else {
+        let stored = if flags & surface_flag::BIND_DEPTH_STENCIL != 0 {
+            format::depth_storage(layout.format())
+        } else {
+            layout.format()
+        };
+        let Some(kind) = format::kind(stored, self.d24s8, self.a8) else {
             return err(format!(
                 "surface format {} has no GPU format",
                 layout.format()
@@ -436,12 +572,14 @@ impl Renderer {
             Surface {
                 resource,
                 layout: layout.clone(),
+                views: HashMap::new(),
+                buffer_views: HashMap::new(),
             },
         );
         Ok(())
     }
 
-    fn create_buffer(&mut self, size: u64) -> Result<Resource, Error> {
+    fn create_buffer(&mut self, size: u64) -> Result<Storage, Error> {
         use vk::BufferUsageFlags as U;
         let info = vk::BufferCreateInfo::default().size(size.max(4)).usage(
             U::TRANSFER_SRC
@@ -449,7 +587,9 @@ impl Renderer {
                 | U::VERTEX_BUFFER
                 | U::INDEX_BUFFER
                 | U::UNIFORM_BUFFER
+                | U::UNIFORM_TEXEL_BUFFER
                 | U::STORAGE_BUFFER
+                | U::STORAGE_TEXEL_BUFFER
                 | U::INDIRECT_BUFFER,
         );
         // SAFETY: a valid create info on a live device.
@@ -465,7 +605,7 @@ impl Renderer {
                     .map_err(Error::from)
             });
         match memory {
-            Ok(memory) => Ok(Resource::Buffer {
+            Ok(memory) => Ok(Storage::Buffer {
                 buffer,
                 memory,
                 size,
@@ -484,7 +624,7 @@ impl Renderer {
         flags: u64,
         kind: Kind,
         format: vk::Format,
-    ) -> Result<Resource, Error> {
+    ) -> Result<Storage, Error> {
         let size = layout.size();
         let three_d = flags & surface_flag::VOLUME != 0 || size.depth > 1;
         let image_type = if three_d {
@@ -604,7 +744,7 @@ impl Renderer {
                 &[to_general],
             );
         }
-        Ok(Resource::Image {
+        Ok(Storage::Image {
             image,
             memory,
             format,
@@ -626,12 +766,18 @@ impl Renderer {
         if let Some(surface) = self.surfaces.remove(&sid) {
             // SAFETY: the GPU is idle (flushed); the handles are ours.
             unsafe {
+                for view in surface.views.into_values() {
+                    self.device.destroy_image_view(view, None);
+                }
+                for view in surface.buffer_views.into_values() {
+                    self.device.destroy_buffer_view(view, None);
+                }
                 match surface.resource {
-                    Resource::Buffer { buffer, memory, .. } => {
+                    Storage::Buffer { buffer, memory, .. } => {
                         self.device.destroy_buffer(buffer, None);
                         self.device.free_memory(memory, None);
                     }
-                    Resource::Image { image, memory, .. } => {
+                    Storage::Image { image, memory, .. } => {
                         self.device.destroy_image(image, None);
                         self.device.free_memory(memory, None);
                     }
@@ -650,7 +796,7 @@ impl Renderer {
     /// Buffer-image regions of every subresource of a copyable image, at
     /// the offsets of its guest layout.
     fn whole_regions(surface: &Surface) -> Result<Vec<vk::BufferImageCopy>, Error> {
-        let Resource::Image {
+        let Storage::Image {
             aspect,
             copyable,
             three_d,
@@ -698,8 +844,8 @@ impl Renderer {
             ));
         }
         let target = match &surface.resource {
-            Resource::Buffer { buffer, .. } => Ok(*buffer),
-            Resource::Image { image, .. } => Err((*image, Self::whole_regions(surface)?)),
+            Storage::Buffer { buffer, .. } => Ok(*buffer),
+            Storage::Image { image, .. } => Err((*image, Self::whole_regions(surface)?)),
         };
         let (staging, ptr) = self.staging(data.len() as u64)?;
         // SAFETY: the mapping holds at least `data.len()` bytes and nothing
@@ -740,8 +886,8 @@ impl Renderer {
             ));
         }
         let source = match &surface.resource {
-            Resource::Buffer { buffer, .. } => Ok(*buffer),
-            Resource::Image { image, .. } => Err((*image, Self::whole_regions(surface)?)),
+            Storage::Buffer { buffer, .. } => Ok(*buffer),
+            Storage::Image { image, .. } => Err((*image, Self::whole_regions(surface)?)),
         };
         let (staging, ptr) = self.staging(out.len() as u64)?;
         let cmd = self.barrier()?;
@@ -823,21 +969,21 @@ impl Renderer {
         sid: u32,
     ) -> Result<(vk::Image, vk::Format, vk::ImageAspectFlags, bool), Error> {
         match self.surface(sid)?.resource {
-            Resource::Image {
+            Storage::Image {
                 image,
                 format,
                 aspect,
                 three_d,
                 ..
             } => Ok((image, format, aspect, three_d)),
-            Resource::Buffer { .. } => err(format!("surface {sid} is a buffer")),
+            Storage::Buffer { .. } => err(format!("surface {sid} is a buffer")),
         }
     }
 
     fn buffer(&self, sid: u32) -> Result<(vk::Buffer, u64), Error> {
         match self.surface(sid)?.resource {
-            Resource::Buffer { buffer, size, .. } => Ok((buffer, size)),
-            Resource::Image { .. } => err(format!("surface {sid} is an image")),
+            Storage::Buffer { buffer, size, .. } => Ok((buffer, size)),
+            Storage::Image { .. } => err(format!("surface {sid} is an image")),
         }
     }
 
@@ -1146,6 +1292,7 @@ impl Drop for Renderer {
         for sid in sids {
             let _ = self.destroy(sid);
         }
+        self.destroy_draw_caches();
         // SAFETY: the GPU is idle and every object below is ours.
         unsafe {
             let _ = self.device.device_wait_idle();

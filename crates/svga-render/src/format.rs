@@ -26,9 +26,52 @@ pub enum Kind {
     DepthConverted(vk::Format),
 }
 
+/// What shaders read from or write to a view or vertex attribute of
+/// `format`: integers for the `UINT`/`SINT` formats, floats otherwise.
+pub fn scalar(format: u32) -> svga_shader::Scalar {
+    use svga_shader::Scalar;
+    match format {
+        f::R32G32B32A32_UINT
+        | f::R32G32B32_UINT
+        | f::R16G16B16A16_UINT
+        | f::R32G32_UINT
+        | f::X32_G8X24_UINT
+        | f::R10G10B10A2_UINT
+        | f::R8G8B8A8_UINT
+        | f::R16G16_UINT
+        | f::R32_UINT
+        | f::X24_G8_UINT
+        | f::R8G8_UINT
+        | f::R16_UINT
+        | f::R8_UINT => Scalar::Uint,
+        f::R32G32B32A32_SINT
+        | f::R32G32B32_SINT
+        | f::R16G16B16A16_SINT
+        | f::R32G32_SINT
+        | f::R8G8B8A8_SINT
+        | f::R16G16_SINT
+        | f::R32_SINT
+        | f::R8G8_SINT
+        | f::R16_SINT
+        | f::R8_SINT => Scalar::Int,
+        _ => Scalar::Float,
+    }
+}
+
+/// The format a surface bound as a depth-stencil target is stored in:
+/// Direct3D creates readable depth textures typeless (`R32_TYPELESS`), and
+/// Vulkan views depth only on depth images.
+pub fn depth_storage(format: u32) -> u32 {
+    match format {
+        f::R32_TYPELESS => f::D32_FLOAT,
+        f::R16_TYPELESS => f::D16_UNORM,
+        other => other,
+    }
+}
+
 /// The Vulkan resource of an SVGA surface format; `None`: not supported.
-/// `d24s8`: the GPU supports `D24_UNORM_S8_UINT`.
-pub fn kind(format: u32, d24s8: bool) -> Option<Kind> {
+/// `d24s8`: the GPU supports `D24_UNORM_S8_UINT`; `a8`: `A8_UNORM`.
+pub fn kind(format: u32, d24s8: bool, a8: bool) -> Option<Kind> {
     use vk::Format as V;
     let color = |v| Some(Kind::Color(v));
     match format {
@@ -40,6 +83,7 @@ pub fn kind(format: u32, d24s8: bool) -> Option<Kind> {
         f::X1R5G5B5 | f::A1R5G5B5 => color(V::A1R5G5B5_UNORM_PACK16),
         f::A4R4G4B4 => color(V::A4R4G4B4_UNORM_PACK16),
         f::A2R10G10B10 => color(V::A2R10G10B10_UNORM_PACK32),
+        f::ALPHA8 | f::A8_UNORM if a8 => color(V::A8_UNORM_KHR),
         f::ALPHA8 | f::LUMINANCE8 => color(V::R8_UNORM),
         f::LUMINANCE16 => color(V::R16_UNORM),
         f::LUMINANCE8_ALPHA8 => color(V::R8G8_UNORM),
@@ -147,7 +191,7 @@ pub fn kind(format: u32, d24s8: bool) -> Option<Kind> {
 pub fn vk_bytes(format: vk::Format) -> Option<u32> {
     use vk::Format as V;
     Some(match format {
-        V::R8_UNORM | V::R8_SNORM | V::R8_UINT | V::R8_SINT => 1,
+        V::R8_UNORM | V::R8_SNORM | V::R8_UINT | V::R8_SINT | V::A8_UNORM_KHR => 1,
         V::R8G8_UNORM | V::R8G8_SNORM | V::R8G8_UINT | V::R8G8_SINT => 2,
         V::R16_UNORM | V::R16_SNORM | V::R16_UINT | V::R16_SINT | V::R16_SFLOAT => 2,
         V::R5G6B5_UNORM_PACK16 | V::A1R5G5B5_UNORM_PACK16 | V::A4R4G4B4_UNORM_PACK16 => 2,
@@ -246,7 +290,7 @@ mod tests {
     #[test]
     fn mapped_formats_keep_the_guest_layout() {
         for format in 1..=f::R11G11B10_TYPELESS {
-            let (Some(desc), Some(kind)) = (f::desc(format), kind(format, false)) else {
+            let (Some(desc), Some(kind)) = (f::desc(format), kind(format, false, false)) else {
                 continue;
             };
             let vk_format = match kind {
@@ -264,19 +308,19 @@ mod tests {
     #[test]
     fn the_desktop_and_depth_formats_map() {
         assert_eq!(
-            kind(f::A8R8G8B8, false),
+            kind(f::A8R8G8B8, false, false),
             Some(Kind::Color(vk::Format::B8G8R8A8_UNORM))
         );
-        assert_eq!(kind(f::BUFFER, false), Some(Kind::Buffer));
+        assert_eq!(kind(f::BUFFER, false, false), Some(Kind::Buffer));
         assert_eq!(
-            kind(f::D24_UNORM_S8_UINT, false),
+            kind(f::D24_UNORM_S8_UINT, false, false),
             Some(Kind::DepthConverted(vk::Format::D32_SFLOAT_S8_UINT))
         );
         assert_eq!(
-            kind(f::D24_UNORM_S8_UINT, true),
+            kind(f::D24_UNORM_S8_UINT, true, false),
             Some(Kind::Depth(vk::Format::D24_UNORM_S8_UINT))
         );
-        assert_eq!(kind(f::NV12, false), None);
+        assert_eq!(kind(f::NV12, false, false), None);
     }
 
     #[test]
