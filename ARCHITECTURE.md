@@ -177,7 +177,7 @@ Au début de M3, la 3D restait derrière les variables de sonde (`RSVGA_PROBE_CA
 - **KVM `enable_vmware_backdoor=Y`** : activé sur cette machine pour les VMware Tools. Le paramètre est global au module `kvm` et ne change qu'au rechargement du module (toutes les VM arrêtées) ; le noyau 7.4 n'a pas de réglage par VM. La commande 75 vient du noyau de l'invité et passe sans ce réglage.
 - **Shader model 5** : quelles capacités supplémentaires (devcaps, `CAP2_DX3`...) le pilote attend pour le niveau 11_0, et à quel moment les annoncer (M4).
 - **VMware Tools** (pilote invité) : logiciel propriétaire, téléchargé par l'utilisateur, jamais redistribué par ce projet.
-- **Licence du projet** : MIT OR Apache-2.0 proposée, à confirmer.
+- **Licence du projet** : MIT (fichier `LICENSE`) ; les patchs QEMU suivent la licence de QEMU.
 
 ## Références
 

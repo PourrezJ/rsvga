@@ -3,7 +3,7 @@ name = "rsvga-gop"
 description = "UEFI GOP driver for the rsvga card, shipped in its option ROM"
 version = "0.0.1"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 publish = false
 
 # Built for x86_64-unknown-uefi only: not part of the host workspace.
