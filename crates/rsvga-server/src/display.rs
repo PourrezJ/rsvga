@@ -33,8 +33,9 @@ impl Svga {
     /// which case the whole screen is read. `None` when SVGA mode is off.
     pub fn capture(&self, frame: &mut Frame) -> Option<Shown> {
         let mut state = self.lock();
-        if state.twod.capture(frame) {
-            // Screen objects replace the legacy framebuffer when defined.
+        // Screen targets (guest-backed objects) come first: a driver that
+        // uses them shows nothing anywhere else.
+        if let Some(changed) = state.gb.capture(frame) {
             let mode = Mode {
                 width: frame.width as u32,
                 height: frame.height as u32,
@@ -42,10 +43,19 @@ impl Svga {
                 pitch: frame.width as u32 * 4,
                 offset: 0,
             };
-            return Some(Shown {
-                mode,
-                changed: true,
-            });
+            return Some(Shown { mode, changed });
+        }
+        if let Some(changed) = state.twod.capture(frame) {
+            // Screen objects replace the legacy framebuffer when defined.
+            // Their pixels only change through blits, so tracking is exact.
+            let mode = Mode {
+                width: frame.width as u32,
+                height: frame.height as u32,
+                bits_per_pixel: 32,
+                pitch: frame.width as u32 * 4,
+                offset: 0,
+            };
+            return Some(Shown { mode, changed });
         }
         let mode = state.regs.mode()?;
         let resized = frame.width != mode.width as usize || frame.height != mode.height as usize;

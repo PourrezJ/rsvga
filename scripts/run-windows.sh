@@ -11,9 +11,17 @@
 #
 # Usage:
 #   scripts/run-windows.sh --disk WINDOWS.qcow2 --vars OVMF_VARS.fd \
-#       [--overlay FILE] [--mem 6144] [--cpus 4] [--trace] [--diagnose]
+#       [--overlay FILE] [--mem 6144] [--cpus 4] [--trace] [--diagnose] \
+#       [-- EXTRA QEMU ARGUMENTS...]
 #
-# --diagnose saves each guest cursor and a screen capture per second in
+# Sleep (S3) and hibernation (S4) are hidden from the guest: without S4,
+# Windows cannot use Fast Startup, so every boot is a full one and the
+# display driver always starts from scratch (a resumed driver keeps the
+# choices it made against the previous device).
+#
+# --trace logs register accesses and FIFO commands (rsvga.log), and the
+# VMware backdoor traffic, driver log messages included (qemu.log).
+# --diagnose also saves each guest cursor and a screen capture per second in
 # the overlay's folder (cursors/, screen.png).
 #
 # A QEMU (HMP) monitor listens on $XDG_RUNTIME_DIR/rsvga-vm-hmp.sock, to look
@@ -40,10 +48,11 @@ while (($#)); do
     --cpus) cpus=$2; shift 2 ;;
     --trace) trace=1; shift ;;
     --diagnose) diagnose=1; trace=1; shift ;;
-    *) sed -n '2,22p' "$0"; exit 2 ;;
+    --) shift; break ;;
+    *) sed -n '2,32p' "$0"; exit 2 ;;
   esac
 done
-[[ -n $disk && -n $vars ]] || { sed -n '2,22p' "$0"; exit 2; }
+[[ -n $disk && -n $vars ]] || { sed -n '2,32p' "$0"; exit 2; }
 for f in "$qemu" "$rsvga" "$rom" "$ovmf_code" "$disk" "$vars"; do
   [[ -e $f ]] || { echo "missing: $f" >&2; exit 1; }
 done
@@ -72,6 +81,15 @@ run=${XDG_RUNTIME_DIR:-/tmp}
 sock=$run/rsvga-vm.sock qmp=$run/rsvga-vm-qmp.sock hmp=$run/rsvga-vm-hmp.sock
 rm -f "$sock" "$qmp" "$hmp"
 
+# The VMware backdoor answers GET_SVGA_CAPABILITIES like the device (the
+# VMware driver asks it before using the card) and opens GuestRPC, the
+# channel VMware drivers log through (patch 0002).
+mapfile -t vmport < <("$rsvga" --vmport-args)
+qemu_trace=()
+if ((trace)); then
+  qemu_trace=(-trace vmport_svga_capabilities -trace "vmport_guestrpc_*" -D "$state/qemu.log")
+fi
+
 extra=()
 if ((diagnose)); then
   export RSVGA_CURSOR_DUMP=$state/cursors
@@ -86,6 +104,7 @@ for _ in $(seq 50); do [[ -S $sock ]] && break; sleep 0.1; done
 echo "Windows starts in the rsvga window (logs: $state/rsvga.log)."
 "$qemu" -name rsvga-windows \
   -machine q35,accel=kvm,memory-backend=ram -cpu host -smp "$cpus" -m "$mem" \
+  -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1 \
   -object memory-backend-memfd,id=ram,size="${mem}M",share=on \
   -rtc base=localtime -nodefaults -vga none -display none -serial null \
   -drive "if=pflash,format=raw,unit=0,readonly=on,file=$ovmf_code" \
@@ -96,4 +115,5 @@ echo "Windows starts in the rsvga window (logs: $state/rsvga.log)."
   -device qemu-xhci -device usb-tablet \
   -netdev user,id=net0 -device e1000e,netdev=net0 \
   -qmp "unix:$qmp,server=on,wait=off" -monitor "unix:$hmp,server=on,wait=off" \
-  -device "{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$sock\"}}"
+  -device "{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$sock\"}}" \
+  "${vmport[@]}" "${qemu_trace[@]}" "$@"

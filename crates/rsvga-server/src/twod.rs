@@ -10,6 +10,7 @@ use svga_core::gmr::{GmrError, GmrTable};
 use svga_core::screen::{Screens, clip};
 use svga_proto::{gmr, remap_gmr2};
 
+use crate::damage::Damage;
 use crate::display::Frame;
 use crate::guest::GuestMemory;
 use crate::shm::SharedMem;
@@ -38,6 +39,10 @@ pub struct TwoD {
     screens: Screens,
     pixels: Vec<Option<Vec<u32>>>,
     gmrfb: Option<GmrFb>,
+    /// Area of the shown (primary) screen changed since the last capture.
+    damage: Damage,
+    /// Id of the screen the last capture showed.
+    shown: Option<u32>,
 }
 
 impl TwoD {
@@ -48,6 +53,8 @@ impl TwoD {
             screens: Screens::new(MAX_SCREENS, max_width, max_height),
             pixels: vec![None; MAX_SCREENS as usize],
             gmrfb: None,
+            damage: Damage::default(),
+            shown: None,
         }
     }
 
@@ -62,6 +69,7 @@ impl TwoD {
     pub fn clear_screens(&mut self) {
         self.screens.clear();
         self.pixels.iter_mut().for_each(|p| *p = None);
+        self.damage.all();
     }
 
     /// Reads `out.len()` bytes at `offset` of GMR `id`.
@@ -139,15 +147,35 @@ impl TwoD {
                     .map_err(|e: GmrError| e.to_string())?;
             }
             Command::DefineScreen(screen) => {
+                // With SCREEN_OBJECT_2 the guest also hands over a backing
+                // store in VRAM, which the device may use for its own copy
+                // of the screen. Pixels live in host memory here, and the
+                // guest only ever pushes them with blits, so it is unused.
+                //
+                // Redefining a screen keeps what fits of its old pixels, as
+                // when a guest resizes its desktop.
+                let old = self.screens.get(screen.id).copied();
                 self.screens.define(*screen).map_err(|e| format!("{e:?}"))?;
-                let size = screen.width as usize * screen.height as usize;
-                self.pixels[screen.id as usize] = Some(vec![0; size]);
+                let (width, height) = (screen.width as usize, screen.height as usize);
+                let mut pixels = vec![0; width * height];
+                if let (Some(old), Some(old_pixels)) = (old, self.pixels[screen.id as usize].take())
+                {
+                    let (ow, oh) = (old.width as usize, old.height as usize);
+                    let (w, h) = (ow.min(width), oh.min(height));
+                    for y in 0..h {
+                        pixels[y * width..y * width + w]
+                            .copy_from_slice(&old_pixels[y * ow..y * ow + w]);
+                    }
+                }
+                self.pixels[screen.id as usize] = Some(pixels);
+                self.damage.all();
             }
             Command::DestroyScreen { id } => {
                 self.screens.destroy(*id);
                 if let Some(slot) = self.pixels.get_mut(*id as usize) {
                     *slot = None;
                 }
+                self.damage.all();
             }
             Command::DefineGmrFb {
                 ptr,
@@ -248,6 +276,9 @@ impl TwoD {
                 {
                     *pixel = u32::from_le_bytes(bytes.try_into().unwrap_or_default());
                 }
+                if self.shown == Some(screen_id) {
+                    self.damage.add(b.screen_x, b.screen_y + y, b.width, 1);
+                }
             } else {
                 let pixels = self.pixels[screen_id as usize]
                     .as_ref()
@@ -264,19 +295,34 @@ impl TwoD {
         Ok(())
     }
 
-    /// Copies the primary screen into `frame`; false if no screen exists.
-    pub fn capture(&self, frame: &mut Frame) -> bool {
-        let Some(screen) = self.screens.primary() else {
-            return false;
+    /// Brings `frame` up to date with the primary screen, copying only
+    /// what changed since the last call. `None` if no screen exists, else
+    /// whether `frame` changed.
+    pub fn capture(&mut self, frame: &mut Frame) -> Option<bool> {
+        let screen = *self.screens.primary()?;
+        let pixels = self.pixels[screen.id as usize].as_ref()?;
+        let (width, height) = (screen.width as usize, screen.height as usize);
+        if self.shown != Some(screen.id) || frame.width != width || frame.height != height {
+            self.shown = Some(screen.id);
+            self.damage.all();
+            frame.width = width;
+            frame.height = height;
+            frame.pixels.resize(width * height, 0);
+        }
+        let Some((x0, y0, x1, y1)) = self.damage.take(screen.width, screen.height) else {
+            return Some(false);
         };
-        let Some(pixels) = self.pixels[screen.id as usize].as_ref() else {
-            return false;
-        };
-        frame.width = screen.width as usize;
-        frame.height = screen.height as usize;
-        frame.pixels.clear();
-        frame.pixels.extend(pixels.iter().map(|p| p & 0x00ff_ffff));
-        true
+        let (x0, x1) = (x0 as usize, x1 as usize);
+        for y in y0 as usize..y1 as usize {
+            let line = y * width;
+            for (out, pixel) in frame.pixels[line + x0..line + x1]
+                .iter_mut()
+                .zip(&pixels[line + x0..line + x1])
+            {
+                *out = pixel & 0x00ff_ffff;
+            }
+        }
+        Some(true)
     }
 }
 
@@ -362,8 +408,9 @@ mod tests {
             },
         );
         let mut frame = Frame::default();
-        assert!(twod.capture(&mut frame));
+        assert_eq!(twod.capture(&mut frame), Some(true));
         assert_eq!((frame.width, frame.height), (8, 4));
+        assert_eq!(twod.capture(&mut frame), Some(false), "nothing new");
         assert_eq!(&frame.pixels[8 + 2..8 + 5], &[2, 3, 4]);
         assert_eq!(&frame.pixels[16 + 2..16 + 5], &[6, 7, 8]);
 
@@ -384,6 +431,86 @@ mod tests {
         let mut out = [0u8; 8];
         ram.read(4096 + 16, &mut out);
         assert_eq!(out, [2, 0, 0, 0, 3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn capture_copies_only_blitted_rows_and_resizes_keep_pixels() {
+        let ram = SharedMem::new("ram", 4096).unwrap();
+        let fd: OwnedFd = ram.fd().try_clone_to_owned().unwrap();
+        let mut guest = GuestMemory::default();
+        guest.add(0x10000, 4096, Some(fd), 0, true).unwrap();
+        let vram = SharedMem::new("vram", 4096).unwrap();
+        let mem = Memory {
+            guest: &guest,
+            vram: &vram,
+        };
+        for i in 0..16u32 {
+            ram.write(i as usize * 4, &(0x100 + i).to_le_bytes());
+        }
+        let mut twod = TwoD::new(8, 64, 1920, 1080);
+        let run = |t: &mut TwoD, c: Command| t.execute(&c, &mem).unwrap();
+        run(
+            &mut twod,
+            Command::DefineGmr2 {
+                gmr_id: 0,
+                num_pages: 1,
+            },
+        );
+        run(
+            &mut twod,
+            Command::RemapGmr2 {
+                gmr_id: 0,
+                flags: 0,
+                offset_pages: 0,
+                num_pages: 1,
+                pages: PageSource::Inline(vec![0x10]),
+            },
+        );
+        run(
+            &mut twod,
+            Command::DefineGmrFb {
+                ptr: GuestPtr {
+                    gmr_id: 0,
+                    offset: 0,
+                },
+                bytes_per_line: 16,
+                bits_per_pixel: 32,
+                color_depth: 24,
+                format_reserved: 0,
+            },
+        );
+        let blit = |left, top, right, bottom| Command::BlitGmrFbToScreen {
+            src_origin: Point { x: 0, y: 0 },
+            dst_rect: SignedRect {
+                left,
+                top,
+                right,
+                bottom,
+            },
+            dst_screen: 0,
+        };
+        run(&mut twod, screen(4, 4));
+        let mut frame = Frame::default();
+        assert_eq!(
+            twod.capture(&mut frame),
+            Some(true),
+            "new screen: all of it"
+        );
+        assert_eq!(frame.pixels, [0; 16]);
+
+        // A one-row blit: only that row is copied into the frame.
+        frame.pixels[0] = 0xdead;
+        run(&mut twod, blit(1, 2, 3, 3));
+        assert_eq!(twod.capture(&mut frame), Some(true));
+        assert_eq!(frame.pixels[0], 0xdead, "row 0 was not damaged");
+        assert_eq!(&frame.pixels[8..12], &[0, 0x100, 0x101, 0]);
+
+        // Growing the screen keeps the pixels that still fit.
+        run(&mut twod, screen(6, 4));
+        assert_eq!(twod.capture(&mut frame), Some(true));
+        assert_eq!((frame.width, frame.height), (6, 4));
+        assert_eq!(&frame.pixels[12..18], &[0, 0x100, 0x101, 0, 0, 0]);
+        assert_eq!(twod.capture(&mut frame), Some(false));
     }
 
     #[test]
@@ -418,6 +545,6 @@ mod tests {
         );
         assert_eq!(twod.execute(&Command::Nop, &mem), Ok(false));
         let mut frame = Frame::default();
-        assert!(!twod.capture(&mut frame));
+        assert_eq!(twod.capture(&mut frame), None);
     }
 }

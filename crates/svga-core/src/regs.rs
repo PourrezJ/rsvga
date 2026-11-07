@@ -4,7 +4,7 @@
 //! acts on effects (process the FIFO, switch display mode...). Every guest
 //! value is stored as-is and validated when used, in [`Registers::mode`].
 
-use svga_proto::{fifo, id, port, reg};
+use svga_proto::{cap, fifo, id, port, reg};
 
 /// Static properties of the emulated device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +26,13 @@ pub struct Config {
     /// Value of [`reg::MEMORY_SIZE`]: guest memory usable through GMRs, in
     /// bytes.
     pub memory_size: u32,
+    /// Value of [`reg::SUGGESTED_GBOBJECT_MEM_SIZE_KB`]: guest memory the
+    /// guest may hand over as memory objects (MOBs), in KiB.
+    pub gb_memory_kb: u32,
+    /// Value of [`reg::MOB_MAX_SIZE`]: largest single MOB, in bytes.
+    pub mob_max_size: u32,
+    /// Value of [`reg::CAP2`] (read only with `SVGA_CAP_CAP2_REGISTER`).
+    pub caps2: u32,
 }
 
 /// Number of scratch registers exposed.
@@ -68,6 +75,13 @@ pub enum Effect {
     IrqAck(u32),
     /// The guest changed [`reg::IRQMASK`].
     IrqMask,
+    /// The guest submitted a command buffer ([`reg::COMMAND_LOW`]).
+    CommandBuffer {
+        /// Guest physical address of the `SVGACBHeader` (64-byte aligned).
+        header: u64,
+        /// Context from the low bits of [`reg::COMMAND_LOW`].
+        context: u32,
+    },
 }
 
 /// The register file.
@@ -89,6 +103,9 @@ pub struct Registers {
     displays: [u32; 8],
     fb_start: u32,
     mem_start: u32,
+    command_high: u32,
+    dev_cap_index: u32,
+    devcaps: Vec<u32>,
     palette: Vec<u32>,
     scratch: Vec<u32>,
 }
@@ -113,6 +130,9 @@ impl Registers {
             displays: [0; 8],
             fb_start: 0,
             mem_start: 0,
+            command_high: 0,
+            dev_cap_index: 0,
+            devcaps: Vec::new(),
             palette: vec![0; reg::NUM_PALETTE_REGS as usize],
             scratch: vec![0; SCRATCH_REGS as usize],
         }
@@ -121,9 +141,22 @@ impl Registers {
     /// Back to power-on state, keeping the BAR addresses.
     pub fn reset(&mut self) {
         let (fb_start, mem_start) = (self.fb_start, self.mem_start);
+        let devcaps = std::mem::take(&mut self.devcaps);
         *self = Self::new(self.cfg);
         self.fb_start = fb_start;
         self.mem_start = mem_start;
+        self.devcaps = devcaps;
+    }
+
+    /// Sets the 3D capabilities served through [`reg::DEV_CAP`], indexed by
+    /// `SVGA3D_DEVCAP_*`; missing entries read as 0.
+    pub fn set_devcaps(&mut self, table: Vec<u32>) {
+        self.devcaps = table;
+    }
+
+    /// The 3D capabilities table.
+    pub fn devcaps(&self) -> &[u32] {
+        &self.devcaps
     }
 
     /// Static configuration.
@@ -277,6 +310,18 @@ impl Registers {
             reg::GMR_MAX_IDS => self.cfg.gmr_max_ids,
             reg::GMRS_MAX_PAGES => self.cfg.gmr_max_pages,
             reg::MEMORY_SIZE => self.cfg.memory_size,
+            reg::SUGGESTED_GBOBJECT_MEM_SIZE_KB | reg::GBOBJECT_MEM_SIZE_KB => {
+                self.cfg.gb_memory_kb
+            }
+            reg::MOB_MAX_SIZE => self.cfg.mob_max_size,
+            reg::SCREENTARGET_MAX_WIDTH => self.cfg.max_width,
+            reg::SCREENTARGET_MAX_HEIGHT => self.cfg.max_height,
+            reg::CAP2 => self.cfg.caps2,
+            reg::DEV_CAP => usize::try_from(self.dev_cap_index)
+                .ok()
+                .and_then(|i| self.devcaps.get(i))
+                .copied()
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -376,6 +421,22 @@ impl Registers {
                 self.traces = value;
                 Effect::None
             }
+            reg::COMMAND_HIGH => {
+                self.command_high = value;
+                Effect::None
+            }
+            reg::DEV_CAP => {
+                self.dev_cap_index = value;
+                Effect::None
+            }
+            // Writing the low half submits: the high half must come first.
+            reg::COMMAND_LOW if self.cfg.capabilities & cap::COMMAND_BUFFERS != 0 => {
+                Effect::CommandBuffer {
+                    header: u64::from(self.command_high) << 32
+                        | u64::from(value & !svga_proto::cb::CONTEXT_MASK),
+                    context: value & svga_proto::cb::CONTEXT_MASK,
+                }
+            }
             _ => Effect::None,
         }
     }
@@ -396,6 +457,9 @@ mod tests {
             gmr_max_ids: 64,
             gmr_max_pages: 65536,
             memory_size: 256 << 20,
+            gb_memory_kb: 1 << 20,
+            mob_max_size: 256 << 20,
+            caps2: 0,
         })
     }
 
@@ -501,5 +565,41 @@ mod tests {
         assert!(!r.enabled());
         assert_eq!(get(&mut r, reg::FB_START), 0xe000_0000);
         assert_eq!(get(&mut r, reg::MEM_START), 0xf000_0000);
+    }
+
+    #[test]
+    fn devcaps_are_read_by_index() {
+        let mut r = regs();
+        r.set_devcaps(vec![1, 0, 7]);
+        set(&mut r, reg::DEV_CAP, 2);
+        assert_eq!(get(&mut r, reg::DEV_CAP), 7);
+        set(&mut r, reg::DEV_CAP, 99);
+        assert_eq!(get(&mut r, reg::DEV_CAP), 0, "beyond the table");
+        r.reset();
+        set(&mut r, reg::DEV_CAP, 0);
+        assert_eq!(get(&mut r, reg::DEV_CAP), 1, "kept across resets");
+    }
+
+    #[test]
+    fn command_buffer_submission() {
+        let mut r = regs();
+        set(&mut r, reg::COMMAND_HIGH, 0x1);
+        assert_eq!(
+            set(&mut r, reg::COMMAND_LOW, 0x2345_6040),
+            Effect::None,
+            "ignored without SVGA_CAP_COMMAND_BUFFERS"
+        );
+        let mut r = Registers::new(Config {
+            capabilities: cap::COMMAND_BUFFERS,
+            ..*regs().config()
+        });
+        assert_eq!(set(&mut r, reg::COMMAND_HIGH, 0x1), Effect::None);
+        assert_eq!(
+            set(&mut r, reg::COMMAND_LOW, 0x2345_6040 | 0x3f),
+            Effect::CommandBuffer {
+                header: 0x1_2345_6040,
+                context: 0x3f
+            }
+        );
     }
 }

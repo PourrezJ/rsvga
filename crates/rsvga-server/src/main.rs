@@ -6,10 +6,13 @@
 //!     "socket":{"type":"unix","path":"/run/user/1000/rsvga.sock"}}'
 //! ```
 
+mod cmdbuf;
 mod cursor;
 mod damage;
+mod devcaps;
 mod device;
 mod display;
+mod gb;
 mod guest;
 mod irq;
 mod pci;
@@ -57,7 +60,8 @@ struct Args {
 }
 
 const USAGE: &str = "usage: rsvga --socket PATH [--rom DRIVER.efi] [--vram-mb N] [--fifo-kb N] \
-                     [--snapshot FILE.png] [--window [--qmp QEMU.sock]]";
+                     [--snapshot FILE.png] [--window [--qmp QEMU.sock]]\n       \
+                     rsvga --vmport-args   (QEMU arguments for the VMware backdoor, one per line)";
 
 fn parse_args() -> Result<Args, String> {
     let mut socket = None;
@@ -72,6 +76,12 @@ fn parse_args() -> Result<Args, String> {
         max_height: 2160,
     };
     let mut args = std::env::args().skip(1);
+    if std::env::args().nth(1).as_deref() == Some("--vmport-args") {
+        for arg in device::vmport_args() {
+            println!("{arg}");
+        }
+        process::exit(0);
+    }
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {

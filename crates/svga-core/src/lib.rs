@@ -4,10 +4,14 @@
 //! only (`unsafe` is forbidden workspace-wide), never panics on guest input,
 //! and bounds every size it derives from guest values.
 
+pub mod cmdbuf;
 pub mod command;
 pub mod decode;
 pub mod fifo;
+pub mod gb;
 pub mod gmr;
+pub mod layout;
+pub mod mob;
 pub mod regs;
 pub mod screen;
 

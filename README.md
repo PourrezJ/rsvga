@@ -6,7 +6,7 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M1 atteint**. Avec le QEMU patché (une petite modification de vfio-user), le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel** (2D, framebuffer, interruptions). Prochaine étape : M2 (Screen Objects, GMR, curseur), puis la 3D. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M2 presque atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080. Le pilote écrit son journal à l'hôte, ce qui guide la suite : la 3D (M3). Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
@@ -28,7 +28,10 @@ fuzz/run.sh decode 60
 
 ## QEMU patché
 
-Les pilotes VMware parlent à la carte par des accès non alignés, que QEMU refuse sur les régions vfio. Le patch [patches/qemu/0001-vfio-user-pass-unaligned-region-accesses-through.patch](patches/qemu/0001-vfio-user-pass-unaligned-region-accesses-through.patch) corrige ça pour vfio-user seulement. Pour construire QEMU 11.1.2 patché dans `target/qemu/install`, sans toucher au QEMU du système :
+Deux petits patchs :
+
+- Les pilotes VMware parlent à la carte par des accès non alignés, que QEMU refuse sur les régions vfio. [0001](patches/qemu/0001-vfio-user-pass-unaligned-region-accesses-through.patch) corrige ça pour vfio-user seulement.
+- Le pilote Windows demande les capacités de la carte à l'hyperviseur par le port VMware (commande 75), et y écrit son journal (GuestRPC). [0002](patches/qemu/0002-vmport-answer-SVGA-capability-queries-and-GuestRPC.patch) ajoute les deux, désactivés par défaut ; `run-windows.sh` les active avec les valeurs que donne `rsvga --vmport-args`. Pour construire QEMU 11.1.2 patché dans `target/qemu/install`, sans toucher au QEMU du système :
 
 ```bash
 sudo apt install libpixman-1-dev libslirp-dev libgtk-3-dev libfdt-dev

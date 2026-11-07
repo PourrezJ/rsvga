@@ -10,6 +10,8 @@
 
 #![no_std]
 
+pub mod format;
+
 /// PCI identity and BAR layout of the SVGA II device.
 pub mod pci {
     /// VMware's PCI vendor ID.
@@ -417,6 +419,7 @@ pub mod cmd {
 
 /// 3D command ID ranges. 3D commands are framed as `{ id, size_in_bytes }`
 /// followed by `size_in_bytes` of payload.
+#[allow(missing_docs)]
 pub mod cmd3d {
     /// First ID of the (obsolete) legacy 3D range.
     pub const LEGACY_BASE: u32 = 1000;
@@ -424,6 +427,47 @@ pub mod cmd3d {
     pub const BASE: u32 = 1040;
     /// First 3D context command of the DX interface.
     pub const DX_DEFINE_CONTEXT: u32 = 1143;
+
+    // Guest-backed objects: memory objects (MOBs), object tables, surfaces
+    // and screen targets.
+    pub const SURFACE_COPY: u32 = 1042;
+    pub const SET_OTABLE_BASE: u32 = 1091;
+    pub const READBACK_OTABLE: u32 = 1092;
+    pub const DEFINE_GB_MOB: u32 = 1093;
+    pub const DESTROY_GB_MOB: u32 = 1094;
+    pub const DEFINE_GB_SURFACE: u32 = 1097;
+    pub const DESTROY_GB_SURFACE: u32 = 1098;
+    pub const BIND_GB_SURFACE: u32 = 1099;
+    pub const COND_BIND_GB_SURFACE: u32 = 1100;
+    pub const UPDATE_GB_IMAGE: u32 = 1101;
+    pub const UPDATE_GB_SURFACE: u32 = 1102;
+    pub const READBACK_GB_IMAGE: u32 = 1103;
+    pub const READBACK_GB_SURFACE: u32 = 1104;
+    pub const INVALIDATE_GB_IMAGE: u32 = 1105;
+    pub const INVALIDATE_GB_SURFACE: u32 = 1106;
+    pub const SET_OTABLE_BASE64: u32 = 1115;
+    pub const NOP: u32 = 1119;
+    pub const ENABLE_GART: u32 = 1120;
+    pub const DISABLE_GART: u32 = 1121;
+    pub const MAP_MOB_INTO_GART: u32 = 1122;
+    pub const UNMAP_GART_RANGE: u32 = 1123;
+    pub const DEFINE_GB_SCREENTARGET: u32 = 1124;
+    pub const DESTROY_GB_SCREENTARGET: u32 = 1125;
+    pub const BIND_GB_SCREENTARGET: u32 = 1126;
+    pub const UPDATE_GB_SCREENTARGET: u32 = 1127;
+    pub const READBACK_GB_IMAGE_PARTIAL: u32 = 1128;
+    pub const INVALIDATE_GB_IMAGE_PARTIAL: u32 = 1129;
+    pub const GB_SCREEN_DMA: u32 = 1131;
+    pub const BIND_GB_SURFACE_WITH_PITCH: u32 = 1132;
+    pub const GB_MOB_FENCE: u32 = 1133;
+    pub const DEFINE_GB_SURFACE_V2: u32 = 1134;
+    pub const DEFINE_GB_MOB64: u32 = 1135;
+    pub const REDEFINE_GB_MOB64: u32 = 1136;
+    pub const NOP_ERROR: u32 = 1137;
+    pub const GROW_OTABLE: u32 = 1236;
+    pub const DEFINE_GB_SURFACE_V3: u32 = 1239;
+    pub const UPDATE_ZERO_SURFACE: u32 = 1256;
+    pub const DEFINE_GB_SURFACE_V4: u32 = 1267;
     /// One past the last 3D command known to this protocol version.
     pub const MAX: u32 = 1303;
     /// One past the last ID reserved for 3D-framed commands.
@@ -452,6 +496,68 @@ pub mod screen_flag {
     pub const BLANKING: u32 = 1 << 4;
 }
 
+/// The ID meaning "no object" for MOBs, surfaces, screen targets...
+pub const INVALID_ID: u32 = 0xffff_ffff;
+
+/// `SVGAMobFormat`: how a MOB (or object table) maps its pages. `PT*_0`
+/// point at the data, `PT*_1` at one page of page numbers, `PT*_2` at a
+/// page of page-table pages; `RANGE` is physically contiguous.
+pub mod mobfmt {
+    #![allow(missing_docs)]
+    pub const PT_0: u32 = 0;
+    pub const PT_1: u32 = 1;
+    pub const PT_2: u32 = 2;
+    pub const RANGE: u32 = 3;
+    pub const PT64_0: u32 = 4;
+    pub const PT64_1: u32 = 5;
+    pub const PT64_2: u32 = 6;
+    pub const EMPTY: u32 = 7;
+}
+
+/// `SVGAOTableType`: the object tables the guest hands to the device.
+pub mod otable {
+    #![allow(missing_docs)]
+    pub const MOB: u32 = 0;
+    pub const SURFACE: u32 = 1;
+    pub const CONTEXT: u32 = 2;
+    pub const SHADER: u32 = 3;
+    pub const SCREENTARGET: u32 = 4;
+    pub const DXCONTEXT: u32 = 5;
+    /// Number of table types (including reserved ones).
+    pub const MAX: u32 = 8;
+}
+
+/// Screen target flags (`SVGA_STFLAG_*`).
+pub mod stflag {
+    /// The primary screen.
+    pub const PRIMARY: u32 = 1 << 0;
+}
+
+/// Surface flags used by the device (`SVGA3D_SURFACE_*`, 64-bit).
+pub mod surface_flag {
+    /// Six faces per layer.
+    pub const CUBEMAP: u64 = 1 << 0;
+}
+
+/// Flags of `SVGA_3D_CMD_COND_BIND_GB_SURFACE`.
+pub mod cond_bind {
+    /// Copy the host contents back to the old MOB before rebinding.
+    pub const READBACK: u32 = 1 << 0;
+    /// Load the host contents from the new MOB after rebinding.
+    pub const UPDATE: u32 = 1 << 1;
+}
+
+/// MOB cursors (`SVGA_REG_CURSOR_MOBID`): the MOB starts with an
+/// `SVGAGBCursorHeader` (type, 6 header words, `sizeInBytes`), then pixels.
+pub mod gb_cursor {
+    /// AND/XOR masks (`SVGAGBColorCursorHeader`).
+    pub const COLOR: u32 = 0;
+    /// Premultiplied 0xAARRGGBB pixels (`SVGAGBAlphaCursorHeader`).
+    pub const ALPHA: u32 = 1;
+    /// Size of `SVGAGBCursorHeader` in bytes.
+    pub const HEADER_BYTES: u32 = 32;
+}
+
 /// Special guest memory region IDs.
 pub mod gmr {
     /// No GMR.
@@ -467,6 +573,107 @@ pub mod cursor_on {
     pub const SHOW: u32 = 1;
     pub const REMOVE_FROM_FB: u32 = 2;
     pub const RESTORE_TO_FB: u32 = 3;
+}
+
+/// Command buffers (`SVGA_CAP_COMMAND_BUFFERS`): the guest writes the
+/// physical address of an `SVGACBHeader` to [`reg::COMMAND_HIGH`] then
+/// [`reg::COMMAND_LOW`], the low 6 bits of which select the context.
+pub mod cb {
+    /// Size of `SVGACBHeader` in bytes; headers are aligned on it.
+    pub const HEADER_BYTES: u32 = 64;
+    /// Low bits of [`super::reg::COMMAND_LOW`] holding the context.
+    pub const CONTEXT_MASK: u32 = 0x3f;
+    /// Largest command buffer without `SVGA_CAP2_CB_MAX_SIZE_4MB`, in bytes.
+    pub const MAX_SIZE_DEFAULT: u32 = 512 * 1024;
+    /// Command buffers a context may hold queued.
+    pub const MAX_QUEUED_PER_CONTEXT: usize = 32;
+    /// Largest single command inside a command buffer, in bytes.
+    pub const MAX_COMMAND_SIZE: u32 = 32 * 1024;
+
+    /// `SVGACBContext`: where a command buffer is queued.
+    pub mod context {
+        #![allow(missing_docs)]
+        pub const CONTEXT_0: u32 = 0;
+        pub const CONTEXT_1: u32 = 1;
+        /// Number of regular contexts.
+        pub const MAX: u32 = 2;
+        /// The device context: start, stop and preempt the others.
+        pub const DEVICE: u32 = 0x3f;
+    }
+
+    /// `SVGACBStatus`, written by the device into the header.
+    pub mod status {
+        #![allow(missing_docs)]
+        /// Not processed yet (the guest writes this before submitting).
+        pub const NONE: u32 = 0;
+        pub const COMPLETED: u32 = 1;
+        pub const QUEUE_FULL: u32 = 2;
+        /// A command failed; `errorOffset` points at it.
+        pub const COMMAND_ERROR: u32 = 3;
+        pub const CB_HEADER_ERROR: u32 = 4;
+        pub const PREEMPTED: u32 = 5;
+        pub const SUBMISSION_ERROR: u32 = 6;
+        pub const PARTIAL_COMPLETE: u32 = 7;
+    }
+
+    /// `SVGACBFlags`.
+    pub mod flag {
+        #![allow(missing_docs)]
+        pub const NO_IRQ: u32 = 1 << 0;
+        pub const DX_CONTEXT: u32 = 1 << 1;
+        /// The commands live in a MOB rather than at a physical address.
+        pub const MOB: u32 = 1 << 2;
+    }
+
+    /// `SVGADeviceContextCmdId`: commands of the device context.
+    pub mod dc {
+        #![allow(missing_docs)]
+        pub const NOP: u32 = 0;
+        /// `{ enable, context }`.
+        pub const START_STOP_CONTEXT: u32 = 1;
+        /// `{ context, ignoreIDZero }`.
+        pub const PREEMPT: u32 = 2;
+        /// `{ context }`.
+        pub const START_QUEUE: u32 = 3;
+        /// `{ context }`.
+        pub const ASYNC_STOP_QUEUE: u32 = 4;
+        /// `{ context }`.
+        pub const EMPTY_CONTEXT_QUEUE: u32 = 5;
+        pub const MAX: u32 = 6;
+    }
+}
+
+/// 3D device capabilities (`SVGA3D_DEVCAP_*`), read through
+/// [`reg::DEV_CAP`] or from the FIFO 3D caps record. Only the indices rsvga
+/// sets are named.
+pub mod devcap {
+    #![allow(missing_docs)]
+    pub const THREE_D: u32 = 0;
+    pub const VERTEX_SHADER_VERSION: u32 = 4;
+    pub const VERTEX_SHADER: u32 = 5;
+    pub const FRAGMENT_SHADER_VERSION: u32 = 6;
+    pub const FRAGMENT_SHADER: u32 = 7;
+    pub const MAX_RENDER_TARGETS: u32 = 8;
+    pub const MAX_TEXTURE_WIDTH: u32 = 19;
+    pub const MAX_TEXTURE_HEIGHT: u32 = 20;
+    pub const MAX_SIMULTANEOUS_RENDER_TARGETS: u32 = 64;
+    pub const MAX_CONTEXT_IDS: u32 = 77;
+    pub const MAX_SURFACE_IDS: u32 = 78;
+    pub const DXCONTEXT: u32 = 95;
+    pub const DX_MAX_VERTEXBUFFERS: u32 = 97;
+    pub const DX_MAX_CONSTANT_BUFFERS: u32 = 98;
+    pub const SM41: u32 = 244;
+    pub const SM5: u32 = 258;
+    /// Number of devcap indices.
+    pub const MAX: u32 = 262;
+}
+
+/// Record types in the FIFO 3D caps area ([`fifo::CAPS_3D`]): records of
+/// `{ length_in_words, type }` followed by `(index, value)` pairs, ended
+/// by a record of length 0.
+pub mod fifo_caps_record {
+    /// Device capabilities, as `(devcap index, value)` pairs.
+    pub const DEVCAPS: u32 = 0x100;
 }
 
 /// The only raster operation modern commands accept.

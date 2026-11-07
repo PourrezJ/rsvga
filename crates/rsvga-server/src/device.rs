@@ -10,12 +10,13 @@ use std::time::Duration;
 
 use svga_core::command::{Command, Rect};
 use svga_core::{Config, Effect, FifoMemory, Limits, Mode, Registers, Snapshot, StopReason, run};
-use svga_proto::{cap, cursor_on, fifo, fifo_cap, irq, port};
+use svga_proto::{cap, cap2, cursor_on, fifo, fifo_cap, irq, port};
 use vfio_user::wire::{
     Errno, device_flags, irq_info_flags, irq_set_flags, pci_irq, pci_region, region_flags,
 };
 use vfio_user::{Device, DeviceInfo, DmaMapping, IrqInfo, IrqSet, RegionInfo};
 
+use crate::cmdbuf::CommandBuffers;
 use crate::cursor::{self as guest_cursor, CursorImage};
 use crate::damage::Damage;
 use crate::guest::GuestMemory;
@@ -25,22 +26,45 @@ use crate::pci::{CONFIG_SIZE, PciConfig};
 use crate::shm::SharedMem;
 use crate::twod::{Memory, TwoD};
 
-/// Device capabilities advertised in `SVGA_REG_CAPABILITIES` (M1: 2D only).
+/// Device capabilities advertised in `SVGA_REG_CAPABILITIES`: 2D with GMR2
+/// and screen objects, commands in FIFO or command buffers, and
+/// guest-backed objects (MOBs, surfaces, screen targets). No 3D yet: the
+/// VMware WDDM driver then runs as a display-only driver on screen targets.
 pub const CAPABILITIES: u32 = cap::RECT_COPY
     | cap::CURSOR
     | cap::ALPHA_CURSOR
     | cap::EXTENDED_FIFO
     | cap::PITCHLOCK
-    | cap::IRQMASK;
+    | cap::IRQMASK
+    | cap::GMR2
+    | cap::SCREEN_OBJECT_2
+    | cap::COMMAND_BUFFERS
+    | cap::CMD_BUFFERS_2
+    | cap::GBOBJECTS
+    | cap::CAP2_REGISTER;
+
+/// Value of `SVGA_REG_CAP2`: object tables may grow (the device keeps its
+/// state elsewhere), GB memory is given in `GBOBJECT_MEM_SIZE_KB`, object
+/// tables may use two-level page tables.
+pub const CAPABILITIES_2: u32 = cap2::GROW_OTABLE | cap2::GB_MEMSIZE_2 | cap2::OTABLE_PTDEPTH_2;
 /// GMR limits advertised to the guest (64 regions, 1 GiB of pages).
 pub const GMR_MAX_IDS: u32 = 64;
 /// Total pages across all GMRs.
 pub const GMR_MAX_PAGES: u32 = 256 * 1024;
 /// Guest memory usable through GMRs, in bytes.
 pub const GMR_MEMORY_SIZE: u32 = 1 << 30;
+/// Guest memory the guest may turn into memory objects (MOBs): 1 GiB.
+pub const GB_MEMORY_KB: u32 = 1 << 20;
+/// Largest single MOB, in bytes.
+pub const MOB_MAX_SIZE: u32 = 256 << 20;
+/// Host memory all device copies of guest-backed surfaces may use.
+pub const GB_SURFACE_BYTES: u64 = 1 << 30;
 
 /// FIFO capabilities written into `SVGA_FIFO_CAPABILITIES`.
-pub const FIFO_CAPABILITIES: u32 = fifo_cap::FENCE | fifo_cap::CURSOR_BYPASS_3;
+pub const FIFO_CAPABILITIES: u32 = fifo_cap::FENCE
+    | fifo_cap::CURSOR_BYPASS_3
+    | fifo_cap::SCREEN_OBJECT
+    | fifo_cap::SCREEN_OBJECT_2;
 
 /// Commands handled per FIFO pass, and passes per processing request: the
 /// guest cannot keep the device busy forever.
@@ -54,7 +78,7 @@ const IO_BAR_SIZE: u64 = 16;
 /// and every unsupported FIFO command; 2 also logs raw region accesses.
 pub static TRACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn trace_level() -> u8 {
+pub(crate) fn trace_level() -> u8 {
     TRACE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -63,7 +87,7 @@ fn tracing() -> bool {
 }
 
 /// Logs a trace line, folding identical consecutive lines (drivers poll).
-fn trace(line: String) {
+pub(crate) fn trace(line: String) {
     static LAST: Mutex<(String, u64)> = Mutex::new((String::new(), 0));
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if last.0 == line {
@@ -153,8 +177,12 @@ pub struct State {
     pub guest: GuestMemory,
     /// GMRs and screen objects.
     pub twod: TwoD,
+    /// Guest-backed objects: MOBs, surfaces, screen targets.
+    pub gb: crate::gb::Gb,
     /// The INTx line.
     pub irq: Intx,
+    /// Command buffer contexts.
+    pub cb: CommandBuffers,
     /// Framebuffer area changed since the display last copied it.
     pub damage: Damage,
     /// Last cursor image defined by the guest, and a counter of definitions.
@@ -171,7 +199,7 @@ pub struct Svga {
     vram: SharedMem,
     fifo: SharedMem,
     state: Mutex<State>,
-    limits: Limits,
+    pub(crate) limits: Limits,
     /// Whether a VMM is connected, and whether one ever was.
     client_connected: AtomicBool,
     client_seen: AtomicBool,
@@ -195,6 +223,53 @@ impl FifoMemory for FifoView<'_> {
     }
 }
 
+/// Diagnostic override from the environment (hexadecimal), to study how a
+/// guest driver reacts to capabilities the device does not implement.
+fn probe_env(name: &str) -> Option<u32> {
+    let value = std::env::var(name).ok()?;
+    let value = u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()?;
+    log!("PROBE {name} = {value:#x}: advertised, not implemented");
+    Some(value)
+}
+
+/// Capabilities this run advertises: [`CAPABILITIES`], unless
+/// `RSVGA_PROBE_CAPS` overrides them for driver probing.
+pub fn capabilities() -> u32 {
+    probe_env("RSVGA_PROBE_CAPS").unwrap_or(CAPABILITIES)
+}
+
+/// Value of `SVGA_REG_CAP2`: [`CAPABILITIES_2`], unless
+/// `RSVGA_PROBE_CAPS2` overrides it.
+pub fn caps2() -> u32 {
+    probe_env("RSVGA_PROBE_CAPS2").unwrap_or(CAPABILITIES_2)
+}
+
+/// 3D hardware version written into the FIFO: 0 (no 3D), unless
+/// `RSVGA_PROBE_HW3D` overrides it for driver probing.
+pub fn hw_version_3d() -> u32 {
+    probe_env("RSVGA_PROBE_HW3D").unwrap_or(0)
+}
+
+/// QEMU arguments (one per element) for its VMware backdoor (`vmport`):
+/// answer `BDOOR_CMD_GET_SVGA_CAPABILITIES` exactly like this device, and
+/// open the GuestRPC channel the VMware drivers log through. Needs the
+/// rsvga QEMU patch `0002-vmport-...`.
+pub fn vmport_args() -> Vec<String> {
+    let caps = capabilities();
+    let caps2 = caps2();
+    [
+        "vmport.svga-backdoor=on".to_string(),
+        format!("vmport.svga-caps={caps:#x}"),
+        format!("vmport.svga-fifo-caps={FIFO_CAPABILITIES:#x}"),
+        format!("vmport.svga-3d-hwversion={:#x}", hw_version_3d()),
+        format!("vmport.svga-caps2={caps2:#x}"),
+        "vmport.guestrpc=on".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|global| ["-global".to_string(), global])
+    .collect()
+}
+
 fn reg_index(index: u32) -> usize {
     usize::try_from(index).unwrap_or(usize::MAX)
 }
@@ -210,16 +285,22 @@ impl Svga {
         };
         let vram = SharedMem::new("rsvga-vram", opts.vram_size as usize)?;
         let fifo = SharedMem::new("rsvga-fifo", opts.fifo_size as usize)?;
-        let regs = Registers::new(Config {
+        let mut regs = Registers::new(Config {
             vram_size: opts.vram_size,
             fifo_size: opts.fifo_size,
             max_width: opts.max_width,
             max_height: opts.max_height,
-            capabilities: CAPABILITIES,
+            capabilities: capabilities(),
             gmr_max_ids: GMR_MAX_IDS,
             gmr_max_pages: GMR_MAX_PAGES,
             memory_size: GMR_MEMORY_SIZE,
+            gb_memory_kb: GB_MEMORY_KB,
+            mob_max_size: MOB_MAX_SIZE,
+            caps2: caps2(),
         });
+        regs.set_devcaps(crate::devcaps::table(
+            regs.config().capabilities & cap::THREE_D != 0,
+        ));
         let state = State {
             regs,
             pci: PciConfig::new(opts.vram_size, opts.fifo_size, rom_bar),
@@ -227,7 +308,15 @@ impl Svga {
             last_mode: None,
             guest: GuestMemory::default(),
             twod: TwoD::new(GMR_MAX_IDS, GMR_MAX_PAGES, opts.max_width, opts.max_height),
+            gb: crate::gb::Gb::new(crate::gb::Limits {
+                mob_pages: u64::from(GB_MEMORY_KB) * 1024 / 4096,
+                mob_size: MOB_MAX_SIZE,
+                surface_bytes: GB_SURFACE_BYTES,
+                max_width: opts.max_width,
+                max_height: opts.max_height,
+            }),
             irq: Intx::default(),
+            cb: CommandBuffers::default(),
             damage: Damage::default(),
             cursor: None,
             cursor_serial: 0,
@@ -273,7 +362,7 @@ impl Svga {
         let r = |i: u32| self.fifo.load_u32(reg_index(i));
         let state = self.lock();
         format!(
-            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
+            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
             r(fifo::MIN),
             r(fifo::MAX),
             r(fifo::NEXT_CMD),
@@ -286,6 +375,8 @@ impl Svga {
             r(fifo::CURSOR_Y),
             r(fifo::CURSOR_COUNT),
             state.stats.commands,
+            state.cb.completed,
+            state.cb.failed,
             state.fifo_error,
             state.regs.irq_mask(),
             state.irq.pending(),
@@ -344,10 +435,19 @@ impl Svga {
                         for (index, value) in [
                             (fifo::CAPABILITIES, FIFO_CAPABILITIES),
                             (fifo::FLAGS, 0),
-                            (fifo::HWVERSION_3D, 0),
+                            (fifo::HWVERSION_3D, hw_version_3d()),
+                            (fifo::HWVERSION_3D_REVISED, hw_version_3d()),
                         ] {
                             if snap.has_register(index) {
                                 view.store(reg_index(index), value);
+                            }
+                        }
+                        // The 3D caps record, for drivers that read it from
+                        // the FIFO rather than through SVGA_REG_DEV_CAP.
+                        if snap.has_register(fifo::CAPS_3D_LAST) {
+                            let record = crate::devcaps::fifo_record(state.regs.devcaps());
+                            for (i, word) in record.into_iter().enumerate() {
+                                view.store(reg_index(fifo::CAPS_3D).saturating_add(i), word);
                             }
                         }
                         log!("FIFO on: ring {:#x}..{:#x}", snap.min(), snap.max());
@@ -358,6 +458,9 @@ impl Svga {
             }
             Effect::ConfigDone(false) => log!("FIFO off"),
             Effect::Sync => self.process_fifo(state),
+            Effect::CommandBuffer { header, context } => {
+                self.submit_command_buffer(state, header, context);
+            }
         }
     }
 
@@ -389,13 +492,35 @@ impl Svga {
         }
     }
 
-    fn execute(&self, state: &mut State, command: Command) {
+    pub(crate) fn execute(&self, state: &mut State, command: Command) {
         state.stats.commands = state.stats.commands.saturating_add(1);
         if trace_level() >= 1 {
             match &command {
                 Command::Fence(value) => trace(format!("FIFO Fence({value:#x})")),
+                // Guest-backed commands are traced by name below.
+                Command::Command3d { id, payload, .. }
+                    if svga_core::gb::parse(*id, payload).is_some() => {}
                 other => trace(format!("FIFO {}", command_name(other))),
             }
+        }
+        if let Command::Command3d { id, payload, .. } = &command
+            && let Some(parsed) = svga_core::gb::parse(*id, payload)
+        {
+            let State { gb, guest, .. } = state;
+            let result = parsed
+                .map_err(|short| short.to_string())
+                .and_then(|gb_command| {
+                    if trace_level() >= 1 {
+                        let mut text = format!("{gb_command:?}");
+                        text.truncate(160);
+                        trace(format!("GB {text}"));
+                    }
+                    gb.execute(gb_command, guest)
+                });
+            if let Err(error) = result {
+                trace(format!("GB command {id} failed: {error}"));
+            }
+            return;
         }
         let State { twod, guest, .. } = state;
         match twod.execute(
@@ -829,6 +954,8 @@ impl Device for Handle {
         state.regs.reset();
         state.irq.reset();
         state.twod.reset();
+        state.gb.reset();
+        state.cb.reset();
         state.fifo_error = None;
         state.last_mode = None;
         log!("device reset");
@@ -1066,6 +1193,110 @@ mod tests {
         h.0.fifo.store_u32(fifo::CURSOR_COUNT as usize, 1);
         h.0.fifo.store_u32(fifo::CURSOR_ON as usize, 0);
         assert!(!h.0.cursor().2, "hidden by the guest");
+    }
+
+    #[test]
+    fn command_buffers_run_report_and_stop_on_errors() {
+        use svga_proto::cb;
+        let mut h = device();
+        enable_fifo(&mut h);
+        set(&mut h, reg::IRQMASK, irq::COMMAND_BUFFER);
+        // Guest RAM at 0x10_0000, shared like QEMU does.
+        let ram = SharedMem::new("ram", 0x4000).unwrap();
+        h.dma_map(DmaMapping {
+            address: 0x10_0000,
+            size: 0x4000,
+            offset: 0,
+            flags: 3,
+            fd: Some(ram.fd().try_clone_to_owned().unwrap()),
+        })
+        .unwrap();
+        let put = |at: usize, words: &[u32]| {
+            for (i, w) in words.iter().enumerate() {
+                assert!(ram.write(at + 4 * i, &w.to_le_bytes()));
+            }
+        };
+        let word = |at: usize| {
+            let mut b = [0u8; 4];
+            assert!(ram.read(at, &mut b));
+            u32::from_le_bytes(b)
+        };
+        // A header at `at` for `length` bytes of commands at `data`.
+        let header = |at: usize, length: u32, data: u32| {
+            put(at, &[cb::status::NONE, 0, 1, 0, 0, length, data, 0]);
+            put(at + 32, &[0; 8]);
+        };
+        let submit = |h: &mut Handle, at: usize, context: u32| {
+            set(h, reg::COMMAND_HIGH, 0);
+            set(h, reg::COMMAND_LOW, (0x10_0000 + at as u32) | context);
+        };
+        let irq_status = |h: &mut Handle| {
+            let mut b = [0u8; 4];
+            h.region_read(0, 8, &mut b).unwrap();
+            u32::from_le_bytes(b)
+        };
+
+        // An update then a fence: completed, fence visible, IRQ raised.
+        put(0x1000, &[cmd::UPDATE, 0, 0, 8, 8, cmd::FENCE, 0x42]);
+        header(0, 28, 0x10_1000);
+        submit(&mut h, 0, cb::context::CONTEXT_0);
+        assert_eq!(word(0), cb::status::COMPLETED);
+        assert_eq!(h.0.fifo.load_u32(fifo::FENCE as usize), 0x42);
+        assert_ne!(irq_status(&mut h) & irq::COMMAND_BUFFER, 0);
+
+        // A bad command after a fence: error at its offset, context stopped.
+        put(0x1100, &[cmd::FENCE, 0x43, 12345]);
+        header(0x40, 12, 0x10_1100);
+        submit(&mut h, 0x40, cb::context::CONTEXT_0);
+        assert_eq!(word(0x40), cb::status::COMMAND_ERROR);
+        assert_eq!(word(0x44), 8, "errorOffset");
+        assert_eq!(
+            h.0.fifo.load_u32(fifo::FENCE as usize),
+            0x43,
+            "ran up to it"
+        );
+
+        // While stopped, buffers wait; restarting the context runs them.
+        put(0x1200, &[cmd::FENCE, 0x44]);
+        header(0x80, 8, 0x10_1200);
+        submit(&mut h, 0x80, cb::context::CONTEXT_0);
+        assert_eq!(word(0x80), cb::status::NONE, "queued");
+        put(
+            0x1300,
+            &[cb::dc::START_STOP_CONTEXT, 1, cb::context::CONTEXT_0],
+        );
+        header(0xc0, 12, 0x10_1300);
+        submit(&mut h, 0xc0, cb::context::DEVICE);
+        assert_eq!(word(0xc0), cb::status::COMPLETED, "device command");
+        assert_eq!(word(0x80), cb::status::COMPLETED, "queued buffer ran");
+        assert_eq!(h.0.fifo.load_u32(fifo::FENCE as usize), 0x44);
+
+        // Bad headers and contexts are refused, not run.
+        header(0x100, 6, 0x10_1200);
+        submit(&mut h, 0x100, cb::context::CONTEXT_0);
+        assert_eq!(word(0x100), cb::status::CB_HEADER_ERROR);
+        header(0x140, 8, 0x10_1200);
+        submit(&mut h, 0x140, 5);
+        assert_eq!(word(0x140), cb::status::SUBMISSION_ERROR);
+        let state = h.0.lock();
+        assert_eq!((state.cb.completed, state.cb.failed), (3, 3));
+    }
+
+    #[test]
+    fn vmport_answers_like_the_device() {
+        if std::env::var_os("RSVGA_PROBE_CAPS").is_some() {
+            return; // probing overrides the advertised capabilities
+        }
+        let args = vmport_args();
+        assert!(args.chunks(2).all(|pair| pair[0] == "-global"));
+        let globals: Vec<&str> = args.iter().skip(1).step_by(2).map(String::as_str).collect();
+        assert!(globals.contains(&"vmport.svga-backdoor=on"));
+        assert!(globals.contains(&format!("vmport.svga-caps={CAPABILITIES:#x}").as_str()));
+        assert!(
+            globals.contains(&format!("vmport.svga-fifo-caps={FIFO_CAPABILITIES:#x}").as_str())
+        );
+        let mut h = device();
+        assert_eq!(get(&mut h, svga_proto::reg::CAPABILITIES), CAPABILITIES);
     }
 
     #[test]
