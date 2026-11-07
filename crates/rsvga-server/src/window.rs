@@ -25,6 +25,11 @@ use crate::qmp::{ABS_MAX, Input, InputSink};
 use crate::scale::{View, render};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How long the window size must stay put before the guest is asked to
+/// follow it (a drag of the window edge sends one request, not hundreds).
+const RESIZE_SETTLE: Duration = Duration::from_millis(300);
+/// Smallest resolution asked of the guest.
+const MIN_GUEST_SIZE: (u32, u32) = (800, 600);
 
 /// QEMU qcode of a physical key.
 fn qcode(code: KeyCode) -> Option<&'static str> {
@@ -159,6 +164,11 @@ struct App {
     pressed: HashSet<&'static str>,
     /// Guest resolution the window was last sized for.
     sized_for: (usize, usize),
+    /// A window size the user chose that differs from the guest's, and
+    /// when it was last changed.
+    wanted: Option<(PhysicalSize<u32>, Instant)>,
+    /// Resolution last asked of the guest.
+    asked: Option<(u32, u32)>,
     /// Guest cursor definition last applied, and its visibility.
     cursor_serial: u64,
     cursor_visible: bool,
@@ -214,7 +224,35 @@ impl App {
         if changed {
             window.request_redraw();
         }
+        self.ask_guest_size(shown.is_some());
         self.update_cursor(event_loop, &window);
+    }
+
+    /// Asks the guest (through the VMware Tools) to take the window size
+    /// once the user has stopped resizing it.
+    fn ask_guest_size(&mut self, showing: bool) {
+        let Some((size, since)) = self.wanted else {
+            return;
+        };
+        if !showing || since.elapsed() < RESIZE_SETTLE {
+            return;
+        }
+        self.wanted = None;
+        let (max_w, max_h) = {
+            let state = self.svga.lock();
+            let config = state.regs.config();
+            (config.max_width, config.max_height)
+        };
+        let width = size.width.clamp(MIN_GUEST_SIZE.0, max_w);
+        let height = size.height.clamp(MIN_GUEST_SIZE.1, max_h);
+        let current = (self.frame.width as u32, self.frame.height as u32);
+        if (width, height) == current || Some((width, height)) == self.asked {
+            return;
+        }
+        self.asked = Some((width, height));
+        if let Some(input) = &self.input {
+            input.set_resolution(width, height);
+        }
     }
 
     /// Shows the guest's cursor as the window's cursor: no latency, and the
@@ -324,6 +362,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::Resized(size) => {
+                // Sizes rsvga set itself (the initial one, those matching
+                // the guest) are not requests from the user.
+                let guest = (self.frame.width as u32, self.frame.height as u32);
+                let user = self.sized_for != (0, 0) && (size.width, size.height) != guest;
+                self.wanted = user.then(|| (size, Instant::now()));
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
@@ -408,6 +456,8 @@ pub fn run(svga: Arc<Svga>, snapshot: Option<PathBuf>, qmp: Option<PathBuf>) {
         view: View::default(),
         pressed: HashSet::new(),
         sized_for: (0, 0),
+        wanted: None,
+        asked: None,
         cursor_serial: 0,
         cursor_visible: true,
         closing: false,

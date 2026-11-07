@@ -16,21 +16,39 @@ the value; other types are answered as unsupported (EAX = -1, EBX
 unchanged). The values must be those of the SVGA device given to the
 guest, typically an out-of-process device model that knows them.
 
-The same drivers log through GuestRPC (BDOOR_CMD_MESSAGE, command 30,
-RPCI channel) and read their settings with "info-get guestinfo.*". Add
-an opt-in "guestrpc" property with a minimal RPCI implementation:
-channels with cookies, the 4-byte send and receive loops of open-vm-tools
-(no high-bandwidth port), messages traced by vmport_guestrpc_message,
-"log" answered with success, "info-get" with "0 No value found" (what a
-VMware host says for an unset key) and everything else with the standard
-"0 Unknown command" reply. This makes the driver's own diagnostics
-visible: "-trace vmport_guestrpc_message".
+The same drivers log through GuestRPC (BDOOR_CMD_MESSAGE, command 30)
+and read their settings with "info-get guestinfo.*"; the VMware Tools
+use GuestRPC both ways. Add an opt-in "guestrpc" property with a
+minimal implementation of both channel kinds, with cookies and the
+4-byte send and receive loops of open-vm-tools (no high-bandwidth port):
+
+- RPCI (guest to host): messages are traced (vmport_guestrpc_message)
+  and answered like a VMware host: success for "log", "guest.log.state",
+  "tools.capability.*" and "tools.set.version", "0 Unknown command" for
+  the rest. "info-get KEY" and "info-set KEY VALUE" use a small store,
+  the guestinfo.* settings of a VMware VM: the "guestinfo" property sets
+  initial values ("guestinfo.a=1;guestinfo.b=TRUE"), the guest can add
+  up to 256 keys, unknown keys get "0 No value found". The VMware
+  drivers read their options and log levels there.
+- TCLO (host to guest): a new channel is greeted with "reset" then
+  "Capabilities_Register", as on VMware (the VMware Tools only announce
+  their capabilities on request); each guest message is the result of
+  the previous command and gets the next queued command as its reply. The new QMP command
+  x-vmport-guestrpc-send (unstable) queues a command for every TCLO
+  channel, e.g. "Resolution_Set 1920 1080" for the VMware Tools.
 
 Both are off by default: nothing changes for existing configurations.
+User-mode guest programs such as the VMware Tools also need the KVM
+module parameter enable_vmware_backdoor, and the Tools installer wants
+VMware's CPUID signature (e.g. -cpu host,kvm=off,hv-relaxed,
+hv-vendor-id=VMwareVMware).
 
-Tested with QEMU 11.1.2, rsvga and the VMware SVGA WDDM driver 9.17.11
-in Windows 11: the driver queries type 0 once at start-up, then logs its
-configuration through GuestRPC.
+Tested with QEMU 11.1.2, rsvga, the VMware SVGA WDDM driver 9.17.11
+and VMware Tools 13.1.5 in Windows 11: the driver queries type 0 once
+at start-up and logs through GuestRPC (more with
+guestinfo.svga.wddm.miniportLogging=TRUE); the Tools register their
+capabilities, and x-vmport-guestrpc-send "Resolution_Set 1600 900"
+switches the guest to 1600x900.
 
 --- a/include/hw/i386/vmport.h
 +++ b/include/hw/i386/vmport.h
@@ -61,15 +79,17 @@ configuration through GuestRPC.
  x86_gsi_interrupt(int irqn, int level) "GSI interrupt #%d level:%d"
 --- a/hw/i386/vmport.c
 +++ b/hw/i386/vmport.c
-@@ -37,6 +37,7 @@
+@@ -37,6 +37,9 @@
  #include "system/hw_accel.h"
  #include "system/qtest.h"
  #include "qemu/log.h"
 +#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-misc-i386.h"
  #include "trace.h"
  #include "qom/object.h"
  
-@@ -56,6 +57,29 @@
+@@ -56,6 +59,32 @@
  #define VMPORT_COMPAT_CMDS_V2                   \
      (1 << VMPORT_COMPAT_CMDS_V2_BIT)
  
@@ -88,10 +108,13 @@ configuration through GuestRPC.
 +#define GUESTRPC_STATUS_SUCCESS     0x0001
 +#define GUESTRPC_STATUS_DORECV      0x0002
 +#define GUESTRPC_PROTOCOL_RPCI      0x49435052  /* "RPCI": guest to host */
++#define GUESTRPC_PROTOCOL_TCLO      0x4f4c4354  /* "TCLO": host to guest */
 +#define GUESTRPC_FLAG_COOKIE        0x80000000
 +#define GUESTRPC_CHANNELS           8
 +#define GUESTRPC_MAX_MESSAGE        (64 * 1024)
 +#define GUESTRPC_TRACE_CHARS        256
++#define GUESTRPC_MAX_PENDING        32
++#define GUESTINFO_MAX_KEYS          256
 +
 +/* CMD_GET_SVGA_CAPABILITIES: types answered (ECX high word), see svga_reg.h */
 +#define VMPORT_SVGA_CAP_TYPES       4
@@ -99,13 +122,20 @@ configuration through GuestRPC.
  /* vCPU features reported by CMD_GET_VCPU_INFO */
  #define VCPU_INFO_SLC64_BIT             0
  #define VCPU_INFO_SYNC_VTSCS_BIT        1
-@@ -65,6 +89,19 @@
+@@ -65,6 +94,26 @@
  
  OBJECT_DECLARE_SIMPLE_TYPE(VMPortState, VMPORT)
  
 +typedef struct GuestRpcChannel {
 +    bool open;
 +    bool cookie;
++    /*
++     * TCLO channels carry host commands to the guest: each message the
++     * guest sends is the result of the previous command, and the reply is
++     * the next command queued for it (empty if none).
++     */
++    bool tclo;
++    GQueue *pending;
 +    uint32_t cookie_high;
 +    uint32_t cookie_low;
 +    uint8_t *message;
@@ -119,7 +149,7 @@ configuration through GuestRPC.
  struct VMPortState {
      ISADevice parent_obj;
  
-@@ -75,6 +112,18 @@
+@@ -75,6 +124,25 @@
      uint32_t vmware_vmx_version;
      uint8_t vmware_vmx_type;
  
@@ -134,11 +164,18 @@ configuration through GuestRPC.
 +
 +    bool guestrpc;
 +    GuestRpcChannel rpc[GUESTRPC_CHANNELS];
++    /*
++     * Host settings the guest reads with "info-get" (and writes with
++     * "info-set"), like the guestinfo.* entries of a VMware VM: initial
++     * values from the "guestinfo" property, "key=value;key=value".
++     */
++    char *guestinfo;
++    GHashTable *info;
 +
      uint32_t compat_flags;
  };
  
-@@ -221,6 +270,196 @@
+@@ -221,6 +289,308 @@
      return ret;
  }
  
@@ -162,7 +199,73 @@ configuration through GuestRPC.
 +{
 +    g_free(ch->message);
 +    g_free(ch->reply);
++    if (ch->pending) {
++        g_queue_free_full(ch->pending, g_free);
++    }
 +    memset(ch, 0, sizeof(*ch));
++}
++
++/* "info-get KEY": the value, or the reply of a VMware host without it. */
++static char *guestinfo_get(VMPortState *s, const char *key)
++{
++    const char *value = g_hash_table_lookup(s->info, key);
++
++    return value ? g_strdup_printf("1 %s", value)
++                 : g_strdup("0 No value found");
++}
++
++/* "info-set KEY VALUE" */
++static char *guestinfo_set(VMPortState *s, const char *args)
++{
++    const char *space = strchr(args, ' ');
++    char *key;
++
++    if (!space || space == args) {
++        return g_strdup("0 Two and exactly two arguments expected");
++    }
++    key = g_strndup(args, space - args);
++    if (g_hash_table_size(s->info) >= GUESTINFO_MAX_KEYS &&
++        !g_hash_table_contains(s->info, key)) {
++        g_free(key);
++        return g_strdup("0 Too many keys");
++    }
++    g_hash_table_replace(s->info, key, g_strdup(space + 1));
++    return g_strdup("1 ");
++}
++
++/*
++ * Host answers to guest commands (RPCI), as a VMware host: the guestinfo
++ * settings, and success for what only informs the host.
++ */
++static char *guestrpc_rpci_reply(VMPortState *s, const char *text,
++                                 uint32_t len)
++{
++    static const struct {
++        const char *prefix;
++        const char *reply;
++    } replies[] = {
++        { "log ", "1 " },
++        { "tools.capability.", "1 " },
++        { "tools.set.version", "1 " },
++        { "guest.log.state", "1 " },
++    };
++    size_t i;
++
++    /* The message is NUL-terminated (see GUESTRPC_TYPE_SENDSIZE). */
++    if (g_str_has_prefix(text, "info-get ")) {
++        return guestinfo_get(s, text + strlen("info-get "));
++    }
++    if (g_str_has_prefix(text, "info-set ")) {
++        return guestinfo_set(s, text + strlen("info-set "));
++    }
++    for (i = 0; i < ARRAY_SIZE(replies); i++) {
++        size_t n = strlen(replies[i].prefix);
++
++        if (len >= n && memcmp(text, replies[i].prefix, n) == 0) {
++            return g_strdup(replies[i].reply);
++        }
++    }
++    return g_strdup("0 Unknown command");
 +}
 +
 +static void guestrpc_set_reply(GuestRpcChannel *ch, const char *reply)
@@ -174,11 +277,11 @@ configuration through GuestRPC.
 +}
 +
 +/*
-+ * A complete RPCI message: trace it and answer like a VMware host that has
-+ * no settings: "log" succeeds, "info-get" finds no value, everything else
-+ * is an unknown command. The guest then uses its defaults.
++ * A complete message. RPCI: trace it and answer like a VMware host (unknown
++ * settings make the guest use its defaults). TCLO: the message is the
++ * result of the previous host command; answer with the next one.
 + */
-+static void guestrpc_handle(int index, GuestRpcChannel *ch)
++static void guestrpc_handle(VMPortState *s, int index, GuestRpcChannel *ch)
 +{
 +    const char *text = (const char *)ch->message;
 +    uint32_t len = ch->message_size;
@@ -189,12 +292,15 @@ configuration through GuestRPC.
 +        g_autofree char *escaped = g_strescape(raw, NULL);
 +        trace_vmport_guestrpc_message(index, escaped);
 +    }
-+    if (len >= 4 && memcmp(text, "log ", 4) == 0) {
-+        guestrpc_set_reply(ch, "1 ");
-+    } else if (len >= 9 && memcmp(text, "info-get ", 9) == 0) {
-+        guestrpc_set_reply(ch, "0 No value found");
++    if (ch->tclo) {
++        g_autofree char *next = ch->pending ? g_queue_pop_head(ch->pending)
++                                            : NULL;
++        guestrpc_set_reply(ch, next ? next : "");
 +    } else {
-+        guestrpc_set_reply(ch, "0 Unknown command");
++        g_autofree char *reply = guestrpc_rpci_reply(s, text ? text : "",
++                                                     len);
++
++        guestrpc_set_reply(ch, reply);
 +    }
 +    trace_vmport_guestrpc_reply(index, ch->reply);
 +    g_free(ch->message);
@@ -218,7 +324,10 @@ configuration through GuestRPC.
 +        bool ok = false;
 +        int i = 0;
 +
-+        if ((ebx & ~GUESTRPC_FLAG_COOKIE) == GUESTRPC_PROTOCOL_RPCI) {
++        uint32_t protocol = ebx & ~GUESTRPC_FLAG_COOKIE;
++
++        if (protocol == GUESTRPC_PROTOCOL_RPCI ||
++            protocol == GUESTRPC_PROTOCOL_TCLO) {
 +            for (i = 0; i < GUESTRPC_CHANNELS; i++) {
 +                if (!s->rpc[i].open) {
 +                    break;
@@ -236,6 +345,18 @@ configuration through GuestRPC.
 +                                                sizeof(ch->cookie_low));
 +                    env->regs[R_ESI] = ch->cookie_high;
 +                    env->regs[R_EDI] = ch->cookie_low;
++                }
++                if (protocol == GUESTRPC_PROTOCOL_TCLO) {
++                    /*
++                     * A VMware host greets every new TCLO channel, then asks
++                     * the program to register its capabilities (the VMware
++                     * Tools only announce them on request).
++                     */
++                    ch->tclo = true;
++                    ch->pending = g_queue_new();
++                    g_queue_push_tail(ch->pending, g_strdup("reset"));
++                    g_queue_push_tail(ch->pending,
++                                      g_strdup("Capabilities_Register"));
 +                }
 +                env->regs[R_EDX] = (uint32_t)i << 16 | (edx & 0xffff);
 +                status = GUESTRPC_STATUS_SUCCESS;
@@ -265,7 +386,7 @@ configuration through GuestRPC.
 +        ch->message_size = ebx;
 +        ch->message_pos = 0;
 +        if (ebx == 0) {
-+            guestrpc_handle(index, ch);
++            guestrpc_handle(s, index, ch);
 +        }
 +        status = GUESTRPC_STATUS_SUCCESS;
 +        break;
@@ -277,7 +398,7 @@ configuration through GuestRPC.
 +            memcpy(ch->message + ch->message_pos, &word, n);
 +            ch->message_pos += n;
 +            if (ch->message_pos == ch->message_size) {
-+                guestrpc_handle(index, ch);
++                guestrpc_handle(s, index, ch);
 +            }
 +            status = GUESTRPC_STATUS_SUCCESS;
 +        }
@@ -322,6 +443,34 @@ configuration through GuestRPC.
 +    return env->regs[R_EAX];
 +}
 +
++void qmp_x_vmport_guestrpc_send(const char *message, Error **errp)
++{
++    VMPortState *s = port_state;
++    int i, queued = 0;
++
++    if (!s || !s->guestrpc) {
++        error_setg(errp, "GuestRPC is off (vmport property 'guestrpc')");
++        return;
++    }
++    if (strlen(message) > GUESTRPC_MAX_MESSAGE) {
++        error_setg(errp, "GuestRPC message too long");
++        return;
++    }
++    for (i = 0; i < GUESTRPC_CHANNELS; i++) {
++        GuestRpcChannel *ch = &s->rpc[i];
++
++        if (ch->open && ch->tclo &&
++            g_queue_get_length(ch->pending) < GUESTRPC_MAX_PENDING) {
++            g_queue_push_tail(ch->pending, g_strdup(message));
++            queued++;
++        }
++    }
++    if (!queued) {
++        error_setg(errp, "no guest program listens to GuestRPC "
++                   "(are the VMware Tools running?)");
++    }
++}
++
 +static void vmport_reset(DeviceState *dev)
 +{
 +    VMPortState *s = VMPORT(dev);
@@ -335,7 +484,35 @@ configuration through GuestRPC.
  static const MemoryRegionOps vmport_ops = {
      .read = vmport_ioport_read,
      .write = vmport_ioport_write,
-@@ -250,6 +489,13 @@
+@@ -239,6 +609,27 @@
+     memory_region_init_io(&s->io, OBJECT(s), &vmport_ops, s, "vmport", 1);
+     isa_register_ioport(isadev, &s->io, 0x5658);
+ 
++    s->info = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
++    if (s->guestinfo) {
++        g_auto(GStrv) items = g_strsplit(s->guestinfo, ";", -1);
++        char **item;
++
++        for (item = items; *item; item++) {
++            const char *equal = strchr(*item, '=');
++
++            if (**item == '\0') {
++                continue;
++            }
++            if (!equal || equal == *item) {
++                error_setg(errp, "vmport: guestinfo entry '%s' is not "
++                           "key=value", *item);
++                return;
++            }
++            g_hash_table_replace(s->info, g_strndup(*item, equal - *item),
++                                 g_strdup(equal + 1));
++        }
++    }
++
+     port_state = s;
+ 
+     /* Register some generic port commands */
+@@ -250,6 +641,13 @@
          vmport_register(VMPORT_CMD_GET_VCPU_INFO, vmport_cmd_get_vcpu_info,
                          NULL);
      }
@@ -349,7 +526,7 @@ configuration through GuestRPC.
  }
  
  static const Property vmport_properties[] = {
-@@ -284,6 +530,23 @@
+@@ -284,6 +682,29 @@
       * 5 - ACE 1.x (Deprecated)
       */
      DEFINE_PROP_UINT8("vmware-vmx-type", VMPortState, vmware_vmx_type, 2),
@@ -365,15 +542,21 @@ configuration through GuestRPC.
 +    DEFINE_PROP_UINT32("svga-3d-hwversion", VMPortState, svga_caps[2], 0),
 +    DEFINE_PROP_UINT32("svga-caps2", VMPortState, svga_caps[3], 0),
 +    /*
-+     * Minimal GuestRPC (RPCI channel): messages from the guest are traced
-+     * (trace event vmport_guestrpc_message); "log" succeeds, anything else
-+     * gets the standard "unknown command" reply.
++     * Minimal GuestRPC: messages from the guest are traced (trace event
++     * vmport_guestrpc_message); "log" succeeds, "info-get"/"info-set" use
++     * the guestinfo settings, anything else gets the standard "unknown
++     * command" reply. The host greets TCLO channels like VMware does.
 +     */
 +    DEFINE_PROP_BOOL("guestrpc", VMPortState, guestrpc, false),
++    /*
++     * Initial guestinfo settings, "key=value;key=value", as the guestinfo.*
++     * lines of a VMware VM configuration (keys include "guestinfo.").
++     */
++    DEFINE_PROP_STRING("guestinfo", VMPortState, guestinfo),
  };
  
  static void vmport_class_initfn(ObjectClass *klass, const void *data)
-@@ -291,6 +554,7 @@
+@@ -291,6 +712,7 @@
      DeviceClass *dc = DEVICE_CLASS(klass);
  
      dc->realize = vmport_realizefn;
@@ -381,3 +564,64 @@ configuration through GuestRPC.
      /* Reason: realize sets global port_state */
      dc->user_creatable = false;
      device_class_set_props(dc, vmport_properties);
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -24,6 +24,35 @@
+ { 'command': 'rtc-reset-reinjection' }
+ 
+ ##
++# @x-vmport-guestrpc-send:
++#
++# Send a GuestRPC command to the programs of the guest that listen to
++# the host through the VMware backdoor (TCLO channels), typically the
++# VMware Tools, e.g. "Resolution_Set 1920 1080".  The command is
++# queued for every such program and delivered when it next polls; its
++# result is visible with the trace event vmport_guestrpc_message.
++#
++# Needs the vmport property "guestrpc".
++#
++# @message: the command
++#
++# Features:
++#
++# @unstable: This command is experimental.
++#
++# Since: 11.2
++#
++# .. qmp-example::
++#
++#     -> { "execute": "x-vmport-guestrpc-send",
++#          "arguments": { "message": "Resolution_Set 1920 1080" } }
++#     <- { "return": {} }
++##
++{ 'command': 'x-vmport-guestrpc-send',
++  'data': { 'message': 'str' },
++  'features': [ 'unstable' ] }
++
++##
+ # @SevState:
+ #
+ # An enumeration of SEV state information used during `query-sev`.
+--- a/stubs/meson.build
++++ b/stubs/meson.build
+@@ -81,6 +81,7 @@
+   stub_ss.add(files('qmp-i386-rtc.c'))
+   stub_ss.add(files('qmp-i386-sev.c'))
+   stub_ss.add(files('qmp-i386-sgx.c'))
++  stub_ss.add(files('qmp-i386-vmport.c'))
+   stub_ss.add(files('qmp-i386-xen.c'))
+   stub_ss.add(files('qmp-cpu.c'))
+   stub_ss.add(files('qmp-cpu-s390x.c'))
+--- /dev/null
++++ b/stubs/qmp-i386-vmport.c
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-misc-i386.h"
++
++void qmp_x_vmport_guestrpc_send(const char *message, Error **errp)
++{
++    error_setg(errp, "this machine has no VMware backdoor (vmport)");
++}

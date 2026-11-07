@@ -145,6 +145,29 @@ fn to_mob(
     Ok(merge(out))
 }
 
+/// Byte order of a 32-bit color format: `Some(true)` for R, G, B, A in
+/// memory, `Some(false)` for B, G, R, A; `None` for other formats.
+fn rgba_order(format: u32) -> Option<bool> {
+    use svga_proto::format as f;
+    match format {
+        f::R8G8B8A8_TYPELESS
+        | f::R8G8B8A8_UNORM
+        | f::R8G8B8A8_UNORM_SRGB
+        | f::R8G8B8A8_UINT
+        | f::R8G8B8A8_SNORM
+        | f::R8G8B8A8_SINT => Some(true),
+        f::A8R8G8B8
+        | f::X8R8G8B8
+        | f::B8G8R8A8_TYPELESS
+        | f::B8G8R8A8_UNORM
+        | f::B8G8R8A8_UNORM_SRGB
+        | f::B8G8R8X8_TYPELESS
+        | f::B8G8R8X8_UNORM
+        | f::B8G8R8X8_UNORM_SRGB => Some(false),
+        _ => None,
+    }
+}
+
 fn range(offset: u64, len: u64, total: usize) -> Option<std::ops::Range<usize>> {
     let start = usize::try_from(offset).ok()?;
     let end = start.checked_add(usize::try_from(len).ok()?)?;
@@ -470,6 +493,158 @@ impl Gb {
         Ok(())
     }
 
+    /// The image of Direct3D subresource `sub` (`mip + layer * mips`).
+    fn subresource(&self, sid: u32, sub: u32) -> Result<ImageId, String> {
+        let layout = &self.surface(sid)?.layout;
+        let mips = layout.mip_levels().max(1);
+        let image = ImageId {
+            sid,
+            face: sub / mips,
+            mipmap: sub % mips,
+        };
+        if image.face >= layout.layers() {
+            return Err(format!("surface {sid} has no subresource {sub}"));
+        }
+        Ok(image)
+    }
+
+    /// `DX_PRESENTBLT`: copies `src_box` of an image to `dest_box` of
+    /// another, scaled to nearest pixels when the sizes differ, then shows
+    /// the result if a screen target displays it. Only 2D boxes of
+    /// uncompressed formats with the same pixel size; red and blue swap
+    /// between RGBA and BGRA orders.
+    fn present_blt(
+        &mut self,
+        guest: &GuestMemory,
+        src: ImageId,
+        src_box: Box3,
+        dest: ImageId,
+        dest_box: Box3,
+    ) -> Result<(), String> {
+        let (sl, dl) = (
+            &self.surface(src.sid)?.layout,
+            &self.surface(dest.sid)?.layout,
+        );
+        let (sd, dd) = (sl.desc(), dl.desc());
+        let plain = |d: svga_proto::format::FormatDesc| {
+            (d.block_width, d.block_height, d.block_depth) == (1, 1, 1)
+        };
+        if !plain(sd) || !plain(dd) || sd.bytes_per_block != dd.bytes_per_block {
+            return Err(format!(
+                "present between formats {} and {}",
+                sl.format(),
+                dl.format()
+            ));
+        }
+        let bpp = u64::from(sd.bytes_per_block);
+        let swap = matches!(
+            (rgba_order(sl.format()), rgba_order(dl.format())),
+            (Some(a), Some(b)) if a != b
+        );
+        // Each box must be a 2D area inside its image.
+        let inside = |layout: &SurfaceLayout, image: ImageId, b: Box3| {
+            let size = layout.mip_size(image.mipmap);
+            b.z == 0
+                && b.d <= 1
+                && b.x.checked_add(b.w).is_some_and(|e| e <= size.width)
+                && b.y.checked_add(b.h).is_some_and(|e| e <= size.height)
+        };
+        if !inside(sl, src, src_box) || !inside(dl, dest, dest_box) {
+            return Err("present box leaves its image".into());
+        }
+        if [src_box.w, src_box.h, dest_box.w, dest_box.h].contains(&0) {
+            return Ok(());
+        }
+        let src_base = sl
+            .image_offset(src.face, src.mipmap)
+            .ok_or("no source image")?;
+        let dest_base = dl
+            .image_offset(dest.face, dest.mipmap)
+            .ok_or("no destination image")?;
+        let (src_pitch, dest_pitch) = (sl.row_pitch(src.mipmap), dl.row_pitch(dest.mipmap));
+
+        self.ensure_host(guest, src.sid)?;
+        self.ensure_host(guest, dest.sid)?;
+        let source = if src.sid == dest.sid {
+            self.surfaces[&src.sid].host.clone().unwrap_or_default()
+        } else {
+            self.surfaces
+                .get_mut(&src.sid)
+                .and_then(|s| s.host.take())
+                .unwrap_or_default()
+        };
+        let mut outcome: Result<(), String> = Ok(());
+        if let Some(target) = self
+            .surfaces
+            .get_mut(&dest.sid)
+            .and_then(|s| s.host.as_mut())
+        {
+            // Nearest source pixel of a destination pixel (centres mapped).
+            let pick = |d: u32, dn: u32, s: u32, sn: u32| {
+                let pos = (2 * u64::from(d) + 1) * u64::from(sn) / (2 * u64::from(dn));
+                u64::from(s) + pos
+            };
+            let scaled = (src_box.w, src_box.h) != (dest_box.w, dest_box.h);
+            'rows: for y in 0..dest_box.h {
+                let sy = pick(y, dest_box.h, src_box.y, src_box.h);
+                let s_row = src_base + sy * src_pitch + u64::from(src_box.x) * bpp;
+                let d_row = dest_base
+                    + u64::from(dest_box.y + y) * dest_pitch
+                    + u64::from(dest_box.x) * bpp;
+                let row_len = u64::from(dest_box.w) * bpp;
+                let Some(d) = range(d_row, row_len, target.len()) else {
+                    outcome = Err("present row outside the destination".into());
+                    break;
+                };
+                if !scaled {
+                    let Some(s) = range(s_row, row_len, source.len()) else {
+                        outcome = Err("present row outside the source".into());
+                        break;
+                    };
+                    target[d.clone()].copy_from_slice(&source[s]);
+                } else {
+                    for x in 0..dest_box.w {
+                        let sx = pick(x, dest_box.w, 0, src_box.w);
+                        let Some(s) = range(s_row + sx * bpp, bpp, source.len()) else {
+                            outcome = Err("present pixel outside the source".into());
+                            break 'rows;
+                        };
+                        let at = d.start + x as usize * bpp as usize;
+                        target[at..at + bpp as usize].copy_from_slice(&source[s]);
+                    }
+                }
+                if swap {
+                    for px in target[d].chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                }
+            }
+        }
+        if src.sid != dest.sid
+            && let Some(s) = self.surfaces.get_mut(&src.sid)
+        {
+            s.host = Some(source);
+        }
+        outcome?;
+        // Show it at once if a screen target displays the destination.
+        let shown: Vec<u32> = self
+            .targets
+            .iter()
+            .filter(|(_, t)| t.image == Some(dest))
+            .map(|(id, _)| *id)
+            .collect();
+        for stid in shown {
+            let rect = Rect {
+                x: dest_box.x,
+                y: dest_box.y,
+                width: dest_box.w,
+                height: dest_box.h,
+            };
+            self.present(guest, stid, rect)?;
+        }
+        Ok(())
+    }
+
     // ---- screen targets ---------------------------------------------------
 
     /// Picks the screen target to show: the primary one, else the lowest ID.
@@ -760,6 +935,21 @@ impl Gb {
             GbCommand::MobFence { value, mob, offset } => {
                 self.write_mob(guest, mob, u64::from(offset), &value.to_le_bytes())?;
             }
+            GbCommand::PresentBlt {
+                src,
+                src_sub,
+                dest,
+                dest_sub,
+                src_box,
+                dest_box,
+                mode: _,
+            } => {
+                // Filtering (SVGADX_PRESENTBLT_LINEAR) and colour space
+                // flags will come with the GPU renderer.
+                let src = self.subresource(src, src_sub)?;
+                let dest = self.subresource(dest, dest_sub)?;
+                self.present_blt(guest, src, src_box, dest, dest_box)?;
+            }
         }
         Ok(())
     }
@@ -954,6 +1144,108 @@ mod tests {
             pixels[0],
             "copied pixel read back"
         );
+    }
+
+    /// Defines `sid` (format, size) with known pixels in its device copy.
+    fn filled(gb: &mut Gb, guest: &GuestMemory, sid: u32, fmt: u32, w: u32, h: u32, px: &[u32]) {
+        gb.execute(
+            GbCommand::DefineSurface(SurfaceDef {
+                sid,
+                flags: 0,
+                format: fmt,
+                mip_levels: 1,
+                samples: 0,
+                size: Size3 {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                },
+                array_size: 0,
+            }),
+            guest,
+        )
+        .unwrap();
+        gb.ensure_host(guest, sid).unwrap();
+        let host = gb.surfaces.get_mut(&sid).unwrap().host.as_mut().unwrap();
+        for (out, p) in host.chunks_exact_mut(4).zip(px) {
+            out.copy_from_slice(&p.to_le_bytes());
+        }
+    }
+
+    fn area2d(x: u32, y: u32, w: u32, h: u32) -> Box3 {
+        Box3 {
+            x,
+            y,
+            z: 0,
+            w,
+            h,
+            d: 1,
+        }
+    }
+
+    #[test]
+    fn present_blt_copies_scales_swaps_and_shows() {
+        let (_ram, guest) = ram();
+        let mut gb = Gb::new(limits());
+        // Source: 2x1 RGBA pixels; destination: a 4x2 BGRX screen.
+        filled(
+            &mut gb,
+            &guest,
+            1,
+            format::R8G8B8A8_UNORM,
+            2,
+            1,
+            &[0x11_22_33, 0x44_55_66],
+        );
+        filled(&mut gb, &guest, 2, format::B8G8R8X8_UNORM, 4, 2, &[0; 8]);
+        for c in [
+            GbCommand::DefineScreenTarget {
+                stid: 0,
+                width: 4,
+                height: 2,
+                root: (0, 0),
+                flags: stflag::PRIMARY,
+                dpi: 0,
+            },
+            GbCommand::BindScreenTarget {
+                stid: 0,
+                image: image(2),
+            },
+        ] {
+            gb.execute(c, &guest).unwrap();
+        }
+        let mut frame = Frame::default();
+        gb.capture(&mut frame);
+        // Scaled 2x in both directions; red and blue swapped.
+        let blt = |src_box, dest_box| GbCommand::PresentBlt {
+            src: 1,
+            src_sub: 0,
+            dest: 2,
+            dest_sub: 0,
+            src_box,
+            dest_box,
+            mode: 0,
+        };
+        gb.execute(blt(area2d(0, 0, 2, 1), area2d(0, 0, 4, 2)), &guest)
+            .unwrap();
+        assert_eq!(gb.capture(&mut frame), Some(true), "shown at once");
+        let (a, b) = (0x33_22_11, 0x66_55_44);
+        assert_eq!(frame.pixels, [a, a, b, b, a, a, b, b]);
+        // Same size: a plain copy of one pixel.
+        gb.execute(blt(area2d(1, 0, 1, 1), area2d(3, 1, 1, 1)), &guest)
+            .unwrap();
+        gb.capture(&mut frame);
+        assert_eq!(frame.pixels[7], b);
+        // Outside the images, or a missing subresource: refused.
+        assert!(
+            gb.execute(blt(area2d(1, 0, 2, 1), area2d(0, 0, 2, 1)), &guest)
+                .is_err()
+        );
+        let mut far = blt(area2d(0, 0, 1, 1), area2d(0, 0, 1, 1));
+        if let GbCommand::PresentBlt { src_sub, .. } = &mut far {
+            *src_sub = 1;
+        }
+        assert!(gb.execute(far, &guest).is_err());
     }
 
     #[test]

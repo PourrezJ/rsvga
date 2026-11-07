@@ -235,6 +235,25 @@ pub enum GbCommand {
         /// Byte offset in the MOB.
         offset: u32,
     },
+    /// Copies `src_box` of a surface image to `dest_box` of another,
+    /// scaling if the boxes differ (`DX_PRESENTBLT`). Images are given as
+    /// Direct3D subresources: `mip + layer * mip_levels`.
+    PresentBlt {
+        /// Source surface.
+        src: u32,
+        /// Source subresource.
+        src_sub: u32,
+        /// Destination surface.
+        dest: u32,
+        /// Destination subresource.
+        dest_sub: u32,
+        /// Source area.
+        src_box: Box3,
+        /// Destination area.
+        dest_box: Box3,
+        /// `SVGADX_PRESENTBLT_*` flags.
+        mode: u32,
+    },
     /// Does nothing.
     Nop,
 }
@@ -309,6 +328,7 @@ fn fixed_words(id: u32) -> Option<usize> {
         cmd3d::DEFINE_GB_SURFACE_V2 => 11,
         cmd3d::DEFINE_GB_SURFACE_V3 => 13,
         cmd3d::DEFINE_GB_SURFACE_V4 => 14,
+        cmd3d::DX_PRESENTBLT => 17,
         _ => return None,
     })
 }
@@ -467,6 +487,15 @@ pub fn parse(id: u32, payload: &[u32]) -> Option<Result<GbCommand, ShortPayload>
                 height: w[4],
             },
         },
+        cmd3d::DX_PRESENTBLT => GbCommand::PresentBlt {
+            src: w[0],
+            src_sub: w[1],
+            dest: w[2],
+            dest_sub: w[3],
+            src_box: area(&w[4..10]),
+            dest_box: area(&w[10..16]),
+            mode: w[16],
+        },
         cmd3d::GB_MOB_FENCE => GbCommand::MobFence {
             value: w[0],
             mob: w[1],
@@ -563,6 +592,34 @@ mod tests {
                 root: (-1, 0),
                 flags: 1,
                 dpi: 96
+            }))
+        );
+        // src, srcSubResource, dst, destSubResource, boxSrc, boxDest, mode.
+        let blt = [1, 0, 0, 0, 0, 0, 0, 800, 600, 1, 0, 0, 0, 1600, 1200, 1, 1];
+        assert_eq!(
+            parse(cmd3d::DX_PRESENTBLT, &blt),
+            Some(Ok(GbCommand::PresentBlt {
+                src: 1,
+                src_sub: 0,
+                dest: 0,
+                dest_sub: 0,
+                src_box: Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    w: 800,
+                    h: 600,
+                    d: 1
+                },
+                dest_box: Box3 {
+                    x: 0,
+                    y: 0,
+                    z: 0,
+                    w: 1600,
+                    h: 1200,
+                    d: 1
+                },
+                mode: 1
             }))
         );
         assert_eq!(

@@ -12,7 +12,15 @@
 # Usage:
 #   scripts/run-windows.sh --disk WINDOWS.qcow2 --vars OVMF_VARS.fd \
 #       [--overlay FILE] [--mem 6144] [--cpus 4] [--trace] [--diagnose] \
+#       [--kvm-cpu] [--guest-tools] [--guestinfo 'KEY=VALUE;...'] \
 #       [-- EXTRA QEMU ARGUMENTS...]
+#
+# The CPU shows VMware's hypervisor signature ("VMwareVMware", through the
+# Hyper-V vendor leaf; KVM's own leaves are hidden): the VMware Tools
+# installer refuses other hypervisors (VM_CheckRequirements, error 1602).
+# --kvm-cpu keeps KVM's signature instead. The Tools also need the host KVM
+# module parameter enable_vmware_backdoor=Y to reach the VMware port from
+# user mode. With them, resizing the rsvga window resizes Windows.
 #
 # Sleep (S3) and hibernation (S4) are hidden from the guest: without S4,
 # Windows cannot use Fast Startup, so every boot is a full one and the
@@ -23,6 +31,11 @@
 # VMware backdoor traffic, driver log messages included (qemu.log).
 # --diagnose also saves each guest cursor and a screen capture per second in
 # the overlay's folder (cursors/, screen.png).
+#
+# --guest-tools gives the guest target/guest-tools (scripts/build-guest-tools.sh)
+# as a read-only FAT disk. --guestinfo sets VMware guestinfo values the
+# drivers read, e.g. their log levels:
+#   --guestinfo 'guestinfo.svga.wddm.miniportLogging=TRUE;guestinfo.loglevel.vm3d.all=10'
 #
 # A QEMU (HMP) monitor listens on $XDG_RUNTIME_DIR/rsvga-vm-hmp.sock, to look
 # at a stuck guest from outside, e.g.:
@@ -39,6 +52,8 @@ rom=$root/target/firmware/rsvga-gop.efi
 ovmf_code=/usr/share/OVMF/OVMF_CODE_4M.fd
 
 disk= vars= overlay=$root/target/vm/overlay.qcow2 mem=6144 cpus=4 trace=0 diagnose=0
+guest_tools=0 guestinfo=
+cpu=host,kvm=off,hv-relaxed,hv-vendor-id=VMwareVMware
 while (($#)); do
   case $1 in
     --disk) disk=$2; shift 2 ;;
@@ -46,13 +61,16 @@ while (($#)); do
     --overlay) overlay=$2; shift 2 ;;
     --mem) mem=$2; shift 2 ;;
     --cpus) cpus=$2; shift 2 ;;
+    --kvm-cpu) cpu=host; shift ;;
     --trace) trace=1; shift ;;
     --diagnose) diagnose=1; trace=1; shift ;;
+    --guest-tools) guest_tools=1; shift ;;
+    --guestinfo) guestinfo=$2; shift 2 ;;
     --) shift; break ;;
-    *) sed -n '2,32p' "$0"; exit 2 ;;
+    *) sed -n '2,46p' "$0"; exit 2 ;;
   esac
 done
-[[ -n $disk && -n $vars ]] || { sed -n '2,32p' "$0"; exit 2; }
+[[ -n $disk && -n $vars ]] || { sed -n '2,46p' "$0"; exit 2; }
 for f in "$qemu" "$rsvga" "$rom" "$ovmf_code" "$disk" "$vars"; do
   [[ -e $f ]] || { echo "missing: $f" >&2; exit 1; }
 done
@@ -90,6 +108,17 @@ if ((trace)); then
   qemu_trace=(-trace vmport_svga_capabilities -trace "vmport_guestrpc_*" -D "$state/qemu.log")
 fi
 
+if [[ -n $guestinfo ]]; then
+  vmport+=(-global "vmport.guestinfo=$guestinfo")
+fi
+if ((guest_tools)); then
+  tools=$root/target/guest-tools
+  [[ -d $tools ]] || { echo "missing: $tools (scripts/build-guest-tools.sh)" >&2; exit 1; }
+  # snapshot=on: vvfat is read-only, which ide-hd would refuse otherwise.
+  vmport+=(-drive "if=none,id=guesttools,format=raw,snapshot=on,file=fat:$tools"
+           -device ide-hd,drive=guesttools,bus=sata.1)
+fi
+
 extra=()
 if ((diagnose)); then
   export RSVGA_CURSOR_DUMP=$state/cursors
@@ -103,7 +132,7 @@ for _ in $(seq 50); do [[ -S $sock ]] && break; sleep 0.1; done
 
 echo "Windows starts in the rsvga window (logs: $state/rsvga.log)."
 "$qemu" -name rsvga-windows \
-  -machine q35,accel=kvm,memory-backend=ram -cpu host -smp "$cpus" -m "$mem" \
+  -machine q35,accel=kvm,memory-backend=ram -cpu "$cpu" -smp "$cpus" -m "$mem" \
   -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1 \
   -object memory-backend-memfd,id=ram,size="${mem}M",share=on \
   -rtc base=localtime -nodefaults -vga none -display none -serial null \

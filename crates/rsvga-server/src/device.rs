@@ -585,8 +585,17 @@ impl Svga {
             Command::NopError => self.fail(state, "the guest sent NOP_ERROR".into()),
             other => {
                 if trace_level() >= 1 {
-                    let mut text = format!("{other:?}");
-                    text.truncate(240);
+                    let text = match &other {
+                        Command::Command3d { id, size, .. } => format!(
+                            "3D {} ({id}), {size} bytes",
+                            svga_proto::cmd3d_names::name(*id).unwrap_or("?")
+                        ),
+                        _ => {
+                            let mut text = format!("{other:?}");
+                            text.truncate(240);
+                            text
+                        }
+                    };
                     trace(format!("FIFO unsupported: {text}"));
                 } else if state.stats.unsupported == 0 {
                     log!(

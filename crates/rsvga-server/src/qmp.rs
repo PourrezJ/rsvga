@@ -93,6 +93,25 @@ enum Request {
     Input(Input),
     /// Press the virtual power button (`system_powerdown`).
     Powerdown,
+    /// Send a GuestRPC command to the guest's VMware Tools (rsvga QEMU patch
+    /// `x-vmport-guestrpc-send`).
+    GuestRpc(String),
+}
+
+/// A JSON string literal.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl InputSink {
@@ -113,6 +132,14 @@ impl InputSink {
     pub fn powerdown(&self) {
         let _ = self.tx.send(Request::Powerdown);
     }
+
+    /// Asks the guest's VMware Tools for a new screen resolution; never
+    /// blocks.
+    pub fn set_resolution(&self, width: u32, height: u32) {
+        let _ = self.tx.send(Request::GuestRpc(format!(
+            "Resolution_Set {width} {height}"
+        )));
+    }
 }
 
 struct Connection {
@@ -130,12 +157,16 @@ impl Connection {
         };
         let mut greeting = String::new();
         conn.reader.read_line(&mut greeting)?;
-        conn.command(r#"{"execute":"qmp_capabilities"}"#)?;
+        if let Some(error) = conn.command(r#"{"execute":"qmp_capabilities"}"#)? {
+            return Err(std::io::Error::other(error));
+        }
         Ok(conn)
     }
 
-    /// Sends a command and waits for its reply, skipping asynchronous events.
-    fn command(&mut self, json: &str) -> std::io::Result<()> {
+    /// Sends a command and waits for its reply, skipping asynchronous
+    /// events. `Ok(Some(error))`: QEMU refused the command (the connection
+    /// stays usable); `Err`: the connection failed.
+    fn command(&mut self, json: &str) -> std::io::Result<Option<String>> {
         self.writer.write_all(json.as_bytes())?;
         self.writer.write_all(b"\n")?;
         let mut line = String::new();
@@ -145,10 +176,10 @@ impl Connection {
                 return Err(std::io::Error::other("QMP closed"));
             }
             if line.contains("\"return\"") {
-                return Ok(());
+                return Ok(None);
             }
             if line.contains("\"error\"") {
-                return Err(std::io::Error::other(line.trim().to_string()));
+                return Ok(Some(line.trim().to_string()));
             }
         }
     }
@@ -160,10 +191,12 @@ fn sender(path: &PathBuf, rx: &Receiver<Request>) {
     while let Ok(first) = rx.recv() {
         let mut inputs = Vec::new();
         let mut powerdown = false;
+        let mut guest_rpc = Vec::new();
         for request in std::iter::once(first).chain(rx.try_iter()) {
             match request {
                 Request::Input(input) => inputs.push(input),
                 Request::Powerdown => powerdown = true,
+                Request::GuestRpc(message) => guest_rpc.push(message),
             }
         }
         let batch = coalesce(inputs);
@@ -184,17 +217,31 @@ fn sender(path: &PathBuf, rx: &Receiver<Request>) {
             }
         }
         if let Some(c) = conn.as_mut() {
-            let mut result = Ok(());
+            let mut commands = Vec::new();
             if !batch.is_empty() {
-                result = c.command(&command_json(&batch));
+                commands.push(command_json(&batch));
             }
-            if result.is_ok() && powerdown {
+            for message in guest_rpc {
+                log!("asking the guest: {message}");
+                commands.push(format!(
+                    r#"{{"execute":"x-vmport-guestrpc-send","arguments":{{"message":{}}}}}"#,
+                    json_string(&message)
+                ));
+            }
+            if powerdown {
                 log!("asking the guest to shut down (ACPI power button)");
-                result = c.command(r#"{"execute":"system_powerdown"}"#);
+                commands.push(r#"{"execute":"system_powerdown"}"#.to_string());
             }
-            if let Err(error) = result {
-                log!("QMP error: {error}");
-                conn = None;
+            for command in commands {
+                match c.command(&command) {
+                    Ok(None) => {}
+                    Ok(Some(refused)) => log!("QMP refused a command: {refused}"),
+                    Err(error) => {
+                        log!("QMP error: {error}");
+                        conn = None;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -260,7 +307,7 @@ mod tests {
             let mut writer = stream;
             writer.write_all(b"{\"QMP\": {}}\n").unwrap();
             let mut lines = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 writer
@@ -275,12 +322,16 @@ mod tests {
             qcode: "ret",
             down: true,
         });
+        sink.set_resolution(1600, 900);
         sink.powerdown();
         let lines = server.join().unwrap();
         assert!(lines[0].contains("qmp_capabilities"));
         assert!(lines[1].contains(r#""data":"ret""#));
+        assert!(lines[2].contains(
+            r#""execute":"x-vmport-guestrpc-send","arguments":{"message":"Resolution_Set 1600 900"}"#
+        ));
         assert!(
-            lines[2].contains("system_powerdown"),
+            lines[3].contains("system_powerdown"),
             "input first, then the power button"
         );
         let _ = std::fs::remove_file(&dir);

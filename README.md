@@ -6,7 +6,7 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M2 presque atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080. Le pilote écrit son journal à l'hôte, ce qui guide la suite : la 3D (M3). Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M2 atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D) en cours** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu, que rsvga n'exécute pas encore. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
@@ -67,6 +67,12 @@ scripts/run-windows.sh --disk /chemin/windows.qcow2 --vars /chemin/OVMF_VARS_4M.
 
 Le pilote VMware se trouve dans les VMware Tools : il faut extraire `vm3d.inf` et ses fichiers, puis lancer `pnputil /add-driver vm3d.inf /install` dans Windows.
 
+Programmes de test côté invité (mingw-w64), donnés à la VM par `run-windows.sh --guest-tools` ; `d3dprobe.exe` rapporte à l'hôte, par la porte dérobée VMware, ce que Direct3D voit de la carte :
+
+```bash
+scripts/build-guest-tools.sh
+```
+
 ## Lancer la carte
 
 ```bash
@@ -103,7 +109,8 @@ target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/
 - `vfio-user` : protocole vfio-user côté serveur, avec passage de descripteurs de fichiers.
 - `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
 - `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
-- 60 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; deux cibles de fuzzing.
+- `guest/d3dprobe` : sonde Direct3D côté Windows.
+- 121 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; deux cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
 

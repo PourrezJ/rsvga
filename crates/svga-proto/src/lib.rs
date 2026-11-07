@@ -10,6 +10,7 @@
 
 #![no_std]
 
+pub mod cmd3d_names;
 pub mod format;
 
 /// PCI identity and BAR layout of the SVGA II device.
@@ -464,6 +465,9 @@ pub mod cmd3d {
     pub const DEFINE_GB_MOB64: u32 = 1135;
     pub const REDEFINE_GB_MOB64: u32 = 1136;
     pub const NOP_ERROR: u32 = 1137;
+    /// Copies (and scales) a surface image to another: how the WDDM driver
+    /// presents when 3D is on, whether or not DirectX runs.
+    pub const DX_PRESENTBLT: u32 = 1180;
     pub const GROW_OTABLE: u32 = 1236;
     pub const DEFINE_GB_SURFACE_V3: u32 = 1239;
     pub const UPDATE_ZERO_SURFACE: u32 = 1256;
@@ -656,16 +660,66 @@ pub mod devcap {
     pub const MAX_RENDER_TARGETS: u32 = 8;
     pub const MAX_TEXTURE_WIDTH: u32 = 19;
     pub const MAX_TEXTURE_HEIGHT: u32 = 20;
+    pub const MAX_VOLUME_EXTENT: u32 = 21;
+    pub const MAX_TEXTURE_REPEAT: u32 = 22;
+    pub const MAX_TEXTURE_ANISOTROPY: u32 = 24;
+    pub const MAX_PRIMITIVE_COUNT: u32 = 25;
+    pub const MAX_VERTEX_INDEX: u32 = 26;
     pub const MAX_SIMULTANEOUS_RENDER_TARGETS: u32 = 64;
     pub const MAX_CONTEXT_IDS: u32 = 77;
     pub const MAX_SURFACE_IDS: u32 = 78;
     pub const DXCONTEXT: u32 = 95;
     pub const DX_MAX_VERTEXBUFFERS: u32 = 97;
     pub const DX_MAX_CONSTANT_BUFFERS: u32 = 98;
+    pub const DX_PROVOKING_VERTEX: u32 = 99;
+    /// `DXFMT_*` of surface formats 1 (`X8R8G8B8`) to 144 (`BC5_UNORM`),
+    /// in format order: see [`dxfmt_index`].
+    pub const DXFMT_FIRST: u32 = 100;
     pub const SM41: u32 = 244;
+    pub const MULTISAMPLE_2X: u32 = 245;
+    pub const MULTISAMPLE_4X: u32 = 246;
+    pub const MS_FULL_QUALITY: u32 = 247;
+    pub const LOGICOPS: u32 = 248;
+    pub const LOGIC_BLENDOPS: u32 = 249;
+    /// `DXFMT_*` of formats 146 (`BC6H_TYPELESS`) to 151 (`BC7_UNORM_SRGB`).
+    pub const DXFMT_BC6H_TYPELESS: u32 = 251;
     pub const SM5: u32 = 258;
+    pub const MULTISAMPLE_8X: u32 = 259;
+    pub const MAX_FORCED_SAMPLE_COUNT: u32 = 260;
     /// Number of devcap indices.
     pub const MAX: u32 = 262;
+
+    /// The `DXFMT_*` devcap of a surface format. Formats 145
+    /// (`B4G4R4A4_UNORM`), 152 (`AYUV`) and 153 (`R11G11B10_TYPELESS`)
+    /// have none: drivers decide their support themselves.
+    pub const fn dxfmt_index(format: u32) -> Option<u32> {
+        match format {
+            // DXFMT_FIRST - 1 and DXFMT_BC6H_TYPELESS - 146.
+            1..=144 => format.checked_add(99),
+            146..=151 => format.checked_add(105),
+            _ => None,
+        }
+    }
+}
+
+/// What a surface format can do (`SVGA3D_DXFMT_*`), the value of its
+/// `DXFMT` devcap.
+pub mod dxfmt {
+    #![allow(missing_docs)]
+    /// Surfaces of this format can be created (and read by `ld`).
+    pub const SUPPORTED: u32 = 1 << 0;
+    /// Shaders can sample it with filtering.
+    pub const SHADER_SAMPLE: u32 = 1 << 1;
+    pub const COLOR_RENDERTARGET: u32 = 1 << 2;
+    pub const DEPTH_RENDERTARGET: u32 = 1 << 3;
+    pub const BLENDABLE: u32 = 1 << 4;
+    pub const MIPS: u32 = 1 << 5;
+    /// Texture arrays and cube maps.
+    pub const ARRAY: u32 = 1 << 6;
+    /// 3D textures.
+    pub const VOLUME: u32 = 1 << 7;
+    pub const DX_VERTEX_BUFFER: u32 = 1 << 8;
+    pub const MULTISAMPLE: u32 = 1 << 9;
 }
 
 /// Record types in the FIFO 3D caps area ([`fifo::CAPS_3D`]): records of
