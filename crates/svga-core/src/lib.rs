@@ -6,6 +6,7 @@
 
 pub mod cmdbuf;
 pub mod command;
+pub mod cotable;
 pub mod decode;
 pub mod dx;
 pub mod fifo;

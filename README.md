@@ -114,7 +114,7 @@ target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/
 - `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
 - `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
 - `guest/d3dprobe` : sonde Direct3D côté Windows.
-- 129 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; trois cibles de fuzzing.
+- 137 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; trois cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
 

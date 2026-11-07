@@ -59,6 +59,10 @@ pub const GB_MEMORY_KB: u32 = 1 << 20;
 pub const MOB_MAX_SIZE: u32 = 256 << 20;
 /// Host memory all device copies of guest-backed surfaces may use.
 pub const GB_SURFACE_BYTES: u64 = 1 << 30;
+/// Shader code all DX contexts together may hold.
+pub const DX_CODE_BYTES: usize = 64 << 20;
+/// Largest DX shader (code and signatures).
+pub const DX_SHADER_BYTES: u32 = 4 << 20;
 
 /// FIFO capabilities written into `SVGA_FIFO_CAPABILITIES`.
 pub const FIFO_CAPABILITIES: u32 = fifo_cap::FENCE
@@ -164,9 +168,12 @@ pub struct Stats {
     pub updates: u64,
     /// Commands ignored because they are not implemented yet.
     pub unsupported: u64,
-    /// DX context commands decoded (not executed yet).
+    /// DX context commands done.
     pub dx: u64,
-    /// DX context commands refused by the decoder.
+    /// DX context commands that need the renderer (draws, clears, copies):
+    /// accepted, not executed yet.
+    pub dx_deferred: u64,
+    /// DX context commands refused (malformed, or invalid for the state).
     pub dx_refused: u64,
 }
 
@@ -183,6 +190,8 @@ pub struct State {
     pub twod: TwoD,
     /// Guest-backed objects: MOBs, surfaces, screen targets.
     pub gb: crate::gb::Gb,
+    /// DirectX contexts.
+    pub dx: crate::dxctx::DxContexts,
     /// The INTx line.
     pub irq: Intx,
     /// Command buffer contexts.
@@ -319,6 +328,11 @@ impl Svga {
                 max_width: opts.max_width,
                 max_height: opts.max_height,
             }),
+            dx: crate::dxctx::DxContexts::new(crate::dxctx::Limits {
+                contexts: crate::devcaps::MAX_CONTEXT_IDS,
+                code_bytes: DX_CODE_BYTES,
+                shader_bytes: DX_SHADER_BYTES,
+            }),
             irq: Intx::default(),
             cb: CommandBuffers::default(),
             damage: Damage::default(),
@@ -366,7 +380,7 @@ impl Svga {
         let r = |i: u32| self.fifo.load_u32(reg_index(i));
         let state = self.lock();
         format!(
-            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} dx={} refused={} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
+            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} dx={} deferred={} refused={} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
             r(fifo::MIN),
             r(fifo::MAX),
             r(fifo::NEXT_CMD),
@@ -380,6 +394,7 @@ impl Svga {
             r(fifo::CURSOR_COUNT),
             state.stats.commands,
             state.stats.dx,
+            state.stats.dx_deferred,
             state.stats.dx_refused,
             state.cb.completed,
             state.cb.failed,
@@ -534,20 +549,31 @@ impl Svga {
         if let Command::Command3d { id, size, payload } = &command
             && let Some(parsed) = svga_core::dx::parse(*id, *size, payload)
         {
-            // Decoded only: execution comes with the renderer (M3).
-            match parsed {
-                Ok(dx_command) => {
-                    state.stats.dx = state.stats.dx.saturating_add(1);
-                    if trace_level() >= 1 {
-                        let mut text = format!("{dx_command:?}");
-                        text.truncate(200);
-                        let context = dx_context.map_or("-".to_string(), |c| c.to_string());
-                        trace(format!("DX {context} {text}"));
-                    }
+            let State {
+                dx,
+                gb,
+                guest,
+                stats,
+                ..
+            } = state;
+            let result = parsed.map_err(|e| e.to_string()).and_then(|dx_command| {
+                if trace_level() >= 1 {
+                    let mut text = format!("{dx_command:?}");
+                    text.truncate(200);
+                    let context = dx_context.map_or("-".to_string(), |c| c.to_string());
+                    trace(format!("DX {context} {text}"));
+                }
+                dx.execute(dx_command, dx_context, gb, guest)
+            });
+            match result {
+                Ok(crate::dxctx::Outcome::Done) => stats.dx = stats.dx.saturating_add(1),
+                Ok(crate::dxctx::Outcome::Deferred) => {
+                    stats.dx_deferred = stats.dx_deferred.saturating_add(1);
                 }
                 Err(error) => {
-                    state.stats.dx_refused = state.stats.dx_refused.saturating_add(1);
-                    trace(format!("DX command refused: {error}"));
+                    stats.dx_refused = stats.dx_refused.saturating_add(1);
+                    let name = svga_proto::cmd3d_names::name(*id).unwrap_or("?");
+                    trace(format!("DX {name} refused: {error}"));
                 }
             }
             return;
@@ -994,6 +1020,7 @@ impl Device for Handle {
         state.irq.reset();
         state.twod.reset();
         state.gb.reset();
+        state.dx.reset();
         state.cb.reset();
         state.fifo_error = None;
         state.last_mode = None;
@@ -1310,9 +1337,10 @@ mod tests {
         assert_eq!(word(0x80), cb::status::COMPLETED, "queued buffer ran");
         assert_eq!(h.0.fifo.load_u32(fifo::FENCE as usize), 0x44);
 
-        // DX commands of a DX context's buffer are decoded (not executed
-        // yet); one with nine render targets is refused.
-        let mut dx = vec![svga_proto::cmd3d::DX_SET_TOPOLOGY, 4, 1];
+        // DX commands of a DX context's buffer apply to that context; one
+        // with nine render targets is refused.
+        let mut dx = vec![svga_proto::cmd3d::DX_DEFINE_CONTEXT, 4, 7];
+        dx.extend([svga_proto::cmd3d::DX_SET_TOPOLOGY, 4, 1]);
         dx.extend([svga_proto::cmd3d::DX_SET_RENDERTARGETS, 40]);
         dx.extend([u32::MAX; 10]);
         put(0x1400, &dx);
@@ -1335,7 +1363,9 @@ mod tests {
         assert_eq!(word(0x180), cb::status::COMPLETED);
         {
             let state = h.0.lock();
-            assert_eq!((state.stats.dx, state.stats.dx_refused), (1, 1));
+            assert_eq!((state.stats.dx, state.stats.dx_refused), (2, 1));
+            let context = state.dx.context(7).expect("context 7");
+            assert_eq!(context.bindings.topology, 1);
         }
 
         // Bad headers and contexts are refused, not run.

@@ -214,7 +214,13 @@ impl Gb {
         mob::pieces(&m.pages, offset, len as u64).ok_or_else(|| format!("MOB {id} is too small"))
     }
 
-    fn read_mob(
+    /// Size in bytes of MOB `id`, if defined.
+    pub(crate) fn mob_size(&self, id: u32) -> Option<u32> {
+        self.mobs.get(&id).map(|m| m.size)
+    }
+
+    /// Reads `out.len()` bytes at `offset` of MOB `id`.
+    pub(crate) fn read_mob(
         &self,
         guest: &GuestMemory,
         id: u32,
@@ -232,7 +238,8 @@ impl Gb {
         Ok(())
     }
 
-    fn write_mob(
+    /// Writes `data` at `offset` of MOB `id`.
+    pub(crate) fn write_mob(
         &self,
         guest: &GuestMemory,
         id: u32,
@@ -494,7 +501,7 @@ impl Gb {
     }
 
     /// The image of Direct3D subresource `sub` (`mip + layer * mips`).
-    fn subresource(&self, sid: u32, sub: u32) -> Result<ImageId, String> {
+    pub(crate) fn subresource(&self, sid: u32, sub: u32) -> Result<ImageId, String> {
         let layout = &self.surface(sid)?.layout;
         let mips = layout.mip_levels().max(1);
         let image = ImageId {

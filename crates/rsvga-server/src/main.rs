@@ -12,6 +12,7 @@ mod damage;
 mod devcaps;
 mod device;
 mod display;
+mod dxctx;
 mod gb;
 mod guest;
 mod irq;

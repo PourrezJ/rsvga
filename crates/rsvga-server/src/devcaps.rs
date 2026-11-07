@@ -170,6 +170,9 @@ pub fn dxfmt(format: u32) -> u32 {
     }
 }
 
+/// DX contexts the device holds (`SVGA3D_DEVCAP_MAX_CONTEXT_IDS`).
+pub const MAX_CONTEXT_IDS: u32 = 256;
+
 /// `(devcap, value)` of everything but the formats.
 const CAPS: &[(u32, u32)] = &[
     (devcap::THREE_D, 1),
@@ -189,7 +192,7 @@ const CAPS: &[(u32, u32)] = &[
     (devcap::MAX_TEXTURE_ANISOTROPY, 16),
     (devcap::MAX_PRIMITIVE_COUNT, 0x00ff_ffff),
     (devcap::MAX_VERTEX_INDEX, 0x00ff_ffff),
-    (devcap::MAX_CONTEXT_IDS, 256),
+    (devcap::MAX_CONTEXT_IDS, MAX_CONTEXT_IDS),
     (devcap::MAX_SURFACE_IDS, 32_768),
     (devcap::DXCONTEXT, 1),
     (devcap::DX_MAX_VERTEXBUFFERS, 32),

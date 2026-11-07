@@ -1,9 +1,11 @@
-//! DX context commands (and guest-backed object commands) from arbitrary
-//! bytes: the decoders must never panic, and decoded arrays stay within
-//! the Direct3D limits.
+//! DX context commands (and guest-backed object commands) and context
+//! table entries from arbitrary bytes: the decoders must never panic,
+//! decoded arrays stay within the Direct3D limits, and a decoded entry
+//! encodes back to the same bytes after a round trip.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use svga_core::cotable;
 use svga_core::dx::{DxCommand, parse};
 use svga_proto::{cmd3d, dx};
 
@@ -23,6 +25,13 @@ fuzz_target!(|data: &[u8]| {
         })
         .collect();
     let _ = svga_core::gb::parse(id, &words);
+    // The same bytes as an entry of a context table.
+    let table = u32::from(*lo) % (dx::cotable::MAX + 1);
+    if let Ok(object) = cotable::decode(table, rest) {
+        let bytes = cotable::encode(1, &object);
+        let again = cotable::decode(table, &bytes).expect("an encoded entry decodes");
+        assert_eq!(cotable::encode(1, &again), bytes, "{object:?}");
+    }
     if let Some(Ok(command)) = parse(id, size, &words) {
         let bounded = match &command {
             DxCommand::SetShaderResources { views, .. } => views.len() <= dx::MAX_SRVIEWS,
