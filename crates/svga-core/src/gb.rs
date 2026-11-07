@@ -47,6 +47,8 @@ pub struct SurfaceDef {
     pub size: Size3,
     /// Array size (0: not an array).
     pub array_size: u32,
+    /// Bytes per element of a structured buffer (V4; 0: none).
+    pub buffer_stride: u32,
 }
 
 /// A decoded guest-backed object command.
@@ -495,6 +497,7 @@ pub fn parse(id: u32, payload: &[u32]) -> Option<Result<GbCommand, ShortPayload>
                 } else {
                     w[9]
                 },
+                buffer_stride: 0,
             })
         }
         cmd3d::DEFINE_GB_SURFACE_V3 | cmd3d::DEFINE_GB_SURFACE_V4 => {
@@ -506,6 +509,11 @@ pub fn parse(id: u32, payload: &[u32]) -> Option<Result<GbCommand, ShortPayload>
                 samples: w[5],
                 size: size(&w[9..12]),
                 array_size: w[12],
+                buffer_stride: if id == cmd3d::DEFINE_GB_SURFACE_V4 {
+                    w[13]
+                } else {
+                    0
+                },
             })
         }
         cmd3d::DESTROY_GB_SURFACE => GbCommand::DestroySurface { sid: w[0] },
@@ -702,7 +710,7 @@ mod tests {
         );
         // V4: sid, flags (2 words), format, mips, samples, pattern, quality,
         // filter, size (3), arraySize, bufferByteStride.
-        let v4 = [7, 0x200, 1, 142, 1, 0, 0, 0, 0, 1920, 1080, 1, 0, 0];
+        let v4 = [7, 0x200, 1, 142, 1, 0, 0, 0, 0, 1920, 1080, 1, 0, 16];
         assert_eq!(
             parse(cmd3d::DEFINE_GB_SURFACE_V4, &v4),
             Some(Ok(GbCommand::DefineSurface(SurfaceDef {
@@ -716,7 +724,8 @@ mod tests {
                     height: 1080,
                     depth: 1
                 },
-                array_size: 0
+                array_size: 0,
+                buffer_stride: 16
             })))
         );
     }

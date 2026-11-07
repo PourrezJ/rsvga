@@ -800,6 +800,10 @@ impl Gpu {
                             None => Resource::None,
                         }
                     }
+                    // Direct3D 9 shaders have no buffer views.
+                    BindingKind::BufferResource { .. } | BindingKind::UaView { .. } => {
+                        Resource::None
+                    }
                 };
                 resources.push(Bound {
                     binding: b.binding,
@@ -832,6 +836,7 @@ impl Gpu {
         let mut draw = Draw {
             vs: &vs.shader,
             ps: Some(&ps.shader),
+            gs: None,
             attributes,
             buffers,
             index: None,
@@ -1016,6 +1021,7 @@ mod tests {
                     depth: 1,
                 },
                 array_size: 0,
+                buffer_stride: 0,
             }));
             self.gb(GbCommand::BindSurface { sid, mob, pitch: 0 });
         }
@@ -1222,6 +1228,7 @@ mod tests {
                 depth: 1,
             },
             array_size: 0,
+            buffer_stride: 0,
         }));
         r.gb(GbCommand::BindSurface {
             sid: 12,

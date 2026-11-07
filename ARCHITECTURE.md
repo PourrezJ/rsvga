@@ -11,7 +11,7 @@ Windows invité  : pilote VMware SVGA officiel (inchangé)
       │  registres, FIFO, command buffers (mémoire partagée)
 QEMU (≥ 10.1)   : -device vfio-user-pci,socket=/run/rsvga.sock
       │  protocole vfio-user (socket Unix + mémoire partagée)
-rsvga-server    : processus séparé, sandboxé, en Rust
+rsvga-server    : processus séparé, en Rust (sandbox prévue en M5)
       │  Vulkan (ash)
 GPU de l'hôte   : RX 6950 XT, via /dev/dri/renderD*
 ```
@@ -40,8 +40,8 @@ GPU de l'hôte   : RX 6950 XT, via /dev/dri/renderD*
 4. **Une commande incomplète n'est jamais consommée.** Une commande invalide arrête la FIFO et lève `SVGA_IRQFLAG_ERROR`, sans jamais paniquer.
 5. **Budget par passe** : l'invité ne peut pas monopoliser le thread de traitement.
 6. **`unsafe` confiné** à `rsvga-server` (mmap, accès volatils) et à `svga-render` (Vulkan), derrière des API sûres et documentées.
-7. **Sandbox du serveur** : seccomp et landlock. Le serveur n'accède qu'au socket vfio-user, à la mémoire invitée et à `/dev/dri/renderD*`.
-8. **Fuzzing de chaque décodeur** (cargo-fuzz), en plus des tests unitaires et d'un test de stress déterministe.
+7. **Sandbox du serveur** (pas encore faite, prévue en M5) : seccomp et landlock, pour que le serveur n'accède qu'au socket vfio-user, à la mémoire invitée et à `/dev/dri/renderD*`.
+8. **Fuzzing de chaque décodeur** (libFuzzer), en plus des tests unitaires et d'un test de stress déterministe.
 
 ## Feuille de route
 
@@ -51,7 +51,7 @@ GPU de l'hôte   : RX 6950 XT, via /dev/dri/renderD*
 | **M1 : bureau 2D** (atteint) | Serveur vfio-user, registres SVGA, VRAM et FIFO en mémoire partagée, mode graphique, `UPDATE` affiché dans une fenêtre. | OVMF puis Windows affichés avec le pilote VMware, en 2D. |
 | **M2 : pilote WDDM** (atteint) | Objets « guest-backed » (MOB, OTables), command buffers, Screen Targets, curseur, fences et IRQ. | Bureau Windows 11 à la résolution native, redimensionnement. |
 | **M3 : 3D de base** (atteint) | Contexte DX, ressources, vues, clear/copy/draw, traducteur VGPU10 → SPIR-V (VS/PS). | Bureau DWM en 3D, triangle D3D11, `dxdiag` sans erreur. |
-| **M4 : D3D11 complet** | GS/HS/DS/CS, stream output, requêtes, MSAA, capacités FL 11_0. | 3DMark et jeux DX11. |
+| **M4 : D3D11 complet** (en cours) | GS/HS/DS/CS, stream output, requêtes, MSAA, capacités FL 11_0. | 3DMark et jeux DX11. |
 | **M5 : intégration** | Sandbox, patchs QEMU proposés upstream, paquet Debian. | Installation en une commande. |
 
 ## État de M1 (2026-11-06)
@@ -167,6 +167,22 @@ Au début de M3, la 3D restait derrière les variables de sonde (`RSVGA_PROBE_CA
       - une texture YUY2 liée en cible de rendu le fait échouer lui-même (« erreur interne », `0x887a0020`, et Windows retire le périphérique) ;
       - il refuse une vue d'entrée du processeur vidéo sur une YUY2 liée en lecture seule.
 
+## M4 : Direct3D 11 au niveau 11_0 (en cours)
+
+1. **Ce que le pilote exige.** Le pilote DirectX de VMware (`vm3dum64_10.dll`) garde une table de minimums de devcaps par niveau (voir M3, point « Pourquoi DWM échouait »). Pour 11_0 elle ajoute aux exigences de 10_1 : des textures de 16 384 texels (`MAX_TEXTURE_WIDTH`, `HEIGHT`, `REPEAT`), les formats BC6H et BC7, `SM5` et `MULTISAMPLE_8X` (pour l'interface 11.0 et au-delà). Celle de 11_1 est la même ; Windows refuse pourtant 11_1 (`DXGI_ERROR_UNSUPPORTED`), pour une raison à trouver. rsvga annonçait déjà tout le reste : avec le seul devcap `SM5` (`RSVGA_PROBE_DEVCAPS="258=1"`), `dxdiag` montre les niveaux 11_0 à 9_1, et DWM tourne. En attendant la fin de M4, 11_0 reste derrière cette sonde.
+2. **Les commandes que le pilote change** à ce niveau, même pour un programme Direct3D 10 : ses copies vers et depuis les ressources « staging » passent par `DX_PRED_STAGING_COPY_REGION` et ses sœurs (`Staging` dans `svga-core/src/dx.rs` : la copie, puis la relecture de la destination si demandée), il lie les vues UAV à chaque changement de cibles (`DX_SET_UA_VIEWS`, même vides) et donne à chaque contexte une zone de MOB pour les interfaces de classes (`DX_BIND_SHADER_IFACE`). Avec elles, `d3dtest` repasse au niveau 11_0.
+3. **`d3dtest` couvre maintenant Direct3D 11** : comparaison de profondeur, gather, geometry shader, stream output, et au niveau 11_0 compute shaders (vue typée, tampons structurés et bruts, mémoire partagée, atomiques, instructions sur les bits), UAV dans un pixel shader, tessellation, dessin et dispatch indirects. Ce qu'un niveau ne permet pas est sauté (`SKIP`). Résultats dans la VM de test : au niveau 11_0 (sonde), 24 des 26 tests passent, tous sauf le stream output et la tessellation ; au niveau 10_1 (le défaut), les 14 tests d'avant plus la comparaison de profondeur, le gather et le geometry shader, et `d3d9test` reste à 37/37.
+4. **Shader model 5 dans le traducteur** (`svga-shader/src/translate/`) :
+   - `bits.rs` : `countbits`, `firstbit_*` (comptés depuis le bit de poids fort, ~0 sans bit, comme Direct3D), `ubfe`, `ibfe`, `bfi` avec les règles de Direct3D, `bfrev`, demi-flottants, retenues, produits complets, `swapc` ;
+   - `memory.rs` : tampons bruts et structurés en tampons de stockage de mots, mémoire partagée de groupe en tableau `Workgroup`, vues typées en images de stockage de format inconnu (sauf `R32` pour les atomiques), atomiques, `sync`, `bufinfo` ;
+   - `geometry.rs` : geometry shaders (entrées par sommet, `emit`, `cut`, instances, couche et viewport en sortie) ;
+   - comparaisons de profondeur (`sample_c`, `sample_c_lz`) et gathers (`gather4`, `_c`, `_po`) ;
+   - le stage compute : groupes, identifiants de threads.
+   Les 103 shaders capturés (DWM et `d3dtest`, gardés hors du dépôt) se traduisent et passent `spirv-val`, sauf hull et domain.
+5. **Moteur Vulkan** : dispatchs directs et indirects (`svga-render/src/compute.rs`), dessins indirects, geometry shaders, descripteurs de stockage (tampons, images, tampons de texels) avec des ressources « nulles » à part pour les vues non liées, usage stockage pour les surfaces que Windows déclare liables en UAV (`SVGA3D_SURFACE_BIND_UAVIEW`), effacement des vues UAV.
+6. **Côté serveur** : les vues UAV (table d'objets, liaisons graphiques et compute), le stride des tampons structurés (`DEFINE_GB_SURFACE_V4`), la résolution des descripteurs commune aux dessins et aux dispatchs. `DX_SET_UA_VIEWS` donne les vues à partir de l'emplacement qui suit les cibles de rendu (`uavSpliceIndex`), comme le fait le pilote Mesa `svga`.
+7. **Pas encore** : hull et domain shaders (tessellation), stream output (`DX_DEFINE_STREAMOUTPUT_WITH_MOB`), compteurs des tampons append/consume, `switch` et sous-routines, doubles, `eval_*`, interfaces de classes, requêtes de statistiques.
+
 ## Questions ouvertes
 
 - **Réglages `guestinfo.svga.wddm.*`** : le patch 0002 sait maintenant les servir, mais rsvga n'en fixe aucun ; le pilote prend ses défauts. Reste à savoir si certains méritent une valeur (VMware les prend dans le `.vmx`).
@@ -175,7 +191,7 @@ Au début de M3, la 3D restait derrière les variables de sonde (`RSVGA_PROBE_CA
 - **Patchs QEMU à proposer upstream** : 0001 (accès non alignés vfio-user) et 0002 (port VMware), une fois le design validé par l'usage.
 - **Affichage** : vfio-user ne transporte pas l'image vers la fenêtre de QEMU (`hw/vfio/display.c` appelle `ioctl` directement sur le fd du périphérique). En attendant, le serveur ouvre sa propre fenêtre et envoie clavier et souris par QMP. Cible : étendre le protocole vfio-user (GFX plane + dmabuf).
 - **KVM `enable_vmware_backdoor=Y`** : activé sur cette machine pour les VMware Tools. Le paramètre est global au module `kvm` et ne change qu'au rechargement du module (toutes les VM arrêtées) ; le noyau 7.4 n'a pas de réglage par VM. La commande 75 vient du noyau de l'invité et passe sans ce réglage.
-- **Shader model 5** : quelles capacités supplémentaires (devcaps, `CAP2_DX3`...) le pilote attend pour le niveau 11_0, et à quel moment les annoncer (M4).
+- **Niveau 11_1** : le pilote a les mêmes exigences de devcaps qu'en 11_0, mais Windows le refuse ; reste à trouver ce qui manque.
 - **VMware Tools** (pilote invité) : logiciel propriétaire, téléchargé par l'utilisateur, jamais redistribué par ce projet.
 - **Licence du projet** : MIT (fichier `LICENSE`) ; les patchs QEMU suivent la licence de QEMU.
 

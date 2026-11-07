@@ -13,8 +13,8 @@ use svga_proto::{cmd3d, dx};
 
 use crate::dx::{
     BlendState, DepthStencilState, DepthStencilView, DxCommand, DxError, InputElement,
-    RasterizerState, RtvRange, SamplerState, ShaderStage, SrvRange, StreamOutputDecl, ViewTarget,
-    parse,
+    RasterizerState, RtvRange, SamplerState, ShaderStage, SrvRange, StreamOutputDecl, UaRange,
+    ViewTarget, parse,
 };
 
 /// Bytes of one entry of table `table` (`SVGACOTableType`).
@@ -73,6 +73,17 @@ pub struct StreamOutput {
     pub rasterized_stream: u32,
 }
 
+/// An unordered-access view (`SVGACOTableDXUAViewEntry`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UaView {
+    /// Surface, format and dimension.
+    pub target: ViewTarget,
+    /// What it covers.
+    pub range: UaRange,
+    /// Hidden counter of append and counter buffer views.
+    pub structure_count: u32,
+}
+
 /// An object of a context table.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Object {
@@ -98,6 +109,8 @@ pub enum Object {
     Query(Query),
     /// `SVGA_COTABLE_DXSHADER`.
     Shader(Shader),
+    /// `SVGA_COTABLE_UAVIEW`.
+    UaView(UaView),
 }
 
 impl Object {
@@ -115,6 +128,7 @@ impl Object {
             Self::StreamOutput(_) => dx::cotable::STREAMOUTPUT,
             Self::Query(_) => dx::cotable::DXQUERY,
             Self::Shader(_) => dx::cotable::DXSHADER,
+            Self::UaView(_) => dx::cotable::UAVIEW,
         }
     }
 
@@ -165,6 +179,14 @@ impl Object {
                     size: *size,
                     offset: 0,
                     mob: svga_proto::INVALID_ID,
+                }),
+            ),
+            C::DefineUaView { id, target, range } => (
+                *id,
+                Self::UaView(UaView {
+                    target: *target,
+                    range: *range,
+                    structure_count: 0,
                 }),
             ),
             _ => return None,
@@ -370,6 +392,27 @@ pub fn encode(id: u32, object: &Object) -> Vec<u8> {
                 .u32(s.offset)
                 .u32(s.mob);
         }
+        Object::UaView(v) => {
+            o.target(&v.target);
+            let (a, b, c) = match v.range {
+                UaRange::Buffer {
+                    first,
+                    count,
+                    flags,
+                } => (first, count, flags),
+                UaRange::Texture {
+                    mip,
+                    first_slice,
+                    slices,
+                } => (mip, first_slice, slices),
+                UaRange::Texture3d {
+                    mip,
+                    first_w,
+                    w_size,
+                } => (mip, first_w, w_size),
+            };
+            o.u32(a).u32(b).u32(c).u32(0).u32(0).u32(v.structure_count);
+        }
     }
     let mut bytes = o.0;
     bytes.resize(entry_size(object.table()).unwrap_or(0), 0);
@@ -502,7 +545,13 @@ pub fn decode(table: u32, bytes: &[u8]) -> Result<Object, DxError> {
                 mob: word(entry, 12),
             }))
         }
-        // Unordered access views come with shader model 5.
+        dx::cotable::UAVIEW => {
+            let mut object = define(cmd3d::DX_DEFINE_UA_VIEW, 32)?;
+            if let Object::UaView(v) = &mut object {
+                v.structure_count = word(entry, 32);
+            }
+            Ok(object)
+        }
         _ => Err(DxError::BadValue {
             id: cmd3d::DX_SET_COTABLE,
             field: "object table",
@@ -675,6 +724,27 @@ mod tests {
                 offset: 128,
                 mob: 3,
             }),
+            Object::UaView(UaView {
+                target: ViewTarget {
+                    dimension: dx::resource::BUFFER,
+                    ..target
+                },
+                range: UaRange::Buffer {
+                    first: 2,
+                    count: 64,
+                    flags: crate::dx::UABUFFER_APPEND,
+                },
+                structure_count: 17,
+            }),
+            Object::UaView(UaView {
+                target,
+                range: UaRange::Texture {
+                    mip: 1,
+                    first_slice: 0,
+                    slices: 4,
+                },
+                structure_count: 0,
+            }),
         ]
     }
 
@@ -704,6 +774,13 @@ mod tests {
             (7, QUERY_FINISHED, 9)
         );
         assert_eq!(encode(1, &all[7])[28], 4);
+        // UA view: the description's three words, then structureCount
+        // after the description's two padding words.
+        let view = encode(1, &all[12]);
+        assert_eq!(
+            (word(&view, 12), word(&view, 20), word(&view, 32)),
+            (2, crate::dx::UABUFFER_APPEND, 17)
+        );
         let layout = encode(6, &all[4]);
         assert_eq!(
             (word(&layout, 0), word(&layout, 4)),
@@ -752,7 +829,10 @@ mod tests {
             "shader type 0"
         );
         assert!(decode(dx::cotable::SAMPLER, &[0u8; 10]).is_err(), "short");
-        assert!(decode(dx::cotable::UAVIEW, &[0u8; 64]).is_err(), "not yet");
+        assert!(
+            decode(dx::cotable::UAVIEW, &[0u8; 64]).is_err(),
+            "resource dimension 0"
+        );
         assert!(decode(99, &[0u8; 64]).is_err());
     }
 }

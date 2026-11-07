@@ -317,6 +317,7 @@ fn a_triangle_is_drawn_upright_with_its_constants() {
     let draw = Draw {
         vs: &vs,
         ps: Some(&ps),
+        gs: None,
         attributes: vec![
             VertexAttribute {
                 location: 0,
@@ -504,6 +505,7 @@ fn an_indexed_textured_quad_behind_and_in_front_of_depth() {
     let draw = Draw {
         vs: &vs,
         ps: Some(&ps),
+        gs: None,
         attributes: vec![
             VertexAttribute {
                 location: 0,
@@ -652,6 +654,7 @@ fn a_pixel_shader_reads_a_buffer_view() {
     let draw = Draw {
         vs: &vs,
         ps: Some(&ps),
+        gs: None,
         attributes: vec![attribute(0, 0), attribute(1, 16)],
         buffers: vec![VertexBuffer {
             binding: 0,
@@ -767,4 +770,97 @@ fn resolves_blits_and_mipmaps() {
         "1x1 level {gray:?} on {}",
         r.name()
     );
+}
+
+#[test]
+fn a_compute_shader_writes_a_buffer_directly_and_indirectly() {
+    use svga_shader::opcode as op;
+    use tokens::*;
+    let Some(mut r) = renderer() else { return };
+    // cs_5_0: dcl_uav_raw u0; dcl_input vThreadID.x; dcl_thread_group 4, 1, 1
+    // ishl r0.x, vThreadID.x, l(2); store_raw u0.x, r0.x, vThreadID.x
+    let sel = |c: u32| 2 | (2 << 2) | (c << 4);
+    let mask_x = 2 | (1 << 4);
+    let u0 = operand(30, 0, 1);
+    let thread_x = operand(32, sel(0), 0);
+    let cs = program(
+        5,
+        &[
+            instr(op::DCL_UAV_RAW, &[u0, 0]),
+            instr(op::DCL_INPUT, &[operand(32, mask_x, 0)]),
+            instr(op::DCL_TEMPS, &[1]),
+            instr(op::DCL_THREAD_GROUP, &[4, 1, 1]),
+            instr(
+                op::ISHL,
+                &[operand(0, mask_x, 1), 0, thread_x, operand(4, 1, 0), 2],
+            ),
+            instr(
+                op::STORE_RAW,
+                &[
+                    operand(30, mask_x, 1),
+                    0,
+                    operand(0, sel(0), 1),
+                    0,
+                    thread_x,
+                ],
+            ),
+            instr(op::RET, &[]),
+        ],
+    );
+    let cs = svga_shader::translate_words(&cs, &svga_shader::Options::default()).unwrap();
+    // u0: 16 words; indirect arguments (3 groups) in another buffer.
+    r.create(1, &layout(format::BUFFER, 64, 1, 1, 1), 0)
+        .unwrap();
+    r.upload(1, &[0xff; 64]).unwrap();
+    r.create(2, &layout(format::BUFFER, 16, 1, 1, 1), 0)
+        .unwrap();
+    let args: Vec<u8> = [0u32, 3, 1, 1]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    r.upload(2, &args).unwrap();
+    let uav = Bound {
+        binding: svga_shader::binding(
+            svga_shader::Stage::Compute,
+            &svga_shader::BindingKind::UaView {
+                slot: 0,
+                dimension: 0,
+            },
+        ),
+        resource: Resource::StorageBuffer {
+            sid: 1,
+            offset: 0,
+            size: 64,
+        },
+    };
+    let mut dispatch = Dispatch {
+        cs: &cs,
+        resources: vec![uav],
+        data: Vec::new(),
+        groups: Groups::Count([2, 1, 1]),
+    };
+    if let Err(e) = r.dispatch(&dispatch) {
+        eprintln!("{} cannot dispatch: {e}", r.name());
+        return;
+    }
+    let mut back = vec![0u8; 64];
+    r.download(1, &mut back).unwrap();
+    let words: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut want: Vec<u32> = (0..8).collect();
+    want.extend([u32::MAX; 8]);
+    assert_eq!(words, want, "8 threads on {}", r.name());
+    // The same from the arguments at byte 4: 3 groups, 12 threads.
+    dispatch.groups = Groups::Indirect { sid: 2, offset: 4 };
+    r.dispatch(&dispatch).unwrap();
+    r.download(1, &mut back).unwrap();
+    let words: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut want: Vec<u32> = (0..12).collect();
+    want.extend([u32::MAX; 4]);
+    assert_eq!(words, want, "12 threads on {}", r.name());
 }

@@ -10,18 +10,25 @@
 //!
 //! Bindings, all in descriptor set 0: [`binding`] gives each stage 256
 //! numbers: constant buffers from 0, samplers from 16, shader resources
-//! from 32.
+//! from 32, unordered-access views from 160.
 //!
-//! Supported now: vertex and pixel shaders of shader model 4.0 and 4.1,
-//! their arithmetic, comparisons, conversions, flow control (without
-//! `switch` and subroutines), `sample`, `sample_l`, `sample_b`, `sample_d`,
-//! `ld` and `resinfo`. Anything else is refused with a reason.
+//! Supported now: vertex, pixel and compute shaders of shader models 4.0
+//! to 5.0: their arithmetic, comparisons, conversions, flow control
+//! (without `switch` and subroutines), sampling (`sample` and its forms,
+//! depth comparisons, gathers), `ld`, `resinfo`; shader model 5's bit
+//! instructions, half floats, carries (module `bits`), raw and structured
+//! buffers, group-shared memory, typed UA views, atomics and barriers
+//! (module `memory`). Anything else is refused with a reason.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decode::{Index, Instruction, Modifier, Operand, Program, Select, Stage};
 use crate::opcode as o;
 use crate::spirv::{Module, Scalar, glsl, op};
+
+mod bits;
+mod geometry;
+mod memory;
 
 /// Why a program cannot be translated.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +84,21 @@ pub enum BindingKind {
         /// `VGPU10_RESOURCE_DIMENSION_*`.
         dimension: u32,
     },
+    /// Shader resource `slot` read as words: a raw or structured buffer
+    /// (read-only storage buffer).
+    BufferResource {
+        /// Slot.
+        slot: u32,
+    },
+    /// Unordered-access view `slot`: a storage image or storage texel
+    /// buffer if typed, else a storage buffer of words.
+    UaView {
+        /// Slot.
+        slot: u32,
+        /// `VGPU10_RESOURCE_DIMENSION_*` of a typed view; 0 for raw and
+        /// structured views.
+        dimension: u32,
+    },
 }
 
 /// A descriptor the shader uses.
@@ -122,7 +144,8 @@ pub fn spirv_hash(words: &[u32]) -> u64 {
     })
 }
 
-/// Binding number of a descriptor: 256 per stage.
+/// Binding number of a descriptor: 256 per stage (constant buffers from
+/// 0, samplers from 16, shader resources from 32, UA views from 160).
 pub fn binding(stage: Stage, kind: &BindingKind) -> u32 {
     let base: u32 = match stage {
         Stage::Vertex => 0,
@@ -135,7 +158,10 @@ pub fn binding(stage: Stage, kind: &BindingKind) -> u32 {
     let offset = match *kind {
         BindingKind::ConstantBuffer { slot, .. } => slot,
         BindingKind::Sampler { slot } => 16u32.saturating_add(slot),
-        BindingKind::Resource { slot, .. } => 32u32.saturating_add(slot),
+        BindingKind::Resource { slot, .. } | BindingKind::BufferResource { slot } => {
+            32u32.saturating_add(slot)
+        }
+        BindingKind::UaView { slot, .. } => 160u32.saturating_add(slot),
     };
     base.saturating_add(offset.min(255))
 }
@@ -172,9 +198,11 @@ const CAP_GEOMETRY: u32 = 2;
 const CAP_SAMPLED_1D: u32 = 43;
 const CAP_SAMPLED_BUFFER: u32 = 46;
 const CAP_IMAGE_QUERY: u32 = 50;
+const CAP_IMAGE_GATHER_EXTENDED: u32 = 25;
 const CAP_DERIVATIVE_CONTROL: u32 = 51;
 const CAP_SAMPLE_RATE_SHADING: u32 = 35;
 const CAP_DRAW_PARAMETERS: u32 = 4427;
+const CAP_MULTI_VIEWPORT: u32 = 57;
 const MODEL_VERTEX: u32 = 0;
 const MODEL_FRAGMENT: u32 = 4;
 const MODE_ORIGIN_UPPER_LEFT: u32 = 7;
@@ -184,6 +212,7 @@ const IMAGE_BIAS: u32 = 0x1;
 const IMAGE_LOD: u32 = 0x2;
 const IMAGE_GRAD: u32 = 0x4;
 const IMAGE_CONST_OFFSET: u32 = 0x8;
+const IMAGE_OFFSET: u32 = 0x10;
 
 // Operand types (`VGPU10_OPERAND_TYPE_*`).
 const T_TEMP: u32 = 0;
@@ -196,6 +225,19 @@ const T_IMMEDIATE_CONSTANT_BUFFER: u32 = 9;
 const T_INPUT_PRIMITIVEID: u32 = 11;
 const T_OUTPUT_DEPTH: u32 = 12;
 const T_NULL: u32 = 13;
+const T_RESOURCE: u32 = 7;
+const T_UAV: u32 = 30;
+const T_TGSM: u32 = 31;
+const T_THREAD_ID: u32 = 32;
+const T_THREAD_GROUP_ID: u32 = 33;
+const T_THREAD_ID_IN_GROUP: u32 = 34;
+const T_THREAD_ID_IN_GROUP_FLATTENED: u32 = 36;
+const BUILTIN_WORKGROUP_ID: u32 = 26;
+const BUILTIN_LOCAL_INVOCATION_ID: u32 = 27;
+const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
+const BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 29;
+const MODEL_GLCOMPUTE: u32 = 5;
+const MODE_LOCAL_SIZE: u32 = 17;
 
 /// How an input register is filled at entry.
 enum InputSource {
@@ -209,6 +251,13 @@ enum InputSource {
     IntBuiltin(u32),
     /// The front-facing boolean, as ~0 or 0.
     FrontFacing(u32),
+    /// A `uvec3` builtin (compute thread IDs), w = 0.
+    Uint3(u32),
+    /// A `uint` builtin, in x.
+    Uint(u32),
+    /// An array of `vec4`s (geometry shader inputs), of this type, copied
+    /// whole into a local array.
+    Array(u32, u32),
 }
 
 struct Resource {
@@ -256,13 +305,46 @@ struct Tx<'a> {
     input_locations: Vec<u32>,
     output_locations: Vec<u32>,
     early_tests: bool,
+    /// Registers of the compute thread IDs, by operand type.
+    system: HashMap<u32, u32>,
+    /// Threads per group (compute).
+    local_size: Option<[u32; 3]>,
+    /// Raw and structured buffers and group-shared memory, by operand
+    /// type and slot.
+    words: HashMap<(u32, u32), memory::Words>,
+    /// The storage buffer block type, once made.
+    words_block: Option<u32>,
+    /// Typed UA views.
+    typed_uavs: HashMap<u32, Resource>,
+    /// Typed UA views atomics use (they get the `R32` format).
+    atomic_uavs: HashSet<u32>,
+    /// Geometry shader declarations.
+    geometry: geometry::Geometry,
+    /// Per-vertex inputs (geometry shaders): local arrays by register.
+    vertex_inputs: HashMap<u32, u32>,
+    /// Scalar integer outputs (layer, viewport): variable and register.
+    int_sinks: Vec<(u32, u32)>,
 }
 
 /// Translates `program` to SPIR-V.
 pub fn translate(program: &Program, options: &Options) -> Result<Shader, TranslateError> {
-    if !matches!(program.stage, Stage::Vertex | Stage::Pixel) {
+    if !matches!(
+        program.stage,
+        Stage::Vertex | Stage::Pixel | Stage::Compute | Stage::Geometry
+    ) {
         return unsupported(format_args!("{:?} shaders", program.stage));
     }
+    // Typed views used by atomics: their declarations need a format.
+    let atomic_uavs: HashSet<u32> = program
+        .instructions
+        .iter()
+        .filter(|i| (o::ATOMIC_AND..=o::IMM_ATOMIC_UMIN).contains(&i.opcode))
+        .filter_map(|i| {
+            let first = usize::from((o::IMM_ATOMIC_ALLOC..=o::IMM_ATOMIC_UMIN).contains(&i.opcode));
+            let target = i.operands.get(first)?;
+            (target.kind == T_UAV).then(|| target.index0()).flatten()
+        })
+        .collect();
     let mut m = Module::new();
     m.capability(CAP_SHADER);
     let f4 = m.vector(Scalar::Float, 4);
@@ -294,6 +376,15 @@ pub fn translate(program: &Program, options: &Options) -> Result<Shader, Transla
         input_locations: Vec::new(),
         output_locations: Vec::new(),
         early_tests: false,
+        system: HashMap::new(),
+        local_size: None,
+        words: HashMap::new(),
+        words_block: None,
+        typed_uavs: HashMap::new(),
+        atomic_uavs,
+        geometry: geometry::Geometry::default(),
+        vertex_inputs: HashMap::new(),
+        int_sinks: Vec::new(),
     };
     let function = tx.m.id();
     let entry = tx.m.id();
@@ -311,6 +402,16 @@ pub fn translate(program: &Program, options: &Options) -> Result<Shader, Transla
     tx.ret();
     let (model, mut modes): (u32, Vec<Vec<u32>>) = match tx.stage {
         Stage::Vertex => (MODEL_VERTEX, Vec::new()),
+        Stage::Compute => {
+            let [x, y, z] = tx
+                .local_size
+                .ok_or_else(|| TranslateError("compute shader without thread group size".into()))?;
+            (MODEL_GLCOMPUTE, vec![vec![MODE_LOCAL_SIZE, x, y, z]])
+        }
+        Stage::Geometry => {
+            tx.m.capability(CAP_GEOMETRY);
+            (geometry::MODEL_GEOMETRY, tx.geometry_modes()?)
+        }
         _ => (MODEL_FRAGMENT, vec![vec![MODE_ORIGIN_UPPER_LEFT]]),
     };
     if tx.depth.is_some() {
@@ -411,6 +512,9 @@ impl Tx<'_> {
     // ---- declarations ---------------------------------------------------
 
     fn declare(&mut self, i: &Instruction) -> Result<(), TranslateError> {
+        if self.declare_geometry(i)? {
+            return Ok(());
+        }
         let reg = |i: &Instruction| -> Result<u32, TranslateError> {
             i.operands
                 .first()
@@ -502,10 +606,36 @@ impl Tx<'_> {
                     },
                 );
             }
+            o::DCL_RESOURCE_RAW
+            | o::DCL_RESOURCE_STRUCTURED
+            | o::DCL_UAV_RAW
+            | o::DCL_UAV_STRUCTURED
+            | o::DCL_TGSM_RAW
+            | o::DCL_TGSM_STRUCTURED => self.declare_words(i)?,
+            o::DCL_UAV_TYPED => self.declare_typed_uav(i)?,
+            o::DCL_THREAD_GROUP => {
+                let size = [0, 1, 2].map(|n| i.raw.get(n).copied().unwrap_or(0));
+                // Direct3D: at most 1024 threads, z at most 64.
+                let total = size.iter().try_fold(1u32, |a, &b| a.checked_mul(b));
+                if size.contains(&0) || size[2] > 64 || total.is_none_or(|t| t > 1024) {
+                    return unsupported(format_args!("thread group {size:?}"));
+                }
+                self.local_size = Some(size);
+            }
             o::DCL_INPUT | o::DCL_INPUT_PS => {
                 let operand = self.operand(i, 0)?;
                 if operand.kind == T_INPUT_PRIMITIVEID {
                     return self.declare_builtin_input(u32::MAX, 7);
+                }
+                if (T_THREAD_ID..=T_THREAD_ID_IN_GROUP_FLATTENED).contains(&operand.kind) {
+                    return self.declare_thread_id(operand.kind);
+                }
+                if operand.kind == geometry::T_GS_INSTANCE_ID {
+                    self.declare_instance_id();
+                    return Ok(());
+                }
+                if let [Index::Imm(vertices), Index::Imm(r)] = operand.indices.as_slice() {
+                    return self.declare_vertex_input(*vertices, *r, 0);
                 }
                 let r = reg(i)?;
                 if self.inputs.contains_key(&r) {
@@ -551,6 +681,11 @@ impl Tx<'_> {
             }
             o::DCL_INPUT_SGV | o::DCL_INPUT_SIV | o::DCL_INPUT_PS_SGV | o::DCL_INPUT_PS_SIV => {
                 let name = i.raw.first().copied().unwrap_or(0) & 0xffff;
+                if let [Index::Imm(vertices), Index::Imm(r)] =
+                    self.operand(i, 0)?.indices.as_slice()
+                {
+                    return self.declare_vertex_input(*vertices, *r, name);
+                }
                 let r = reg(i)?;
                 self.declare_builtin_input(r, name)?;
             }
@@ -577,7 +712,24 @@ impl Tx<'_> {
                 };
                 let local = self.register_var();
                 self.outputs.insert(r, local);
-                let (var, ty) = if name == 1 && self.stage == Stage::Vertex {
+                if self.stage == Stage::Geometry && matches!(name, 4 | 5) {
+                    // Render target array index, viewport index.
+                    let int = self.m.scalar(Scalar::Int);
+                    let builtin = if name == 4 {
+                        geometry::BUILTIN_LAYER
+                    } else {
+                        geometry::BUILTIN_VIEWPORT_INDEX
+                    };
+                    if name == 5 {
+                        self.m.capability(CAP_MULTI_VIEWPORT);
+                    }
+                    let var = self.output_var(int, &[&[DECORATION_BUILTIN, builtin]]);
+                    self.int_sinks.push((var, local));
+                    return Ok(());
+                }
+                let (var, ty) = if name == 1
+                    && matches!(self.stage, Stage::Vertex | Stage::Geometry)
+                {
                     let var = self.output_var(self.f4, &[&[DECORATION_BUILTIN, BUILTIN_POSITION]]);
                     (var, Scalar::Float)
                 } else {
@@ -620,10 +772,7 @@ impl Tx<'_> {
                 self.m.emit_void(op::STORE, &[var, value]);
                 self.icb = Some((var, len));
             }
-            o::DCL_INDEX_RANGE
-            | o::DCL_GS_INPUT_PRIMITIVE
-            | o::DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY
-            | o::DCL_MAX_OUTPUT_VERTEX_COUNT => {}
+            o::DCL_INDEX_RANGE => {}
             _ => {}
         }
         Ok(())
@@ -658,7 +807,7 @@ impl Tx<'_> {
                 let v = self.input_var(b, &[&[DECORATION_BUILTIN, BUILTIN_FRONT_FACING]]);
                 InputSource::FrontFacing(v)
             }
-            (Stage::Pixel, 7) => {
+            (Stage::Pixel | Stage::Geometry, 7) => {
                 self.m.capability(CAP_GEOMETRY);
                 let v = self.input_var(
                     int,
@@ -690,6 +839,34 @@ impl Tx<'_> {
                 l
             }
         };
+        self.input_sources.push((local, source));
+        Ok(())
+    }
+
+    /// A compute thread ID input (`vThreadID` and the like).
+    fn declare_thread_id(&mut self, kind: u32) -> Result<(), TranslateError> {
+        if self.stage != Stage::Compute || self.system.contains_key(&kind) {
+            return Ok(());
+        }
+        let u = self.m.scalar(Scalar::Uint);
+        let u3 = self.m.vector(Scalar::Uint, 3);
+        let source = match kind {
+            T_THREAD_ID => InputSource::Uint3(
+                self.input_var(u3, &[&[DECORATION_BUILTIN, BUILTIN_GLOBAL_INVOCATION_ID]]),
+            ),
+            T_THREAD_GROUP_ID => InputSource::Uint3(
+                self.input_var(u3, &[&[DECORATION_BUILTIN, BUILTIN_WORKGROUP_ID]]),
+            ),
+            T_THREAD_ID_IN_GROUP => InputSource::Uint3(
+                self.input_var(u3, &[&[DECORATION_BUILTIN, BUILTIN_LOCAL_INVOCATION_ID]]),
+            ),
+            T_THREAD_ID_IN_GROUP_FLATTENED => InputSource::Uint(
+                self.input_var(u, &[&[DECORATION_BUILTIN, BUILTIN_LOCAL_INVOCATION_INDEX]]),
+            ),
+            other => return unsupported(format_args!("compute input {other}")),
+        };
+        let local = self.register_var();
+        self.system.insert(kind, local);
         self.input_sources.push((local, source));
         Ok(())
     }
@@ -736,6 +913,28 @@ impl Tx<'_> {
                     let v = self.m.emit(op::LOAD, int, &[var]);
                     self.splat_int(v)
                 }
+                InputSource::Array(var, ty) => self.m.emit(op::LOAD, ty, &[var]),
+                InputSource::Uint3(var) => {
+                    let u = self.m.scalar(Scalar::Uint);
+                    let u3 = self.m.vector(Scalar::Uint, 3);
+                    let v = self.m.emit(op::LOAD, u3, &[var]);
+                    let zero = self.m.constant_u32(0);
+                    let parts: Vec<u32> = (0..3)
+                        .map(|c| self.m.emit(op::COMPOSITE_EXTRACT, u, &[v, c]))
+                        .chain([zero])
+                        .collect();
+                    let u4 = self.m.emit(op::COMPOSITE_CONSTRUCT, self.u4, &parts);
+                    self.m.emit(op::BITCAST, self.f4, &[u4])
+                }
+                InputSource::Uint(var) => {
+                    let u = self.m.scalar(Scalar::Uint);
+                    let v = self.m.emit(op::LOAD, u, &[var]);
+                    let zero = self.m.constant_u32(0);
+                    let u4 = self
+                        .m
+                        .emit(op::COMPOSITE_CONSTRUCT, self.u4, &[v, zero, zero, zero]);
+                    self.m.emit(op::BITCAST, self.f4, &[u4])
+                }
                 InputSource::FrontFacing(var) => {
                     let b = self.m.scalar(Scalar::Bool);
                     let u = self.m.scalar(Scalar::Uint);
@@ -758,11 +957,27 @@ impl Tx<'_> {
 
     /// Copies output registers to the interface, then returns.
     fn ret(&mut self) {
+        // Geometry shaders write their outputs at each emit.
+        if self.stage != Stage::Geometry {
+            self.write_outputs();
+        }
+        self.m.emit_void(op::RETURN, &[]);
+    }
+
+    /// Copies the output registers to the interface.
+    fn write_outputs(&mut self) {
         let sinks: Vec<(u32, u32, Scalar)> = self.output_sinks.clone();
         for (var, local, ty) in sinks {
             let v = self.m.emit(op::LOAD, self.f4, &[local]);
             let v = self.typed(v, ty);
             self.m.emit_void(op::STORE, &[var, v]);
+        }
+        for (var, local) in self.int_sinks.clone() {
+            let int = self.m.scalar(Scalar::Int);
+            let v = self.m.emit(op::LOAD, self.f4, &[local]);
+            let v = self.typed(v, Scalar::Int);
+            let x = self.m.emit(op::COMPOSITE_EXTRACT, int, &[v, 0]);
+            self.m.emit_void(op::STORE, &[var, x]);
         }
         if let Some((var, local)) = self.depth {
             let f = self.m.scalar(Scalar::Float);
@@ -770,7 +985,6 @@ impl Tx<'_> {
             let x = self.m.emit(op::COMPOSITE_EXTRACT, f, &[v, 0]);
             self.m.emit_void(op::STORE, &[var, x]);
         }
-        self.m.emit_void(op::RETURN, &[]);
     }
 
     /// Starts a new block (after a terminator).
@@ -830,10 +1044,16 @@ impl Tx<'_> {
                     .copied()
                     .ok_or_else(|| missing("temporary"))
             }
+            T_INPUT if operand.indices.len() == 2 => self.vertex_input(operand),
             T_INPUT => {
                 let r = operand.index0().ok_or_else(|| missing("input"))?;
                 self.inputs.get(&r).copied().ok_or_else(|| missing("input"))
             }
+            geometry::T_GS_INSTANCE_ID => self
+                .system
+                .get(&operand.kind)
+                .copied()
+                .ok_or_else(|| missing("instance ID")),
             T_OUTPUT => {
                 let r = operand.index0().ok_or_else(|| missing("output"))?;
                 self.outputs
@@ -850,6 +1070,11 @@ impl Tx<'_> {
                 .get(&u32::MAX)
                 .copied()
                 .ok_or_else(|| missing("primitive ID")),
+            T_THREAD_ID..=T_THREAD_ID_IN_GROUP_FLATTENED => self
+                .system
+                .get(&operand.kind)
+                .copied()
+                .ok_or_else(|| missing("thread ID")),
             T_INDEXABLE_TEMP => {
                 let r = operand
                     .index0()
@@ -1151,18 +1376,9 @@ impl Tx<'_> {
             }
             _ => return unsupported(format_args!("sample opcode {}", i.opcode)),
         };
-        if let Some(offsets) = i.texel_offsets().filter(|o| *o != [0; 3]) {
-            let n = match dimension {
-                2 | 7 => 1,
-                5 => 3,
-                3 | 8 => 2,
-                _ => 0,
-            };
-            if n > 0 {
-                mask |= IMAGE_CONST_OFFSET;
-                let parts: Vec<u32> = offsets[..n].iter().map(|v| *v as u32).collect();
-                extra.push(self.m.constant_vector(Scalar::Int, &parts));
-            }
+        if let Some(offset) = self.const_offset(i, dimension) {
+            mask |= IMAGE_CONST_OFFSET;
+            extra.push(offset);
         }
         let rty = self.vec(ret);
         let mut operands = vec![sampled, coord];
@@ -1171,6 +1387,123 @@ impl Tx<'_> {
             operands.extend(extra);
         }
         let result = self.m.emit(opcode, rty, &operands);
+        self.finish_sample(i, resource_op, result, ret)
+    }
+
+    /// The `aoffimmi` texel offsets of `i` as a constant, for an image of
+    /// `dimension`, if any.
+    fn const_offset(&mut self, i: &Instruction, dimension: u32) -> Option<u32> {
+        let offsets = i.texel_offsets().filter(|o| *o != [0; 3])?;
+        let n = match dimension {
+            2 | 7 => 1,
+            5 => 3,
+            3 | 8 => 2,
+            _ => 0,
+        };
+        (n > 0).then(|| {
+            let parts: Vec<u32> = offsets[..n].iter().map(|v| *v as u32).collect();
+            self.m.constant_vector(Scalar::Int, &parts)
+        })
+    }
+
+    /// Depth comparisons (`sample_c`, `sample_c_lz`) and gathers
+    /// (`gather4`, `gather4_c`, and their `_po` forms with an offset
+    /// register).
+    fn compare_or_gather(&mut self, i: &Instruction) -> Result<(), TranslateError> {
+        let po = matches!(i.opcode, o::GATHER4_PO | o::GATHER4_PO_C);
+        let compare = matches!(
+            i.opcode,
+            o::SAMPLE_C | o::SAMPLE_C_LZ | o::GATHER4_C | o::GATHER4_PO_C
+        );
+        if i.opcode == o::SAMPLE_C && self.stage != Stage::Pixel {
+            return unsupported("implicit-lod sampling outside pixel shaders");
+        }
+        // Operands: destination, address, [offset], resource, sampler,
+        // [reference].
+        let (at, sampler_at, reference_at) = if po { (3, 4, 5) } else { (2, 3, 4) };
+        let resource_op = self.operand(i, at)?;
+        let sampler_op = self.operand(i, sampler_at)?;
+        let (var, image_ty, dimension, ret) = {
+            let r = self.resource(resource_op)?;
+            (r.var, r.image_ty, r.dimension, r.ret)
+        };
+        let Some((_, coords, _, false)) = dimension_info(dimension).filter(|d| d.0 != 5) else {
+            return unsupported(format_args!("sampling resource dimension {dimension}"));
+        };
+        let slot = sampler_op.index0().unwrap_or(u32::MAX);
+        let sampler_var = *self
+            .samplers
+            .get(&slot)
+            .ok_or_else(|| TranslateError(format!("sampler s{slot} is not declared")))?;
+        let address = self.src(self.operand(i, 1)?, Scalar::Float)?;
+        let coord = self.first(address, Scalar::Float, coords);
+        let image = self.m.emit(op::LOAD, image_ty, &[var]);
+        let sampler_ty = self.m.sampler();
+        let sampler = self.m.emit(op::LOAD, sampler_ty, &[sampler_var]);
+        let sampled_ty = self.m.sampled_image(image_ty);
+        let sampled = self
+            .m
+            .emit(op::SAMPLED_IMAGE, sampled_ty, &[image, sampler]);
+        let f = self.m.scalar(Scalar::Float);
+        let mut operands = vec![sampled, coord];
+        if compare {
+            let reference = self.src(self.operand(i, reference_at)?, Scalar::Float)?;
+            operands.push(self.m.emit(op::COMPOSITE_EXTRACT, f, &[reference, 0]));
+        } else {
+            // The sampler's swizzle picks the gathered component.
+            let component = swizzle_of(sampler_op.select)[0];
+            operands.push(self.m.constant_u32(component));
+        }
+        let mut mask = 0u32;
+        let mut extra = Vec::new();
+        if i.opcode == o::SAMPLE_C_LZ {
+            mask |= IMAGE_LOD;
+            extra.push(self.m.constant_f32_bits(0));
+        }
+        if po {
+            // Two offset components (Direct3D gathers 2D textures).
+            self.m.capability(CAP_IMAGE_GATHER_EXTENDED);
+            let offset = self.src(self.operand(i, 2)?, Scalar::Int)?;
+            mask |= IMAGE_OFFSET;
+            extra.push(self.first(offset, Scalar::Int, 2));
+        } else if let Some(offset) = self.const_offset(i, dimension) {
+            mask |= IMAGE_CONST_OFFSET;
+            extra.push(offset);
+        }
+        if mask != 0 {
+            operands.push(mask);
+            operands.extend(extra);
+        }
+        let rty = self.vec(ret);
+        let result = match i.opcode {
+            o::SAMPLE_C | o::SAMPLE_C_LZ => {
+                // Image, coordinates, reference, then the image operands;
+                // the comparison result goes to every component.
+                let opcode = if i.opcode == o::SAMPLE_C {
+                    op::IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                } else {
+                    op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+                };
+                let r = self.m.emit(opcode, f, &operands);
+                let f4 = self.f4;
+                let v = self.m.emit(op::COMPOSITE_CONSTRUCT, f4, &[r, r, r, r]);
+                return self.finish_sample(i, resource_op, v, Scalar::Float);
+            }
+            o::GATHER4_C | o::GATHER4_PO_C => self.m.emit(op::IMAGE_DREF_GATHER, rty, &operands),
+            _ => self.m.emit(op::IMAGE_GATHER, rty, &operands),
+        };
+        self.finish_sample(i, resource_op, result, ret)
+    }
+
+    /// Applies the resource swizzle to a sampled `vec4` and stores it.
+    fn finish_sample(
+        &mut self,
+        i: &Instruction,
+        resource_op: &Operand,
+        result: u32,
+        ret: Scalar,
+    ) -> Result<(), TranslateError> {
+        let rty = self.vec(ret);
         let s = swizzle_of(resource_op.select);
         let result = self.m.emit(
             op::VECTOR_SHUFFLE,
@@ -1294,6 +1627,9 @@ impl Tx<'_> {
         let f4 = self.f4;
         let i4 = self.i4;
         let u4 = self.u4;
+        if self.bits(i)? {
+            return Ok(());
+        }
         match i.opcode {
             o::ADD => self.alu(i, F, 2, |t, a| t.m.emit(op::F_ADD, f4, &[a[0], a[1]]))?,
             o::MUL => self.alu(i, F, 2, |t, a| t.m.emit(op::F_MUL, f4, &[a[0], a[1]]))?,
@@ -1445,8 +1781,27 @@ impl Tx<'_> {
                 self.store(self.operand(i, 0)?, r, ty, false)?;
             }
             o::SAMPLE | o::SAMPLE_L | o::SAMPLE_B | o::SAMPLE_D => self.sample(i)?,
+            o::SAMPLE_C
+            | o::SAMPLE_C_LZ
+            | o::GATHER4
+            | o::GATHER4_C
+            | o::GATHER4_PO
+            | o::GATHER4_PO_C => self.compare_or_gather(i)?,
             o::LD => self.load(i)?,
             o::RESINFO => self.resinfo(i)?,
+            o::LD_RAW | o::LD_STRUCTURED => self.load_words(i)?,
+            o::STORE_RAW | o::STORE_STRUCTURED => self.store_words(i)?,
+            o::LD_UAV_TYPED => self.load_typed(i)?,
+            o::STORE_UAV_TYPED => self.store_typed(i)?,
+            o::ATOMIC_AND..=o::IMM_ATOMIC_UMIN => self.atomic(i)?,
+            o::SYNC => self.sync(i)?,
+            o::EMIT
+            | o::CUT
+            | o::EMITTHENCUT
+            | o::EMIT_STREAM
+            | o::CUT_STREAM
+            | o::EMITTHENCUT_STREAM => self.emit_or_cut(i)?,
+            o::BUFINFO => self.bufinfo(i)?,
             o::IF => {
                 let cond = self.condition(i, 0)?;
                 let (then, otherwise, merge) = (self.m.id(), self.m.id(), self.m.id());
@@ -1552,6 +1907,9 @@ impl Tx<'_> {
             }
             o::NOP | o::CUSTOMDATA | o::LABEL => {}
             opcode if (o::DCL_RESOURCE..=o::DCL_GLOBAL_FLAGS).contains(&opcode) => {}
+            opcode
+                if (o::DCL_STREAM..=o::DCL_RESOURCE_STRUCTURED).contains(&opcode)
+                    || opcode == o::DCL_GS_INSTANCE_COUNT => {}
             opcode => return unsupported(format_args!("opcode {opcode}")),
         }
         Ok(())

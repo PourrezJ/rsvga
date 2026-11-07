@@ -135,6 +135,12 @@ pub struct Bindings {
     pub stream_output: u32,
     /// Predicate query and the value that lets draws through.
     pub predication: (u32, u32),
+    /// Unordered-access views of the graphics stages, by `u#` slot.
+    pub ua_views: [u32; dx::MAX_UAVIEWS],
+    /// Where the render targets end among the output slots.
+    pub ua_splice: u32,
+    /// Unordered-access views of the compute stage.
+    pub cs_ua_views: [u32; dx::MAX_UAVIEWS],
 }
 
 impl Default for Bindings {
@@ -166,6 +172,9 @@ impl Default for Bindings {
             so_targets: [no_so; dx::MAX_SOTARGETS],
             stream_output: INVALID_ID,
             predication: (INVALID_ID, 0),
+            ua_views: [INVALID_ID; dx::MAX_UAVIEWS],
+            ua_splice: 0,
+            cs_ua_views: [INVALID_ID; dx::MAX_UAVIEWS],
         }
     }
 }
@@ -191,6 +200,8 @@ pub struct Context {
     code: HashMap<u32, Arc<[u8]>>,
     /// Their translations (or why there is none).
     spirv: HashMap<u32, Result<Arc<svga_shader::Shader>, String>>,
+    /// MOB and byte offset of its shaders' class-linkage data.
+    pub iface: Option<(u32, u32)>,
 }
 
 impl Context {
@@ -449,7 +460,8 @@ impl DxContexts {
             | C::DefineSamplerState { .. }
             | C::DefineStreamOutput { .. }
             | C::DefineQuery { .. }
-            | C::DefineShader { .. }) => {
+            | C::DefineShader { .. }
+            | C::DefineUaView { .. }) => {
                 let current = cid()?;
                 let Some((id, object)) = Object::defined_by(&command) else {
                     return Err("not a definition".into());
@@ -485,6 +497,7 @@ impl DxContexts {
             C::DestroySamplerState { id } => self.destroy(cid()?, dx::cotable::SAMPLER, id)?,
             C::DestroyStreamOutput { id } => self.destroy(cid()?, dx::cotable::STREAMOUTPUT, id)?,
             C::DestroyQuery { id } => self.destroy(cid()?, dx::cotable::DXQUERY, id)?,
+            C::DestroyUaView { id } => self.destroy(cid()?, dx::cotable::UAVIEW, id)?,
             C::DestroyShader { id } => {
                 let current = cid()?;
                 self.drop_code(current, id);
@@ -548,6 +561,29 @@ impl DxContexts {
                 let range = slots("constant buffer", slot, 1, dx::MAX_CONSTBUFFERS)?;
                 b.stages[stage_index(stage)].constant_buffers[range.start] =
                     ConstantBuffer { sid, offset, size };
+            }
+            C::SetUaViews { splice, views } => {
+                // The views follow the render targets: the first is u#splice.
+                let b = self.bindings(cid()?)?;
+                b.ua_views = [INVALID_ID; dx::MAX_UAVIEWS];
+                for (slot, id) in (splice as usize..).zip(views) {
+                    match b.ua_views.get_mut(slot) {
+                        Some(s) => *s = id,
+                        None if id == INVALID_ID => {}
+                        None => {
+                            return Err(format!("UA view slot {slot} beyond {}", dx::MAX_UAVIEWS));
+                        }
+                    }
+                }
+                b.ua_splice = splice;
+            }
+            C::SetCsUaViews { start, views } => {
+                let b = self.bindings(cid()?)?;
+                let range = slots("compute UA views", start, views.len(), dx::MAX_UAVIEWS)?;
+                b.cs_ua_views[range].copy_from_slice(&views);
+            }
+            C::BindShaderIface { cid, mob, offset } => {
+                self.context_mut(cid)?.iface = (mob != INVALID_ID).then_some((mob, offset));
             }
             C::SetConstantBufferOffset {
                 stage,
@@ -722,7 +758,13 @@ impl DxContexts {
             | C::GenMips { .. }
             | C::BufferCopy { .. }
             | C::TransferFromBuffer { .. }
-            | C::SurfaceCopyAndReadback { .. } => {
+            | C::SurfaceCopyAndReadback { .. }
+            | C::Staging { .. }
+            | C::Dispatch { .. }
+            | C::DispatchIndirect { .. }
+            | C::DrawIndirect { .. }
+            | C::ClearUaViewUint { .. }
+            | C::ClearUaViewFloat { .. } => {
                 cid()?;
                 return Ok(Outcome::Deferred);
             }

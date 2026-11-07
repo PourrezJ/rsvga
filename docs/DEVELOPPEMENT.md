@@ -20,7 +20,7 @@ Ce qui sert à travailler sur rsvga : tests, fuzzing, lancement à la main, outi
 cargo test --workspace
 ```
 
-186 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout. Sans GPU Vulkan, les tests du moteur se sautent eux-mêmes.
+189 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout. Sans GPU Vulkan, les tests du moteur se sautent eux-mêmes.
 
 Fuzzing avec libFuzzer, sur la toolchain stable (ni cargo-fuzz ni nightly). Cibles : `fifo`, `decode`, `dx`, `shader`, `nine`.
 

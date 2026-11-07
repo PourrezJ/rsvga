@@ -246,11 +246,10 @@ pub fn vk_bytes(format: vk::Format) -> Option<u32> {
     })
 }
 
-/// How a clear color reaches the image: Direct3D always gives floats, which
-/// integer formats take as integers.
-pub fn clear_value(format: vk::Format, color: [f32; 4]) -> vk::ClearColorValue {
+/// Unsigned integer formats.
+fn unsigned(format: vk::Format) -> bool {
     use vk::Format as V;
-    let as_uint = matches!(
+    matches!(
         format,
         V::R8_UINT
             | V::R8G8_UINT
@@ -263,8 +262,13 @@ pub fn clear_value(format: vk::Format, color: [f32; 4]) -> vk::ClearColorValue {
             | V::R32G32B32_UINT
             | V::R32G32B32A32_UINT
             | V::A2B10G10R10_UINT_PACK32
-    );
-    let as_sint = matches!(
+    )
+}
+
+/// Signed integer formats.
+fn signed(format: vk::Format) -> bool {
+    use vk::Format as V;
+    matches!(
         format,
         V::R8_SINT
             | V::R8G8_SINT
@@ -276,15 +280,25 @@ pub fn clear_value(format: vk::Format, color: [f32; 4]) -> vk::ClearColorValue {
             | V::R32G32_SINT
             | V::R32G32B32_SINT
             | V::R32G32B32A32_SINT
-    );
+    )
+}
+
+/// Whether `format` holds integers (not normalized, not floats).
+pub fn is_integer(format: vk::Format) -> bool {
+    unsigned(format) || signed(format)
+}
+
+/// How a clear color reaches the image: Direct3D always gives floats, which
+/// integer formats take as integers.
+pub fn clear_value(format: vk::Format, color: [f32; 4]) -> vk::ClearColorValue {
     // Saturating float-to-integer conversions, as Direct3D does: `as`
     // saturates and truncates toward zero, which is the intent.
     #[allow(clippy::cast_possible_truncation)]
-    if as_uint {
+    if unsigned(format) {
         vk::ClearColorValue {
             uint32: color.map(|c| c as u32),
         }
-    } else if as_sint {
+    } else if signed(format) {
         vk::ClearColorValue {
             int32: color.map(|c| c as i32),
         }

@@ -63,6 +63,8 @@ struct Surface {
     mob_pitch: u64,
     /// The device copy; `None` until first needed.
     host: Option<Vec<u8>>,
+    /// Bytes per element of a structured buffer (0: not one).
+    buffer_stride: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -280,6 +282,12 @@ impl Gb {
         })
     }
 
+    /// Bytes per element of structured buffer `sid` (0: not one, or
+    /// unknown).
+    pub(crate) fn buffer_stride(&self, sid: u32) -> u32 {
+        self.surfaces.get(&sid).map_or(0, |s| s.buffer_stride)
+    }
+
     /// Layout and `SVGA3D_SURFACE_*` flags of surface `sid`.
     pub(crate) fn surface_shape(&self, sid: u32) -> Option<(SurfaceLayout, u64)> {
         self.surfaces.get(&sid).map(|s| (s.layout.clone(), s.flags))
@@ -427,6 +435,7 @@ impl Gb {
                 mob: None,
                 mob_pitch: 0,
                 host: None,
+                buffer_stride: def.buffer_stride,
             },
         );
         Ok(())
@@ -1123,6 +1132,7 @@ mod tests {
                 depth: 1,
             },
             array_size: 0,
+            buffer_stride: 0,
         })
     }
 
@@ -1287,6 +1297,7 @@ mod tests {
                     depth: 1,
                 },
                 array_size: 0,
+                buffer_stride: 0,
             }),
             guest,
         )

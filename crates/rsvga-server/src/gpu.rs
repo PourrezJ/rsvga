@@ -180,6 +180,42 @@ pub fn runs_on_gpu(command: &DxCommand) -> bool {
             | DxCommand::BufferCopy { .. }
             | DxCommand::TransferFromBuffer { .. }
             | DxCommand::SurfaceCopyAndReadback { .. }
+            | DxCommand::Staging { .. }
+            | DxCommand::Dispatch { .. }
+            | DxCommand::DispatchIndirect { .. }
+            | DxCommand::DrawIndirect { .. }
+            | DxCommand::ClearUaViewUint { .. }
+            | DxCommand::ClearUaViewFloat { .. }
+    )
+}
+
+/// The surface a staging copy writes, and its subresource when only one
+/// is written.
+fn staging_dest(copy: &DxCommand) -> Result<(u32, Option<u32>), String> {
+    match *copy {
+        DxCommand::PredCopyRegion { dest, dest_sub, .. }
+        | DxCommand::PredConvertRegion { dest, dest_sub, .. } => Ok((dest, Some(dest_sub))),
+        DxCommand::PredCopy { dest, .. }
+        | DxCommand::PredConvert { dest, .. }
+        | DxCommand::BufferCopy { dest, .. } => Ok((dest, None)),
+        _ => Err(format!("{copy:?} is not a staging copy")),
+    }
+}
+
+/// The bytes a raw or structured buffer view covers: `first` and `count`
+/// count words for raw views (typeless 32-bit formats), else elements of
+/// the buffer's structure stride (unknown: from the start, to the end).
+fn word_range(gb: &Gb, sid: u32, format: u32, first: u32, count: u32) -> (u64, u64) {
+    let stride = match gb.buffer_stride(sid) {
+        0 => svga_proto::format::desc(format).map_or(0, |d| d.bytes_per_block),
+        s => s,
+    };
+    if stride == 0 {
+        return (0, u64::MAX);
+    }
+    (
+        u64::from(first).saturating_mul(u64::from(stride)),
+        u64::from(count).saturating_mul(u64::from(stride)),
     )
 }
 
@@ -570,7 +606,17 @@ impl Gpu {
             DxCommand::Draw { .. }
             | DxCommand::DrawIndexed { .. }
             | DxCommand::DrawInstanced { .. }
-            | DxCommand::DrawIndexedInstanced { .. } => self.draw(command, context, gb, guest)?,
+            | DxCommand::DrawIndexedInstanced { .. }
+            | DxCommand::DrawIndirect { .. } => self.draw(command, context, gb, guest)?,
+            DxCommand::Dispatch { .. } | DxCommand::DispatchIndirect { .. } => {
+                self.dispatch(command, context, gb, guest)?;
+            }
+            DxCommand::ClearUaViewUint { view, value } => {
+                self.clear_ua_view(context, view, Err(value), gb, guest)?;
+            }
+            DxCommand::ClearUaViewFloat { view, value } => {
+                self.clear_ua_view(context, view, Ok(value), gb, guest)?;
+            }
             DxCommand::ResolveCopy {
                 dest,
                 dest_sub,
@@ -712,6 +758,20 @@ impl Gpu {
                 self.sync_host(gb, guest, dest)?;
                 gb.execute(GbCommand::ReadbackSurface { sid: dest }, guest)?;
             }
+            DxCommand::Staging { ref copy, readback } => {
+                let (sid, sub) = staging_dest(copy)?;
+                self.execute_dx(copy, context, gb, guest)?;
+                if readback {
+                    self.sync_host(gb, guest, sid)?;
+                    let command = match sub {
+                        Some(sub) => GbCommand::ReadbackImage {
+                            image: gb.subresource(sid, sub)?,
+                        },
+                        None => GbCommand::ReadbackSurface { sid },
+                    };
+                    gb.execute(command, guest)?;
+                }
+            }
             DxCommand::BufferCopy {
                 dest,
                 src,
@@ -811,7 +871,7 @@ impl Gpu {
         gb: &mut Gb,
         guest: &GuestMemory,
     ) -> Result<(), String> {
-        use svga_render::{Bound, Call, Draw, Resource, Target, VertexAttribute, VertexBuffer};
+        use svga_render::{Call, Draw, Target, VertexAttribute, VertexBuffer};
         let b = &context.bindings;
         let call = match *command {
             DxCommand::Draw {
@@ -858,10 +918,22 @@ impl Gpu {
                 base_vertex,
                 first_instance: start_instance,
             },
+            DxCommand::DrawIndirect {
+                indexed,
+                sid,
+                offset,
+            } => {
+                self.sync_gpu(gb, guest, sid)?;
+                Call::Indirect {
+                    sid,
+                    offset: u64::from(offset),
+                    indexed,
+                }
+            }
             _ => return Err("not a draw".into()),
         };
         // What is not drawn yet.
-        for (stage, name) in [(2, "geometry"), (3, "hull"), (4, "domain")] {
+        for (stage, name) in [(3, "hull"), (4, "domain")] {
             if b.stages[stage].shader != INVALID_ID {
                 return Err(format!("{name} shaders are not supported yet"));
             }
@@ -929,6 +1001,10 @@ impl Gpu {
         let ps = match b.stages[1].shader {
             INVALID_ID => None,
             id => Some(self.shader(context, id, &ps_options)?),
+        };
+        let gs = match b.stages[2].shader {
+            INVALID_ID => None,
+            id => Some(self.shader(context, id, &Options::default())?),
         };
         // Vertex attributes the shader reads, and their buffer slots.
         let mut attributes: Vec<VertexAttribute> = Vec::new();
@@ -1004,7 +1080,7 @@ impl Gpu {
             });
         }
         let index = match call {
-            Call::Indexed { .. } => {
+            Call::Indexed { .. } | Call::Indirect { indexed: true, .. } => {
                 let (sid, format, offset, _) = b.index_buffer;
                 if sid == INVALID_ID {
                     return Ok(());
@@ -1012,41 +1088,114 @@ impl Gpu {
                 self.sync_gpu(gb, guest, sid)?;
                 Some((sid, format, u64::from(offset)))
             }
-            Call::Draw { .. } => None,
+            Call::Draw { .. } | Call::Indirect { indexed: false, .. } => None,
         };
-        // Descriptors the shaders use.
+        // Descriptors the shaders use; UA views they may write.
+        let mut written = Vec::new();
+        let mut resources = self.stage_bindings(context, &vs, 0, gb, guest, &mut written)?;
+        for (shader, stage) in [(&ps, 1), (&gs, 2)] {
+            if let Some(shader) = shader {
+                resources.extend(self.stage_bindings(
+                    context,
+                    shader,
+                    stage,
+                    gb,
+                    guest,
+                    &mut written,
+                )?);
+            }
+        }
+        for sid in targets.iter().flatten().chain(depth.iter()).map(|t| t.sid) {
+            self.sync_gpu(gb, guest, sid)?;
+        }
+        let rasterizer = match context.object(dx::cotable::RASTERIZERSTATE, b.rasterizer) {
+            Some(Object::RasterizerState(r)) => *r,
+            _ => svga_render::default_rasterizer(),
+        };
+        let depth_stencil = match context.object(dx::cotable::DEPTHSTENCIL, b.depth_stencil.0) {
+            Some(Object::DepthStencilState(d)) => *d,
+            _ => svga_render::default_depth_stencil(),
+        };
+        let blend = match context.object(dx::cotable::BLENDSTATE, b.blend.0) {
+            Some(Object::BlendState(s)) => *s,
+            _ => svga_render::default_blend(),
+        };
+        let draw = Draw {
+            vs: &vs,
+            ps: ps.as_deref(),
+            gs: gs.as_deref(),
+            attributes,
+            buffers,
+            index,
+            topology: b.topology,
+            rasterizer,
+            depth_stencil: (depth_stencil, b.depth_stencil.1),
+            blend: (blend, b.blend.1, b.blend.2),
+            targets,
+            depth,
+            viewports: b.viewports.clone(),
+            scissors: b.scissors.clone(),
+            resources,
+            data: Vec::new(),
+            occlusion: None,
+            call,
+        };
+        self.renderer.draw(&draw).map_err(|e| e.to_string())?;
+        for sid in targets.iter().flatten().chain(depth.iter()).map(|t| t.sid) {
+            self.gpu_wrote(sid);
+        }
+        for sid in written {
+            self.gpu_wrote(sid);
+        }
+        Ok(())
+    }
+
+    /// The descriptors of `shader`, bound at `stage` (`SVGA3dShaderType`
+    /// minus one) of `context`, their surfaces brought to the GPU; the
+    /// surfaces of its UA views go to `written`.
+    fn stage_bindings(
+        &mut self,
+        context: &Context,
+        shader: &Shader,
+        stage: usize,
+        gb: &mut Gb,
+        guest: &GuestMemory,
+        written: &mut Vec<u32>,
+    ) -> Result<Vec<svga_render::Bound>, String> {
+        use svga_core::dx::UaRange;
+        use svga_render::{Bound, Resource};
+        let b = &context.bindings;
+        let sb = &b.stages[stage];
         let mut resources = Vec::new();
-        for (shader, stage) in [(Some(&vs), 0usize), (ps.as_ref(), 1)] {
-            let Some(shader) = shader else { continue };
-            let sb = &b.stages[stage];
-            for binding in &shader.bindings {
-                let resource = match binding.kind {
-                    BindingKind::ConstantBuffer { slot, .. } => {
-                        match sb.constant_buffers.get(slot as usize) {
-                            Some(cb) if cb.sid != INVALID_ID => {
-                                self.sync_gpu(gb, guest, cb.sid)?;
-                                Resource::Buffer {
-                                    sid: cb.sid,
-                                    offset: u64::from(cb.offset),
-                                    size: if cb.size == 0 {
-                                        u64::MAX
-                                    } else {
-                                        u64::from(cb.size)
-                                    },
-                                }
+        for binding in &shader.bindings {
+            let resource = match binding.kind {
+                BindingKind::ConstantBuffer { slot, .. } => {
+                    match sb.constant_buffers.get(slot as usize) {
+                        Some(cb) if cb.sid != INVALID_ID => {
+                            self.sync_gpu(gb, guest, cb.sid)?;
+                            Resource::Buffer {
+                                sid: cb.sid,
+                                offset: u64::from(cb.offset),
+                                size: if cb.size == 0 {
+                                    u64::MAX
+                                } else {
+                                    u64::from(cb.size)
+                                },
                             }
-                            _ => Resource::None,
                         }
-                    }
-                    BindingKind::Sampler { slot } => match sb
-                        .samplers
-                        .get(slot as usize)
-                        .and_then(|&id| context.object(dx::cotable::SAMPLER, id))
-                    {
-                        Some(Object::Sampler(state)) => Resource::Sampler(*state),
                         _ => Resource::None,
-                    },
-                    BindingKind::Resource { slot, .. } => match sb
+                    }
+                }
+                BindingKind::Sampler { slot } => match sb
+                    .samplers
+                    .get(slot as usize)
+                    .and_then(|&id| context.object(dx::cotable::SAMPLER, id))
+                {
+                    Some(Object::Sampler(state)) => Resource::Sampler(*state),
+                    _ => Resource::None,
+                },
+                BindingKind::Resource { slot, .. } | BindingKind::BufferResource { slot } => {
+                    match sb
                         .resources
                         .get(slot as usize)
                         .and_then(|&id| context.object(dx::cotable::SRVIEW, id))
@@ -1070,7 +1219,9 @@ impl Gpu {
                                 layers: *slices,
                             }
                         }
-                        Some(Object::ShaderResourceView(t, SrvRange::Buffer { first, count })) => {
+                        Some(Object::ShaderResourceView(t, SrvRange::Buffer { first, count }))
+                            if matches!(binding.kind, BindingKind::Resource { .. }) =>
+                        {
                             self.sync_gpu(gb, guest, t.sid)?;
                             let element = svga_proto::format::desc(t.format)
                                 .map_or(0, |d| u64::from(d.bytes_per_block));
@@ -1081,59 +1232,196 @@ impl Gpu {
                                 size: u64::from(*count).saturating_mul(element),
                             }
                         }
+                        Some(Object::ShaderResourceView(
+                            t,
+                            SrvRange::Buffer { first, count }
+                            | SrvRange::BufferEx { first, count, .. },
+                        )) => {
+                            self.sync_gpu(gb, guest, t.sid)?;
+                            let (offset, size) = word_range(gb, t.sid, t.format, *first, *count);
+                            Resource::StorageBuffer {
+                                sid: t.sid,
+                                offset,
+                                size,
+                            }
+                        }
                         Some(_) => {
-                            return Err(
-                                "raw and structured buffer views are not supported yet".into()
-                            );
+                            return Err(format!("shader resource t{slot}: wrong kind of view"));
                         }
                         None => Resource::None,
-                    },
-                };
-                resources.push(Bound {
-                    binding: binding.binding,
-                    resource,
-                });
+                    }
+                }
+                BindingKind::UaView { slot, dimension } => {
+                    let views = if stage == 5 {
+                        &b.cs_ua_views
+                    } else {
+                        &b.ua_views
+                    };
+                    match views
+                        .get(slot as usize)
+                        .and_then(|&id| context.object(dx::cotable::UAVIEW, id))
+                    {
+                        Some(Object::UaView(v)) => {
+                            let sid = v.target.sid;
+                            self.sync_gpu(gb, guest, sid)?;
+                            written.push(sid);
+                            match (v.range, dimension) {
+                                (UaRange::Buffer { first, count, .. }, 0) => {
+                                    let (offset, size) =
+                                        word_range(gb, sid, v.target.format, first, count);
+                                    Resource::StorageBuffer { sid, offset, size }
+                                }
+                                (UaRange::Buffer { first, count, .. }, _) => {
+                                    let element = svga_proto::format::desc(v.target.format)
+                                        .map_or(0, |d| u64::from(d.bytes_per_block));
+                                    Resource::TexelBuffer {
+                                        sid,
+                                        format: v.target.format,
+                                        offset: u64::from(first).saturating_mul(element),
+                                        size: u64::from(count).saturating_mul(element),
+                                    }
+                                }
+                                (
+                                    UaRange::Texture {
+                                        mip,
+                                        first_slice,
+                                        slices,
+                                    },
+                                    _,
+                                ) => Resource::StorageImage {
+                                    sid,
+                                    format: v.target.format,
+                                    mip,
+                                    first_layer: first_slice,
+                                    layers: slices,
+                                },
+                                (UaRange::Texture3d { mip, .. }, _) => Resource::StorageImage {
+                                    sid,
+                                    format: v.target.format,
+                                    mip,
+                                    first_layer: 0,
+                                    layers: 1,
+                                },
+                            }
+                        }
+                        _ => Resource::None,
+                    }
+                }
+            };
+            resources.push(Bound {
+                binding: binding.binding,
+                resource,
+            });
+        }
+        Ok(resources)
+    }
+
+    /// Runs the bound compute shader (`Dispatch`, `DispatchIndirect`).
+    fn dispatch(
+        &mut self,
+        command: &DxCommand,
+        context: &Context,
+        gb: &mut Gb,
+        guest: &GuestMemory,
+    ) -> Result<(), String> {
+        use svga_render::{Dispatch, Groups};
+        let groups = match *command {
+            DxCommand::Dispatch { groups } => {
+                if groups.contains(&0) {
+                    return Ok(());
+                }
+                Groups::Count(groups)
             }
+            DxCommand::DispatchIndirect { sid, offset } => {
+                self.sync_gpu(gb, guest, sid)?;
+                Groups::Indirect {
+                    sid,
+                    offset: u64::from(offset),
+                }
+            }
+            _ => return Err("not a dispatch".into()),
+        };
+        let id = context.bindings.stages[5].shader;
+        if id == INVALID_ID {
+            return Err("dispatch without a compute shader".into());
         }
-        for sid in targets.iter().flatten().chain(depth.iter()).map(|t| t.sid) {
-            self.sync_gpu(gb, guest, sid)?;
-        }
-        let rasterizer = match context.object(dx::cotable::RASTERIZERSTATE, b.rasterizer) {
-            Some(Object::RasterizerState(r)) => *r,
-            _ => svga_render::default_rasterizer(),
-        };
-        let depth_stencil = match context.object(dx::cotable::DEPTHSTENCIL, b.depth_stencil.0) {
-            Some(Object::DepthStencilState(d)) => *d,
-            _ => svga_render::default_depth_stencil(),
-        };
-        let blend = match context.object(dx::cotable::BLENDSTATE, b.blend.0) {
-            Some(Object::BlendState(s)) => *s,
-            _ => svga_render::default_blend(),
-        };
-        let draw = Draw {
-            vs: &vs,
-            ps: ps.as_deref(),
-            attributes,
-            buffers,
-            index,
-            topology: b.topology,
-            rasterizer,
-            depth_stencil: (depth_stencil, b.depth_stencil.1),
-            blend: (blend, b.blend.1, b.blend.2),
-            targets,
-            depth,
-            viewports: b.viewports.clone(),
-            scissors: b.scissors.clone(),
+        let cs = self.shader(context, id, &Options::default())?;
+        let mut written = Vec::new();
+        let resources = self.stage_bindings(context, &cs, 5, gb, guest, &mut written)?;
+        let dispatch = Dispatch {
+            cs: &cs,
             resources,
             data: Vec::new(),
-            occlusion: None,
-            call,
+            groups,
         };
-        self.renderer.draw(&draw).map_err(|e| e.to_string())?;
-        for sid in targets.iter().flatten().chain(depth.iter()).map(|t| t.sid) {
+        self.renderer.dispatch(&dispatch).map_err(gpu_err)?;
+        for sid in written {
             self.gpu_wrote(sid);
         }
         Ok(())
+    }
+
+    /// `ClearUnorderedAccessViewFloat` (`Ok`) and `...Uint` (`Err`).
+    fn clear_ua_view(
+        &mut self,
+        context: &Context,
+        view: u32,
+        value: Result<[f32; 4], [u32; 4]>,
+        gb: &mut Gb,
+        guest: &GuestMemory,
+    ) -> Result<(), String> {
+        use svga_core::dx::UaRange;
+        let Some(Object::UaView(v)) = context.object(dx::cotable::UAVIEW, view) else {
+            return Err(format!("UA view {view} is not defined"));
+        };
+        let sid = v.target.sid;
+        self.sync_gpu(gb, guest, sid)?;
+        match v.range {
+            UaRange::Buffer { first, count, .. } => {
+                // Whole words: raw and structured views, and 32-bit typed
+                // ones (others are left as they are).
+                let element =
+                    svga_proto::format::desc(v.target.format).map_or(0, |d| d.bytes_per_block);
+                if element != 0 && element != 4 {
+                    crate::log!(
+                        "GPU: clearing a typed buffer view of format {}: not yet",
+                        v.target.format
+                    );
+                    return Ok(());
+                }
+                let word = match value {
+                    Ok(f) => f[0].to_bits(),
+                    Err(u) => u[0],
+                };
+                let (offset, size) = word_range(gb, sid, v.target.format, first, count);
+                self.renderer
+                    .fill_buffer(sid, offset, size, word)
+                    .map_err(gpu_err)?;
+            }
+            UaRange::Texture {
+                mip,
+                first_slice,
+                slices,
+            } => self.clear_ua_image(sid, mip, first_slice, slices, value)?,
+            UaRange::Texture3d { mip, .. } => self.clear_ua_image(sid, mip, 0, 1, value)?,
+        }
+        self.gpu_wrote(sid);
+        Ok(())
+    }
+
+    fn clear_ua_image(
+        &mut self,
+        sid: u32,
+        mip: u32,
+        first: u32,
+        count: u32,
+        value: Result<[f32; 4], [u32; 4]>,
+    ) -> Result<(), String> {
+        match value {
+            Ok(color) => self.renderer.clear_color(sid, mip, first, count, color),
+            Err(bits) => self.renderer.clear_uint(sid, mip, first, count, bits),
+        }
+        .map_err(gpu_err)
     }
 
     /// Whether surface `sid` stays in its device copy: its format has no
@@ -1338,6 +1626,7 @@ mod tests {
                     depth: 1,
                 },
                 array_size: 0,
+                buffer_stride: 0,
             })
         };
         run_gb(&mut gpu, &mut gb, surface(10));
@@ -1402,6 +1691,23 @@ mod tests {
             pixels.chunks(4).all(|p| p == [0, 0, 0xff, 0xff]),
             "red in B, G, R, A order on {}: {pixels:?}",
             gpu.name()
+        );
+        // The Direct3D 11 driver's staging copy: copy, then read back by
+        // the device itself.
+        let green = DxCommand::ClearRenderTargetView {
+            view: 0,
+            color: [0.0, 1.0, 0.0, 1.0],
+        };
+        gpu.execute_dx(&green, context, &mut gb, &guest).unwrap();
+        let staging = DxCommand::Staging {
+            copy: Box::new(DxCommand::PredCopy { dest: 11, src: 10 }),
+            readback: true,
+        };
+        gpu.execute_dx(&staging, context, &mut gb, &guest).unwrap();
+        assert!(ram.read(4096, &mut pixels));
+        assert!(
+            pixels.chunks(4).all(|p| p == [0, 0xff, 0, 0xff]),
+            "green after a staging copy: {pixels:?}"
         );
         // Destroying a surface frees its GPU copy.
         run_gb(&mut gpu, &mut gb, GbCommand::DestroySurface { sid: 10 });
@@ -1516,6 +1822,7 @@ mod draw_tests {
                     depth: 1,
                 },
                 array_size: 0,
+                buffer_stride: 0,
             }));
             self.gb(GbCommand::BindSurface { sid, mob, pitch: 0 });
         }

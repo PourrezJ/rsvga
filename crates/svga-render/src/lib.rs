@@ -25,9 +25,11 @@
 //! `RSVGA_GPU` names another (part of its name, e.g. `6400` or
 //! `llvmpipe`).
 
+mod compute;
 mod draw;
 pub mod format;
 
+pub use compute::{Dispatch, Groups};
 pub use draw::{
     Bound, Call, Draw, Resource, Target, VertexAttribute, VertexBuffer, default_blend,
     default_depth_stencil, default_rasterizer,
@@ -90,6 +92,8 @@ enum Storage {
         /// not multisampled).
         copyable: bool,
         three_d: bool,
+        /// Usages it was made with (views may have to drop `STORAGE`).
+        usage: vk::ImageUsageFlags,
     },
 }
 
@@ -401,6 +405,14 @@ impl Renderer {
             image_cube_array: have.image_cube_array,
             shader_clip_distance: have.shader_clip_distance,
             occlusion_query_precise: have.occlusion_query_precise,
+            // Shader model 5: UA views in every stage, typed views of any
+            // format, gathers with offsets.
+            vertex_pipeline_stores_and_atomics: have.vertex_pipeline_stores_and_atomics,
+            fragment_stores_and_atomics: have.fragment_stores_and_atomics,
+            shader_storage_image_read_without_format: have.shader_storage_image_read_without_format,
+            shader_storage_image_write_without_format: have
+                .shader_storage_image_write_without_format,
+            shader_image_gather_extended: have.shader_image_gather_extended,
             ..Default::default()
         };
         let features = Features {
@@ -1267,6 +1279,15 @@ impl Renderer {
         if !depth {
             create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
         }
+        // Unordered-access views: storage images, in the view's format
+        // (sRGB formats are not storable themselves, their UNORM twins
+        // are: the usage then only needs to suit some view format).
+        if flags & surface_flag::BIND_UAVIEW != 0 && !depth {
+            usage |= U::STORAGE;
+            if !features.contains(F::STORAGE_IMAGE) {
+                create_flags |= vk::ImageCreateFlags::EXTENDED_USAGE;
+            }
+        }
         let layers = if three_d { 1 } else { layout.layers() };
         if flags & surface_flag::CUBEMAP != 0
             && image_type == vk::ImageType::TYPE_2D
@@ -1352,6 +1373,7 @@ impl Renderer {
                 && (kind == Kind::Color(format)
                     || matches!(format, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT)),
             three_d,
+            usage,
         })
     }
 
@@ -1635,6 +1657,112 @@ impl Renderer {
             );
         }
         Ok(())
+    }
+
+    /// [`Self::clear_color`] with `color`, or with integer `bits` when
+    /// `color` is `None`.
+    fn clear_image_value(
+        &mut self,
+        sid: u32,
+        mip: u32,
+        first_layer: u32,
+        layers: u32,
+        color: Option<[f32; 4]>,
+        bits: [u32; 4],
+    ) -> Result<(), Error> {
+        if let Some(color) = color {
+            return self.clear_color(sid, mip, first_layer, layers, color);
+        }
+        let (image, _, aspect, three_d) = self.image(sid)?;
+        let layout = &self.surface(sid)?.layout;
+        let all_layers = if three_d { 1 } else { layout.layers() };
+        let (first_layer, layers) = if three_d {
+            (0, 1)
+        } else {
+            (
+                first_layer,
+                layers.min(all_layers.saturating_sub(first_layer)),
+            )
+        };
+        if mip >= layout.mip_levels() || layers == 0 || aspect != vk::ImageAspectFlags::COLOR {
+            return err(format!(
+                "surface {sid}: no color mip {mip} layers {first_layer}+{layers}"
+            ));
+        }
+        let cmd = self.barrier()?;
+        // SAFETY: recording; the range lies within the live image.
+        unsafe {
+            self.device.cmd_clear_color_image(
+                cmd,
+                image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { uint32: bits },
+                &[range(aspect, mip, 1, first_layer, layers)],
+            );
+        }
+        Ok(())
+    }
+
+    /// Fills `size` bytes of buffer surface `sid` from `offset` with
+    /// `word` (both rounded down to whole words; `u64::MAX`: to the end).
+    pub fn fill_buffer(
+        &mut self,
+        sid: u32,
+        offset: u64,
+        size: u64,
+        word: u32,
+    ) -> Result<(), Error> {
+        let (buffer, total) = self.buffer(sid)?;
+        let offset = offset & !3;
+        if offset >= total {
+            return Ok(());
+        }
+        let size = size.min(total.saturating_sub(offset)) & !3;
+        if size == 0 {
+            return Ok(());
+        }
+        let cmd = self.barrier()?;
+        // SAFETY: recording outside any rendering; the range lies within
+        // the live buffer, in whole words.
+        unsafe { self.device.cmd_fill_buffer(cmd, buffer, offset, size, word) };
+        Ok(())
+    }
+
+    /// Clears one mip of layers of a color image with integers, as
+    /// `ClearUnorderedAccessViewUint` does: integer formats take them as
+    /// they are, 32-bit float formats as bits, normalized ones their low
+    /// bits as a fraction of the channel's range.
+    pub fn clear_uint(
+        &mut self,
+        sid: u32,
+        mip: u32,
+        first_layer: u32,
+        layers: u32,
+        value: [u32; 4],
+    ) -> Result<(), Error> {
+        let (_, format, _, _) = self.image(sid)?;
+        let color = if format::is_integer(format) {
+            None
+        } else {
+            let channel = match format {
+                vk::Format::R8_UNORM
+                | vk::Format::R8G8_UNORM
+                | vk::Format::R8G8B8A8_UNORM
+                | vk::Format::B8G8R8A8_UNORM => Some(0xffu16),
+                vk::Format::R16_UNORM
+                | vk::Format::R16G16_UNORM
+                | vk::Format::R16G16B16A16_UNORM => Some(0xffff),
+                _ => None,
+            };
+            Some(match channel {
+                Some(max) => value.map(|v| {
+                    let low = u16::try_from(v & u32::from(max)).unwrap_or(max);
+                    f32::from(low) / f32::from(max)
+                }),
+                None => value.map(f32::from_bits),
+            })
+        };
+        self.clear_image_value(sid, mip, first_layer, layers, color, value)
     }
 
     /// Copies a box of `extent` texels between two images (3D images: z is

@@ -97,6 +97,30 @@ pub enum Resource {
         /// Bytes.
         size: u64,
     },
+    /// A buffer range read or written as words (raw and structured
+    /// views: storage buffer).
+    StorageBuffer {
+        /// Buffer surface.
+        sid: u32,
+        /// Byte offset.
+        offset: u64,
+        /// Bytes.
+        size: u64,
+    },
+    /// An unordered-access view of a texture: one mip of layers (storage
+    /// image).
+    StorageImage {
+        /// Surface.
+        sid: u32,
+        /// View format.
+        format: u32,
+        /// Mip level.
+        mip: u32,
+        /// First layer.
+        first_layer: u32,
+        /// Layers.
+        layers: u32,
+    },
     /// A shader resource view of a texture.
     Texture {
         /// Surface.
@@ -150,6 +174,17 @@ pub enum Call {
         /// First instance.
         first_instance: u32,
     },
+    /// Arguments read from a buffer surface at a byte offset: those of
+    /// `Draw`, or of `Indexed` if `indexed` (Direct3D's indirect argument
+    /// layouts are Vulkan's).
+    Indirect {
+        /// Buffer surface.
+        sid: u32,
+        /// Byte offset.
+        offset: u64,
+        /// Indexed draw.
+        indexed: bool,
+    },
 }
 
 /// The attachments of an open rendering: a draw with the same ones (that
@@ -171,6 +206,8 @@ pub struct Draw<'a> {
     pub vs: &'a Shader,
     /// Pixel shader (`None`: depth only).
     pub ps: Option<&'a Shader>,
+    /// Geometry shader.
+    pub gs: Option<&'a Shader>,
     /// Input layout.
     pub attributes: Vec<VertexAttribute>,
     /// Vertex buffers of the slots the attributes use.
@@ -213,7 +250,9 @@ type LayoutBinding = (u32, i32, u32);
 pub(crate) struct Caches {
     modules: HashMap<u64, vk::ShaderModule>,
     layouts: HashMap<Vec<LayoutBinding>, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
-    pipelines: HashMap<Vec<u8>, vk::Pipeline>,
+    /// Graphics pipelines by their whole state; compute ones by
+    /// [`crate::compute`]'s shorter key.
+    pub(crate) pipelines: HashMap<Vec<u8>, vk::Pipeline>,
     samplers: HashMap<Vec<u8>, vk::Sampler>,
     /// Null resources: a zeroed buffer, zeroed images and their views.
     null: Option<Null>,
@@ -223,10 +262,16 @@ pub(crate) struct Null {
     buffer: vk::Buffer,
     /// A view of `buffer` (`R32G32B32A32_SFLOAT`).
     texel_buffer: vk::BufferView,
+    /// Where writes to unbound UA views go (never read as zeros).
+    sink: vk::Buffer,
+    /// A storable view of `sink` (`R32_UINT`).
+    sink_texel: vk::BufferView,
     memory: Vec<vk::DeviceMemory>,
     images: Vec<vk::Image>,
     /// By `VkImageViewType` raw value.
     views: HashMap<i32, vk::ImageView>,
+    /// Storage images for unbound typed UA views, by view type.
+    storage_views: HashMap<i32, vk::ImageView>,
 }
 
 /// A shader's hash: the one computed at translation, else its code's.
@@ -383,7 +428,7 @@ pub fn default_blend() -> BlendState {
 }
 
 impl Renderer {
-    fn module(&mut self, shader: &Shader) -> Result<vk::ShaderModule, Error> {
+    pub(crate) fn module(&mut self, shader: &Shader) -> Result<vk::ShaderModule, Error> {
         let key = shader_hash(shader);
         if let Some(m) = self.draw.modules.get(&key) {
             return Ok(*m);
@@ -399,19 +444,23 @@ impl Renderer {
         &mut self,
         draw: &Draw<'_>,
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), Error> {
+        let stages: Vec<(&Shader, vk::ShaderStageFlags)> =
+            std::iter::once((draw.vs, vk::ShaderStageFlags::VERTEX))
+                .chain(draw.gs.map(|gs| (gs, vk::ShaderStageFlags::GEOMETRY)))
+                .chain(draw.ps.map(|ps| (ps, vk::ShaderStageFlags::FRAGMENT)))
+                .collect();
+        self.layout_for(&stages)
+    }
+
+    /// The descriptor set and pipeline layouts of shaders, by stage.
+    pub(crate) fn layout_for(
+        &mut self,
+        stages: &[(&Shader, vk::ShaderStageFlags)],
+    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), Error> {
         let mut bindings: Vec<LayoutBinding> = Vec::new();
-        let stages = std::iter::once((draw.vs, vk::ShaderStageFlags::VERTEX))
-            .chain(draw.ps.map(|ps| (ps, vk::ShaderStageFlags::FRAGMENT)));
         for (shader, stage) in stages {
             for b in &shader.bindings {
-                let ty = match b.kind {
-                    BindingKind::ConstantBuffer { .. } => vk::DescriptorType::UNIFORM_BUFFER,
-                    BindingKind::Sampler { .. } => vk::DescriptorType::SAMPLER,
-                    BindingKind::Resource { dimension: 1, .. } => {
-                        vk::DescriptorType::UNIFORM_TEXEL_BUFFER
-                    }
-                    BindingKind::Resource { .. } => vk::DescriptorType::SAMPLED_IMAGE,
-                };
+                let ty = descriptor_type(b.kind);
                 bindings.push((b.binding, ty.as_raw(), stage.as_raw()));
             }
         }
@@ -480,6 +529,7 @@ impl Renderer {
             image,
             format: stored,
             aspect: stored_aspect,
+            usage,
             ..
         } = surface.resource
         else {
@@ -522,7 +572,21 @@ impl Renderer {
         if let Some(v) = surface.views.get(&key) {
             return Ok(*v);
         }
-        let info = vk::ImageViewCreateInfo::default()
+        // A storage image's views inherit that usage, which formats that
+        // cannot be stored (sRGB) refuse: such views leave it out.
+        let storable = usage.contains(vk::ImageUsageFlags::STORAGE) && {
+            // SAFETY: a device of this instance.
+            let features = unsafe {
+                self.instance
+                    .get_physical_device_format_properties(self.physical, format)
+            };
+            features
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+        };
+        let mut view_usage =
+            vk::ImageViewUsageCreateInfo::default().usage(usage & !vk::ImageUsageFlags::STORAGE);
+        let mut info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(view_type)
             .format(format)
@@ -534,6 +598,9 @@ impl Renderer {
                 first_layer,
                 layer_count,
             ));
+        if usage.contains(vk::ImageUsageFlags::STORAGE) && !storable {
+            info = info.push_next(&mut view_usage);
+        }
         // SAFETY: a live image of this device; mutable format images accept
         // views of their class.
         let view = unsafe { self.device.create_image_view(&info, None) }?;
@@ -686,12 +753,29 @@ impl Renderer {
             .range(vk::WHOLE_SIZE);
         // SAFETY: a view of a live buffer with texel buffer usage.
         let texel_buffer = unsafe { self.device.create_buffer_view(&info, None) }?;
+        let Storage::Buffer {
+            buffer: sink,
+            memory: sink_memory,
+            ..
+        } = self.create_buffer(65_536)?
+        else {
+            return err("null UA view buffer");
+        };
+        let info = vk::BufferViewCreateInfo::default()
+            .buffer(sink)
+            .format(vk::Format::R32_UINT)
+            .range(vk::WHOLE_SIZE);
+        // SAFETY: a view of a live buffer with storage texel buffer usage.
+        let sink_texel = unsafe { self.device.create_buffer_view(&info, None) }?;
         let mut null = Null {
             buffer,
             texel_buffer,
-            memory: vec![memory],
+            sink,
+            sink_texel,
+            memory: vec![memory, sink_memory],
             images: Vec::new(),
             views: HashMap::new(),
+            storage_views: HashMap::new(),
         };
         let cmd = self.cmd()?;
         // SAFETY: recording; the whole live buffer.
@@ -719,7 +803,16 @@ impl Renderer {
                 &[T::TYPE_3D][..],
             ),
         ];
-        for (ty, flags, layers, view_types) in shapes {
+        // Sampled images read as zeros, then storage images for unbound
+        // UA views (apart: writes must not reach the zeros).
+        let kinds = [
+            (vk::ImageUsageFlags::SAMPLED, false),
+            (vk::ImageUsageFlags::STORAGE, true),
+        ];
+        for ((ty, flags, layers, view_types), (usage, storage)) in kinds
+            .iter()
+            .flat_map(|k| shapes.iter().map(move |s| (*s, *k)))
+        {
             let info = vk::ImageCreateInfo::default()
                 .flags(flags)
                 .image_type(ty)
@@ -733,7 +826,7 @@ impl Renderer {
                 .array_layers(layers)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST);
+                .usage(usage | vk::ImageUsageFlags::TRANSFER_DST);
             // SAFETY: a valid create info on a live device.
             let image = unsafe { self.device.create_image(&info, None) }?;
             null.images.push(image);
@@ -783,7 +876,11 @@ impl Renderer {
                     .subresource_range(range(vk::ImageAspectFlags::COLOR, 0, 1, 0, layer_count));
                 // SAFETY: a view of a live image within its range.
                 let view = unsafe { self.device.create_image_view(&info, None) }?;
-                null.views.insert(view_type.as_raw(), view);
+                if storage {
+                    null.storage_views.insert(view_type.as_raw(), view);
+                } else {
+                    null.views.insert(view_type.as_raw(), view);
+                }
             }
         }
         Ok(null)
@@ -1042,13 +1139,15 @@ impl Renderer {
                 } => self
                     .device
                     .cmd_draw(cmd, vertices, instances, first_vertex, first_instance),
-                Call::Indexed {
-                    indices,
-                    instances,
-                    first_index,
-                    base_vertex,
-                    first_instance,
+                Call::Indirect {
+                    sid,
+                    offset,
+                    indexed: false,
                 } => {
+                    let (buffer, _) = self.buffer(sid)?;
+                    self.device.cmd_draw_indirect(cmd, buffer, offset, 1, 0);
+                }
+                Call::Indexed { .. } | Call::Indirect { indexed: true, .. } => {
                     let Some((sid, format, offset)) = draw.index else {
                         if let Some((pool, slot)) = occlusion {
                             self.device.cmd_end_query(cmd, pool, slot);
@@ -1064,14 +1163,28 @@ impl Renderer {
                         vk::IndexType::UINT32
                     };
                     self.device.cmd_bind_index_buffer(cmd, buffer, offset, ty);
-                    self.device.cmd_draw_indexed(
-                        cmd,
-                        indices,
-                        instances,
-                        first_index,
-                        base_vertex,
-                        first_instance,
-                    );
+                    match draw.call {
+                        Call::Indexed {
+                            indices,
+                            instances,
+                            first_index,
+                            base_vertex,
+                            first_instance,
+                        } => self.device.cmd_draw_indexed(
+                            cmd,
+                            indices,
+                            instances,
+                            first_index,
+                            base_vertex,
+                            first_instance,
+                        ),
+                        Call::Indirect { sid, offset, .. } => {
+                            let (args, _) = self.buffer(sid)?;
+                            self.device
+                                .cmd_draw_indexed_indirect(cmd, args, offset, 1, 0);
+                        }
+                        Call::Draw { .. } => {}
+                    }
                 }
             }
             if let Some((pool, slot)) = occlusion {
@@ -1086,14 +1199,29 @@ impl Renderer {
 
     /// Descriptor writes of a draw, with null resources for empty slots.
     fn descriptors(&mut self, draw: &Draw<'_>) -> Result<Vec<Write>, Error> {
+        let shaders: Vec<&Shader> = std::iter::once(draw.vs)
+            .chain(draw.gs)
+            .chain(draw.ps)
+            .collect();
+        self.descriptors_for(&shaders, &draw.resources, &draw.data)
+    }
+
+    /// The descriptor writes of shaders' bindings, from `resources`
+    /// (`Resource::Data(n)`: `data[n]`).
+    pub(crate) fn descriptors_for(
+        &mut self,
+        shaders: &[&Shader],
+        resources: &[Bound],
+        data: &[Vec<u8>],
+    ) -> Result<Vec<Write>, Error> {
         self.null()?;
         let mut writes = Vec::new();
-        let stages = std::iter::once(draw.vs).chain(draw.ps);
-        let declared: Vec<svga_shader::Binding> =
-            stages.flat_map(|s| s.bindings.iter().copied()).collect();
+        let declared: Vec<svga_shader::Binding> = shaders
+            .iter()
+            .flat_map(|s| s.bindings.iter().copied())
+            .collect();
         for b in declared {
-            let given = draw
-                .resources
+            let given = resources
                 .iter()
                 .find(|r| r.binding == b.binding)
                 .map_or(Resource::None, |r| r.resource);
@@ -1112,7 +1240,7 @@ impl Renderer {
                     }
                 }
                 (BindingKind::ConstantBuffer { .. }, Resource::Data(n)) => {
-                    match draw.data.get(n).filter(|d| !d.is_empty()) {
+                    match data.get(n).filter(|d| !d.is_empty()) {
                         Some(bytes) => {
                             let bytes = &bytes[..bytes.len().min(65_536)];
                             let (buffer, offset) = self.uniform_slice(bytes)?;
@@ -1135,6 +1263,92 @@ impl Renderer {
                 (BindingKind::Sampler { .. }, _) => {
                     let s = default_sampler();
                     Write::sampler(b.binding, self.sampler(&s)?)
+                }
+                (
+                    BindingKind::BufferResource { .. } | BindingKind::UaView { dimension: 0, .. },
+                    given,
+                ) => {
+                    let ua = matches!(b.kind, BindingKind::UaView { .. });
+                    let range = match given {
+                        Resource::StorageBuffer { sid, offset, size } => self
+                            .buffer(sid)
+                            .ok()
+                            .filter(|&(_, total)| offset < total)
+                            .map(|(buffer, total)| vk::DescriptorBufferInfo {
+                                buffer,
+                                offset,
+                                range: size.min(total.saturating_sub(offset)).max(4),
+                            }),
+                        _ => None,
+                    };
+                    let null = self.null()?;
+                    let range = range.unwrap_or(vk::DescriptorBufferInfo {
+                        buffer: if ua { null.sink } else { null.buffer },
+                        offset: 0,
+                        range: vk::WHOLE_SIZE,
+                    });
+                    Write::StorageBuffer(b.binding, range)
+                }
+                (BindingKind::UaView { dimension: 1, .. }, given) => {
+                    let view = match given {
+                        Resource::TexelBuffer {
+                            sid,
+                            format,
+                            offset,
+                            size,
+                        } if self.buffer(sid).is_ok() => {
+                            self.buffer_view(sid, format, offset, size)?
+                        }
+                        _ => self.null()?.sink_texel,
+                    };
+                    Write::StorageTexelBuffer(b.binding, view)
+                }
+                (BindingKind::UaView { dimension, .. }, given) => {
+                    let view_type = match dimension {
+                        2 => vk::ImageViewType::TYPE_1D,
+                        5 => vk::ImageViewType::TYPE_3D,
+                        7 => vk::ImageViewType::TYPE_1D_ARRAY,
+                        8 => vk::ImageViewType::TYPE_2D_ARRAY,
+                        _ => vk::ImageViewType::TYPE_2D,
+                    };
+                    let view = match given {
+                        Resource::StorageImage {
+                            sid,
+                            format,
+                            mip,
+                            first_layer,
+                            layers,
+                        } if self.has(sid) => {
+                            let (f, aspect) = self.view_format(format)?;
+                            let layers = match view_type {
+                                vk::ImageViewType::TYPE_1D
+                                | vk::ImageViewType::TYPE_2D
+                                | vk::ImageViewType::TYPE_3D => 1,
+                                _ => layers,
+                            };
+                            self.image_view(
+                                sid,
+                                f,
+                                aspect,
+                                view_type,
+                                (mip, 1),
+                                (first_layer, layers),
+                                vk::ComponentMapping::default(),
+                            )?
+                        }
+                        _ => {
+                            let null = self.null()?;
+                            *null.storage_views.get(&view_type.as_raw()).ok_or_else(|| {
+                                Error(format!("no null storage view {view_type:?}"))
+                            })?
+                        }
+                    };
+                    Write::StorageImage(
+                        b.binding,
+                        vk::DescriptorImageInfo::default()
+                            .image_view(view)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    )
                 }
                 (BindingKind::Resource { dimension: 1, .. }, given) => {
                     let view = match given {
@@ -1233,6 +1447,7 @@ impl Renderer {
     ) -> Result<vk::Pipeline, Error> {
         let vs = self.module(draw.vs)?;
         let ps = draw.ps.map(|ps| self.module(ps)).transpose()?;
+        let gs = draw.gs.map(|gs| self.module(gs)).transpose()?;
         let r = &draw.rasterizer;
         let (ds, _) = &draw.depth_stencil;
         let (blend, _, sample_mask) = &draw.blend;
@@ -1240,6 +1455,7 @@ impl Renderer {
         let mut key = Key::default();
         key.u64(shader_hash(draw.vs))
             .u64(draw.ps.map_or(0, shader_hash))
+            .u64(draw.gs.map_or(0, shader_hash))
             .u64(layout.as_raw())
             .u32(u32::try_from(topology.as_raw()).unwrap_or(0))
             .u32(u32::from(restart));
@@ -1436,6 +1652,14 @@ impl Renderer {
                 .module(vs)
                 .name(c"main"),
         ];
+        if let Some(gs) = gs {
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::GEOMETRY)
+                    .module(gs)
+                    .name(c"main"),
+            );
+        }
         if let Some(ps) = ps {
             stages.push(
                 vk::PipelineShaderStageCreateInfo::default()
@@ -1675,7 +1899,7 @@ impl Renderer {
                 self.device.destroy_sampler(s, None);
             }
             if let Some(n) = c.null {
-                for v in n.views.into_values() {
+                for v in n.views.into_values().chain(n.storage_views.into_values()) {
                     self.device.destroy_image_view(v, None);
                 }
                 for i in n.images {
@@ -1683,6 +1907,8 @@ impl Renderer {
                 }
                 self.device.destroy_buffer_view(n.texel_buffer, None);
                 self.device.destroy_buffer(n.buffer, None);
+                self.device.destroy_buffer_view(n.sink_texel, None);
+                self.device.destroy_buffer(n.sink, None);
                 for m in n.memory {
                     self.device.free_memory(m, None);
                 }
@@ -1740,11 +1966,30 @@ fn swizzle(format: u32) -> vk::ComponentMapping {
 }
 
 /// A descriptor write, owning its info until recorded.
-enum Write {
+pub(crate) enum Write {
     Buffer(u32, vk::DescriptorBufferInfo),
     Sampler(u32, vk::DescriptorImageInfo),
     Image(u32, vk::DescriptorImageInfo),
     TexelBuffer(u32, vk::BufferView),
+    StorageBuffer(u32, vk::DescriptorBufferInfo),
+    StorageImage(u32, vk::DescriptorImageInfo),
+    StorageTexelBuffer(u32, vk::BufferView),
+}
+
+/// The descriptor type of a shader binding.
+fn descriptor_type(kind: BindingKind) -> vk::DescriptorType {
+    use vk::DescriptorType as D;
+    match kind {
+        BindingKind::ConstantBuffer { .. } => D::UNIFORM_BUFFER,
+        BindingKind::Sampler { .. } => D::SAMPLER,
+        BindingKind::Resource { dimension: 1, .. } => D::UNIFORM_TEXEL_BUFFER,
+        BindingKind::Resource { .. } => D::SAMPLED_IMAGE,
+        BindingKind::BufferResource { .. } | BindingKind::UaView { dimension: 0, .. } => {
+            D::STORAGE_BUFFER
+        }
+        BindingKind::UaView { dimension: 1, .. } => D::STORAGE_TEXEL_BUFFER,
+        BindingKind::UaView { .. } => D::STORAGE_IMAGE,
+    }
 }
 
 impl Write {
@@ -1761,7 +2006,7 @@ impl Write {
         )
     }
 
-    fn as_vk(&self) -> vk::WriteDescriptorSet<'_> {
+    pub(crate) fn as_vk(&self) -> vk::WriteDescriptorSet<'_> {
         let w = vk::WriteDescriptorSet::default();
         match self {
             Self::Buffer(binding, info) => w
@@ -1779,6 +2024,18 @@ impl Write {
             Self::TexelBuffer(binding, view) => w
                 .dst_binding(*binding)
                 .descriptor_type(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+                .texel_buffer_view(std::slice::from_ref(view)),
+            Self::StorageBuffer(binding, info) => w
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(info)),
+            Self::StorageImage(binding, info) => w
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(info)),
+            Self::StorageTexelBuffer(binding, view) => w
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_TEXEL_BUFFER)
                 .texel_buffer_view(std::slice::from_ref(view)),
         }
     }

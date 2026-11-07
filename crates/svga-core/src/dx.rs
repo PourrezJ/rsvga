@@ -1004,7 +1004,134 @@ pub enum DxCommand {
         /// Bytes.
         width: u32,
     },
+    /// Creates an unordered-access view.
+    DefineUaView {
+        /// View.
+        id: u32,
+        /// Surface, format, dimension.
+        target: ViewTarget,
+        /// Range.
+        range: UaRange,
+    },
+    /// Destroys an unordered-access view.
+    DestroyUaView {
+        /// View.
+        id: u32,
+    },
+    /// Binds the unordered-access views of the graphics stages. Direct3D
+    /// gives render targets the slots below `splice`: `views[i]` is slot
+    /// `u#(splice + i)` of the shaders (`SVGA3D_INVALID_ID`: none), as in
+    /// Mesa's `svga` driver.
+    SetUaViews {
+        /// First slot after the render targets.
+        splice: u32,
+        /// Views, from slot `splice`.
+        views: Vec<u32>,
+    },
+    /// Binds compute-shader unordered-access views from slot `start`.
+    SetCsUaViews {
+        /// First slot.
+        start: u32,
+        /// Views.
+        views: Vec<u32>,
+    },
+    /// Gives a context the MOB area where the class-linkage data of its
+    /// shaders (interfaces, Direct3D 11) lives.
+    BindShaderIface {
+        /// Context.
+        cid: u32,
+        /// MOB (`SVGA3D_INVALID_ID`: none).
+        mob: u32,
+        /// Byte offset.
+        offset: u32,
+    },
+    /// Runs the compute shader on thread groups.
+    Dispatch {
+        /// Thread groups along x, y and z.
+        groups: [u32; 3],
+    },
+    /// A dispatch whose group counts are three `uint`s of a buffer.
+    DispatchIndirect {
+        /// Buffer surface.
+        sid: u32,
+        /// Byte offset of the arguments.
+        offset: u32,
+    },
+    /// A draw whose arguments come from a buffer (`DrawInstancedIndirect`,
+    /// or `DrawIndexedInstancedIndirect` if `indexed`).
+    DrawIndirect {
+        /// Indexed draw.
+        indexed: bool,
+        /// Buffer surface.
+        sid: u32,
+        /// Byte offset of the arguments.
+        offset: u32,
+    },
+    /// Fills an unordered-access view with integers (each component
+    /// converted to the view's format; raw and structured views: `x`).
+    ClearUaViewUint {
+        /// View.
+        view: u32,
+        /// Value.
+        value: [u32; 4],
+    },
+    /// Fills an unordered-access view with floats.
+    ClearUaViewFloat {
+        /// View.
+        view: u32,
+        /// Value.
+        value: [f32; 4],
+    },
+    /// A copy into or out of a staging resource (`DX_*STAGING_*`, used by
+    /// the Direct3D 11 driver): `copy`, then, if `readback`, the
+    /// destination written back to its MOB.
+    Staging {
+        /// The copy: `PredCopyRegion`, `PredCopy`, `PredConvertRegion`,
+        /// `PredConvert` or `BufferCopy`.
+        copy: Box<DxCommand>,
+        /// Write the destination back.
+        readback: bool,
+    },
 }
+
+/// What an unordered-access view covers (`SVGA3dUAViewDesc`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UaRange {
+    /// Elements of a buffer.
+    Buffer {
+        /// First element.
+        first: u32,
+        /// Elements.
+        count: u32,
+        /// `SVGA3D_UABUFFER_*`: raw, append, counter.
+        flags: u32,
+    },
+    /// One mip of slices of a 1D or 2D texture (array).
+    Texture {
+        /// Mip level.
+        mip: u32,
+        /// First array slice.
+        first_slice: u32,
+        /// Slices.
+        slices: u32,
+    },
+    /// One mip of depth slices of a 3D texture.
+    Texture3d {
+        /// Mip level.
+        mip: u32,
+        /// First depth slice.
+        first_w: u32,
+        /// Depth slices.
+        w_size: u32,
+    },
+}
+
+/// `SVGA3D_UABUFFER_RAW`: a byte-addressed buffer view.
+pub const UABUFFER_RAW: u32 = 1;
+/// `SVGA3D_UABUFFER_APPEND`: an append/consume buffer view.
+pub const UABUFFER_APPEND: u32 = 1 << 1;
+/// `SVGA3D_UABUFFER_COUNTER`: a structured buffer view with a counter.
+pub const UABUFFER_COUNTER: u32 = 1 << 2;
 
 /// A DX command that cannot be decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1148,6 +1275,20 @@ fn layout(id: u32) -> Option<(usize, usize, usize)> {
         DX_BUFFER_COPY => none(20),
         DX_TRANSFER_FROM_BUFFER | DX_PRED_TRANSFER_FROM_BUFFER => none(48),
         DX_SURFACE_COPY_AND_READBACK => none(44),
+        // The copy, then readback and unsynchronized bytes and 2 padding.
+        DX_PRED_STAGING_COPY_REGION => none(56),
+        DX_PRED_STAGING_COPY | DX_STAGING_COPY | DX_PRED_STAGING_CONVERT => none(12),
+        DX_PRED_STAGING_CONVERT_REGION => none(68),
+        DX_STAGING_BUFFER_COPY => none(24),
+        DX_DEFINE_UA_VIEW => none(36),
+        DX_DESTROY_UA_VIEW => none(4),
+        DX_SET_UA_VIEWS | DX_SET_CS_UA_VIEWS => Some((4, 4, dx::MAX_UAVIEWS)),
+        DX_BIND_SHADER_IFACE => none(12),
+        DX_DISPATCH => none(12),
+        DX_DISPATCH_INDIRECT | DX_DRAW_INSTANCED_INDIRECT | DX_DRAW_INDEXED_INSTANCED_INDIRECT => {
+            none(8)
+        }
+        DX_CLEAR_UA_VIEW_UINT | DX_CLEAR_UA_VIEW_FLOAT => none(20),
         DX_MOB_FENCE_64 => none(16),
         DX_HINT => none(4),
         DX_BUFFER_UPDATE => none(12),
@@ -1876,6 +2017,90 @@ fn decode(id: u32, mut f: Fields<'_>, elements: &[&[u8]]) -> Result<DxCommand, D
             dest: f.u32(),
             copy: f.copy_box(),
         },
+        DX_PRED_STAGING_COPY_REGION
+        | DX_PRED_STAGING_COPY
+        | DX_STAGING_COPY
+        | DX_PRED_STAGING_CONVERT_REGION
+        | DX_PRED_STAGING_CONVERT
+        | DX_STAGING_BUFFER_COPY => {
+            // The plain copy's structure, then the flags.
+            let (inner, size) = match id {
+                DX_PRED_STAGING_COPY_REGION => (DX_PRED_COPY_REGION, 52),
+                DX_PRED_STAGING_CONVERT_REGION => (DX_PRED_CONVERT_REGION, 64),
+                DX_PRED_STAGING_CONVERT => (DX_PRED_CONVERT, 8),
+                DX_STAGING_BUFFER_COPY => (DX_BUFFER_COPY, 20),
+                _ => (DX_PRED_COPY, 8),
+            };
+            let bytes = f.bytes;
+            let copy = decode(inner, Fields::new(bytes.get(..size).unwrap_or(bytes)), &[])?;
+            let mut flags = Fields::new(bytes.get(size..).unwrap_or_default());
+            C::Staging {
+                copy: Box::new(copy),
+                readback: flags.bool(),
+            }
+        }
+        DX_DEFINE_UA_VIEW => {
+            let view = f.u32();
+            let target = view_target(&mut f);
+            let (a, b, c) = (f.u32(), f.u32(), f.u32());
+            let range = match target.dimension {
+                dx::resource::BUFFER | dx::resource::BUFFEREX => UaRange::Buffer {
+                    first: a,
+                    count: b,
+                    flags: c,
+                },
+                dx::resource::TEXTURE1D | dx::resource::TEXTURE2D => UaRange::Texture {
+                    mip: a,
+                    first_slice: b,
+                    slices: c,
+                },
+                dx::resource::TEXTURE3D => UaRange::Texture3d {
+                    mip: a,
+                    first_w: b,
+                    w_size: c,
+                },
+                other => return Err(bad_dimension(id, other)),
+            };
+            C::DefineUaView {
+                id: view,
+                target,
+                range,
+            }
+        }
+        DX_DESTROY_UA_VIEW => C::DestroyUaView { id: f.u32() },
+        DX_SET_UA_VIEWS => C::SetUaViews {
+            splice: f.u32(),
+            views: ids(elements),
+        },
+        DX_SET_CS_UA_VIEWS => C::SetCsUaViews {
+            start: f.u32(),
+            views: ids(elements),
+        },
+        DX_BIND_SHADER_IFACE => C::BindShaderIface {
+            cid: f.u32(),
+            mob: f.u32(),
+            offset: f.u32(),
+        },
+        DX_DISPATCH => C::Dispatch {
+            groups: [f.u32(), f.u32(), f.u32()],
+        },
+        DX_DISPATCH_INDIRECT => C::DispatchIndirect {
+            sid: f.u32(),
+            offset: f.u32(),
+        },
+        DX_DRAW_INSTANCED_INDIRECT | DX_DRAW_INDEXED_INSTANCED_INDIRECT => C::DrawIndirect {
+            indexed: id == DX_DRAW_INDEXED_INSTANCED_INDIRECT,
+            sid: f.u32(),
+            offset: f.u32(),
+        },
+        DX_CLEAR_UA_VIEW_UINT => C::ClearUaViewUint {
+            view: f.u32(),
+            value: [f.u32(), f.u32(), f.u32(), f.u32()],
+        },
+        DX_CLEAR_UA_VIEW_FLOAT => C::ClearUaViewFloat {
+            view: f.u32(),
+            value: f.f32x4(),
+        },
         DX_MOB_FENCE_64 => C::MobFence64 {
             value: f.u64(),
             mob: f.u32(),
@@ -2505,6 +2730,141 @@ mod tests {
         // Not decoded here.
         assert_eq!(parse(DX_PRESENTBLT, 68, &[0; 17]), None);
         assert_eq!(parse(cmd3d::SURFACE_COPY, 24, &[0; 6]), None);
+    }
+
+    /// Payloads as VMware's Direct3D 11 driver sent them at feature level
+    /// 11_0 (shader model 5 advertised).
+    #[test]
+    fn shader_model_5_commands() {
+        let region = run(
+            DX_PRED_STAGING_COPY_REGION,
+            words(&[0x6c, 0, 0x7e, 0, 0x42, 1, 0, 7, 7, 1, 0, 0, 0, 0]),
+        );
+        let Ok(DxCommand::Staging { copy, readback }) = region else {
+            panic!("{region:?}");
+        };
+        assert!(!readback);
+        let DxCommand::PredCopyRegion {
+            dest,
+            dest_sub,
+            src,
+            src_sub,
+            copy,
+        } = *copy
+        else {
+            panic!("{copy:?}");
+        };
+        assert_eq!((dest, dest_sub, src, src_sub), (0x6c, 0, 0x7e, 0));
+        assert_eq!(
+            (copy.dest.x, copy.dest.y, copy.dest.w, copy.dest.h),
+            (0x42, 1, 7, 7)
+        );
+        assert_eq!(
+            run(DX_PRED_STAGING_COPY, words(&[9, 8, 1])),
+            Ok(DxCommand::Staging {
+                copy: Box::new(DxCommand::PredCopy { dest: 9, src: 8 }),
+                readback: true
+            })
+        );
+        assert_eq!(
+            run(DX_STAGING_BUFFER_COPY, words(&[9, 8, 16, 32, 64, 1])),
+            Ok(DxCommand::Staging {
+                copy: Box::new(DxCommand::BufferCopy {
+                    dest: 9,
+                    src: 8,
+                    dest_x: 16,
+                    src_x: 32,
+                    width: 64
+                }),
+                readback: true
+            })
+        );
+        let mut eight = vec![0];
+        eight.extend([INVALID_ID; 8]);
+        assert_eq!(
+            run(DX_SET_UA_VIEWS, words(&eight)),
+            Ok(DxCommand::SetUaViews {
+                splice: 0,
+                views: vec![INVALID_ID; 8]
+            })
+        );
+        assert_eq!(
+            run(DX_SET_CS_UA_VIEWS, words(&[2, 5])),
+            Ok(DxCommand::SetCsUaViews {
+                start: 2,
+                views: vec![5]
+            })
+        );
+        assert_eq!(
+            run(DX_BIND_SHADER_IFACE, words(&[3, 0x4b, 0x2000])),
+            Ok(DxCommand::BindShaderIface {
+                cid: 3,
+                mob: 0x4b,
+                offset: 0x2000
+            })
+        );
+        assert_eq!(
+            run(
+                DX_DEFINE_UA_VIEW,
+                words(&[
+                    1,
+                    20,
+                    41,
+                    dx::resource::BUFFEREX,
+                    0,
+                    256,
+                    UABUFFER_RAW,
+                    0,
+                    0
+                ])
+            ),
+            Ok(DxCommand::DefineUaView {
+                id: 1,
+                target: ViewTarget {
+                    sid: 20,
+                    format: 41,
+                    dimension: dx::resource::BUFFEREX
+                },
+                range: UaRange::Buffer {
+                    first: 0,
+                    count: 256,
+                    flags: UABUFFER_RAW
+                }
+            })
+        );
+        assert!(
+            run(
+                DX_DEFINE_UA_VIEW,
+                words(&[1, 20, 41, dx::resource::TEXTURECUBE, 0, 0, 6, 0, 0])
+            )
+            .is_err(),
+            "no cube UA views in Direct3D"
+        );
+        assert_eq!(
+            run(DX_DISPATCH, words(&[8, 4, 1])),
+            Ok(DxCommand::Dispatch { groups: [8, 4, 1] })
+        );
+        assert_eq!(
+            run(DX_DRAW_INDEXED_INSTANCED_INDIRECT, words(&[12, 20])),
+            Ok(DxCommand::DrawIndirect {
+                indexed: true,
+                sid: 12,
+                offset: 20
+            })
+        );
+        assert_eq!(
+            run(DX_CLEAR_UA_VIEW_UINT, words(&[3, 1, 2, 3, 4])),
+            Ok(DxCommand::ClearUaViewUint {
+                view: 3,
+                value: [1, 2, 3, 4]
+            })
+        );
+        let mut many = vec![0];
+        many.extend([INVALID_ID; 65]);
+        assert!(matches!(
+            run(DX_SET_UA_VIEWS, words(&many)),
+            Err(DxError::TooMany { count: 65, .. })
+        ));
     }
 
     #[test]

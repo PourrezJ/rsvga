@@ -1,7 +1,8 @@
 //! Translation tests. Generated SPIR-V goes through `spirv-val` (Vulkan 1.3
-//! rules) when it is installed. DWM's own shaders, if captured with
-//! `RSVGA_SHADER_DUMP=target/shaders/dwm` (they are Microsoft's code and
-//! stay out of the repository), are all translated and validated too.
+//! rules) when it is installed. Captured shaders, if any (for instance
+//! DWM's with `RSVGA_SHADER_DUMP=target/shaders/dwm`, or those of the guest
+//! test programs in `target/shaders/d3dtest`; they stay out of the
+//! repository), are all translated and validated too.
 
 #![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
 
@@ -176,6 +177,14 @@ fn malformed_programs_are_refused_not_panicking() {
     assert!(translate_words(&program(1, &[instr(op::ENDIF, &[])]), &Options::default()).is_err());
     assert!(translate_words(&program(1, &[instr(op::LOOP, &[])]), &Options::default()).is_err());
     assert!(translate_words(&program(1, &[instr(op::EMIT, &[])]), &Options::default()).is_err());
+    // Group barriers belong to compute shaders.
+    assert!(
+        translate_words(
+            &program(0, &[instr(op::SYNC | (1 << 11), &[])]),
+            &Options::default()
+        )
+        .is_err()
+    );
     assert!(
         translate_words(&program(2, &[]), &Options::default()).is_err(),
         "geometry shaders"
@@ -203,43 +212,63 @@ fn malformed_programs_are_refused_not_panicking() {
     }
 }
 
-fn corpus() -> Option<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/shaders/dwm");
-    dir.is_dir().then_some(dir)
+/// Folders of captured Direct3D 10/11 shaders: every folder of
+/// `target/shaders` but `d3d9` (`dwm`: DWM's; `d3dtest`: the guest test
+/// program's, which cover shader model 5).
+fn corpora() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/shaders");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| Some(e.ok()?.path()))
+        .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "d3d9"))
+        .collect();
+    dirs.sort();
+    dirs
 }
 
+/// Stages whose translation is still to come: their shaders are counted,
+/// not failed.
+const NOT_YET: [&str; 2] = ["Hull shaders", "Domain shaders"];
+
 #[test]
-fn the_dwm_corpus_translates_and_validates() {
-    let Some(dir) = corpus() else {
-        eprintln!("no captured shaders in target/shaders/dwm: skipped");
+fn captured_shaders_translate_and_validate() {
+    let dirs = corpora();
+    if dirs.is_empty() {
+        eprintln!("no captured shaders in target/shaders: skipped");
         return;
-    };
+    }
     let mut failures = Vec::new();
     let mut count = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        let bytes = std::fs::read(&path).unwrap();
-        let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        count += 1;
-        match translate_words(&words, &Options::default()) {
-            Err(e) => failures.push(format!("{name}: {e}")),
-            Ok(shader) => {
-                // RSVGA_SPV_DUMP=DIR keeps the SPIR-V, to inspect it.
-                if let Some(out) = std::env::var_os("RSVGA_SPV_DUMP") {
-                    let bytes: Vec<u8> =
-                        shader.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    let _ = std::fs::create_dir_all(&out);
-                    let _ = std::fs::write(Path::new(&out).join(format!("{name}.spv")), bytes);
-                }
-                if let Some(Err(e)) = validate(&name, &shader.spirv) {
-                    failures.push(format!(
-                        "{name}: spirv-val: {}",
-                        e.lines().next().unwrap_or("")
-                    ));
+    let mut later = 0;
+    for dir in &dirs {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            count += 1;
+            match translate_words(&words, &Options::default()) {
+                Err(e) if NOT_YET.iter().any(|s| e.0.contains(s)) => later += 1,
+                Err(e) => failures.push(format!("{name}: {e}")),
+                Ok(shader) => {
+                    // RSVGA_SPV_DUMP=DIR keeps the SPIR-V, to inspect it.
+                    if let Some(out) = std::env::var_os("RSVGA_SPV_DUMP") {
+                        let bytes: Vec<u8> =
+                            shader.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        let _ = std::fs::create_dir_all(&out);
+                        let _ = std::fs::write(Path::new(&out).join(format!("{name}.spv")), bytes);
+                    }
+                    if let Some(Err(e)) = validate(&name, &shader.spirv) {
+                        failures.push(format!(
+                            "{name}: spirv-val: {}",
+                            e.lines().next().unwrap_or("")
+                        ));
+                    }
                 }
             }
         }
@@ -250,5 +279,40 @@ fn the_dwm_corpus_translates_and_validates() {
         failures.len(),
         failures.join("\n")
     );
-    eprintln!("{count} DWM shaders translated and validated");
+    eprintln!("{count} captured shaders: translated and validated, {later} of stages to come");
+}
+
+#[test]
+fn a_geometry_shader_emits_a_strip_from_a_point() {
+    // dcl_input_siv v[1][0].xyzw, position; points in, triangle strip out;
+    // two vertices emitted from the point, then a cut.
+    let all = MASK | (0xf << 4);
+    let v00 = operand(1, SWZ, 2);
+    let o0 = operand(2, all, 1);
+    let words = program(
+        2,
+        &[
+            instr(op::DCL_INPUT_SIV, &[operand(1, all, 2), 1, 0, SIV_POSITION]),
+            instr(op::DCL_GS_INPUT_PRIMITIVE | (1 << 11), &[]),
+            instr(op::DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY | (5 << 11), &[]),
+            instr(op::DCL_OUTPUT_SIV, &[o0, 0, SIV_POSITION]),
+            instr(op::DCL_MAX_OUTPUT_VERTEX_COUNT, &[2]),
+            instr(op::MOV, &[o0, 0, v00, 0, 0]),
+            instr(op::EMIT, &[]),
+            instr(op::MOV, &[o0, 0, v00, 0, 0]),
+            instr(op::EMITTHENCUT, &[]),
+            instr(op::RET, &[]),
+        ],
+    );
+    let shader = check("geometry", &words);
+    assert_eq!(shader.stage, Stage::Geometry);
+    // OpEmitVertex twice, OpEndPrimitive once.
+    let count = |opcode: u32| {
+        shader
+            .spirv
+            .iter()
+            .filter(|&&w| w == (1 << 16) | opcode)
+            .count()
+    };
+    assert_eq!((count(218), count(219)), (2, 1));
 }

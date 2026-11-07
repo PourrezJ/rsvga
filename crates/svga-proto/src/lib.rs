@@ -718,6 +718,8 @@ pub mod surface_flag {
     pub const BIND_DEPTH_STENCIL: u64 = 1 << 25;
     /// Multisampled.
     pub const MULTISAMPLE: u64 = 1 << 32;
+    /// Usable through unordered-access views.
+    pub const BIND_UAVIEW: u64 = 1 << 33;
 }
 
 /// Flags of `SVGA_3D_CMD_COND_BIND_GB_SURFACE`.
@@ -1027,6 +1029,9 @@ pub mod dx {
     pub const MAX_SAMPLERS: usize = 16;
     pub const MAX_VIEWPORTS: usize = 16;
     pub const MAX_SCISSORRECTS: usize = 16;
+    /// Unordered-access view slots (`SVGA3D_DX11_1_MAX_UAVIEWS`; Direct3D
+    /// 11.0 uses the first 8).
+    pub const MAX_UAVIEWS: usize = 64;
     /// Elements of an input layout (`SVGACOTableDXElementLayoutEntry`).
     pub const MAX_ELEMENTS: usize = 32;
     /// Declarations of a stream-output object.
