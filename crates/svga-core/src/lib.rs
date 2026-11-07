@@ -7,6 +7,7 @@
 pub mod cmdbuf;
 pub mod command;
 pub mod decode;
+pub mod dx;
 pub mod fifo;
 pub mod gb;
 pub mod gmr;

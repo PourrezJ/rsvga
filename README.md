@@ -26,6 +26,10 @@ fuzz/run.sh fifo 60
 fuzz/run.sh decode 60
 ```
 
+```bash
+fuzz/run.sh dx 60
+```
+
 ## QEMU patché
 
 Deux petits patchs :
@@ -110,7 +114,7 @@ target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/
 - `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
 - `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
 - `guest/d3dprobe` : sonde Direct3D côté Windows.
-- 121 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; deux cibles de fuzzing.
+- 129 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; trois cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
 

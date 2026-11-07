@@ -155,8 +155,10 @@ impl Svga {
                 entries.len()
             ));
         }
+        // DX commands apply to the context the header names.
+        let dx_context = (header.flags & cb::flag::DX_CONTEXT != 0).then_some(header.dx_context);
         for entry in entries {
-            self.execute(state, entry.command);
+            self.execute(state, entry.command, dx_context);
         }
         match error {
             None => finish(state, pa, header, cb::status::COMPLETED, 0),

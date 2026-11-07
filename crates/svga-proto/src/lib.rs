@@ -472,6 +472,126 @@ pub mod cmd3d {
     pub const DEFINE_GB_SURFACE_V3: u32 = 1239;
     pub const UPDATE_ZERO_SURFACE: u32 = 1256;
     pub const DEFINE_GB_SURFACE_V4: u32 = 1267;
+
+    // DirectX contexts (DX_DEFINE_CONTEXT and DX_PRESENTBLT are above).
+    pub const DX_DESTROY_CONTEXT: u32 = 1144;
+    pub const DX_BIND_CONTEXT: u32 = 1145;
+    pub const DX_READBACK_CONTEXT: u32 = 1146;
+    pub const DX_INVALIDATE_CONTEXT: u32 = 1147;
+    pub const DX_SET_SINGLE_CONSTANT_BUFFER: u32 = 1148;
+    pub const DX_SET_SHADER_RESOURCES: u32 = 1149;
+    pub const DX_SET_SHADER: u32 = 1150;
+    pub const DX_SET_SAMPLERS: u32 = 1151;
+    pub const DX_DRAW: u32 = 1152;
+    pub const DX_DRAW_INDEXED: u32 = 1153;
+    pub const DX_DRAW_INSTANCED: u32 = 1154;
+    pub const DX_DRAW_INDEXED_INSTANCED: u32 = 1155;
+    pub const DX_DRAW_AUTO: u32 = 1156;
+    pub const DX_SET_INPUT_LAYOUT: u32 = 1157;
+    pub const DX_SET_VERTEX_BUFFERS: u32 = 1158;
+    pub const DX_SET_INDEX_BUFFER: u32 = 1159;
+    pub const DX_SET_TOPOLOGY: u32 = 1160;
+    pub const DX_SET_RENDERTARGETS: u32 = 1161;
+    pub const DX_SET_BLEND_STATE: u32 = 1162;
+    pub const DX_SET_DEPTHSTENCIL_STATE: u32 = 1163;
+    pub const DX_SET_RASTERIZER_STATE: u32 = 1164;
+    pub const DX_DEFINE_QUERY: u32 = 1165;
+    pub const DX_DESTROY_QUERY: u32 = 1166;
+    pub const DX_BIND_QUERY: u32 = 1167;
+    pub const DX_SET_QUERY_OFFSET: u32 = 1168;
+    pub const DX_BEGIN_QUERY: u32 = 1169;
+    pub const DX_END_QUERY: u32 = 1170;
+    pub const DX_READBACK_QUERY: u32 = 1171;
+    pub const DX_SET_PREDICATION: u32 = 1172;
+    pub const DX_SET_SOTARGETS: u32 = 1173;
+    pub const DX_SET_VIEWPORTS: u32 = 1174;
+    pub const DX_SET_SCISSORRECTS: u32 = 1175;
+    pub const DX_CLEAR_RENDERTARGET_VIEW: u32 = 1176;
+    pub const DX_CLEAR_DEPTHSTENCIL_VIEW: u32 = 1177;
+    pub const DX_PRED_COPY_REGION: u32 = 1178;
+    pub const DX_PRED_COPY: u32 = 1179;
+    pub const DX_GENMIPS: u32 = 1181;
+    pub const DX_UPDATE_SUBRESOURCE: u32 = 1182;
+    pub const DX_READBACK_SUBRESOURCE: u32 = 1183;
+    pub const DX_INVALIDATE_SUBRESOURCE: u32 = 1184;
+    pub const DX_DEFINE_SHADERRESOURCE_VIEW: u32 = 1185;
+    pub const DX_DESTROY_SHADERRESOURCE_VIEW: u32 = 1186;
+    pub const DX_DEFINE_RENDERTARGET_VIEW: u32 = 1187;
+    pub const DX_DESTROY_RENDERTARGET_VIEW: u32 = 1188;
+    pub const DX_DEFINE_DEPTHSTENCIL_VIEW: u32 = 1189;
+    pub const DX_DESTROY_DEPTHSTENCIL_VIEW: u32 = 1190;
+    pub const DX_DEFINE_ELEMENTLAYOUT: u32 = 1191;
+    pub const DX_DESTROY_ELEMENTLAYOUT: u32 = 1192;
+    pub const DX_DEFINE_BLEND_STATE: u32 = 1193;
+    pub const DX_DESTROY_BLEND_STATE: u32 = 1194;
+    pub const DX_DEFINE_DEPTHSTENCIL_STATE: u32 = 1195;
+    pub const DX_DESTROY_DEPTHSTENCIL_STATE: u32 = 1196;
+    pub const DX_DEFINE_RASTERIZER_STATE: u32 = 1197;
+    pub const DX_DESTROY_RASTERIZER_STATE: u32 = 1198;
+    pub const DX_DEFINE_SAMPLER_STATE: u32 = 1199;
+    pub const DX_DESTROY_SAMPLER_STATE: u32 = 1200;
+    pub const DX_DEFINE_SHADER: u32 = 1201;
+    pub const DX_DESTROY_SHADER: u32 = 1202;
+    pub const DX_BIND_SHADER: u32 = 1203;
+    pub const DX_DEFINE_STREAMOUTPUT: u32 = 1204;
+    pub const DX_DESTROY_STREAMOUTPUT: u32 = 1205;
+    pub const DX_SET_STREAMOUTPUT: u32 = 1206;
+    pub const DX_SET_COTABLE: u32 = 1207;
+    pub const DX_READBACK_COTABLE: u32 = 1208;
+    pub const DX_BUFFER_COPY: u32 = 1209;
+    pub const DX_TRANSFER_FROM_BUFFER: u32 = 1210;
+    pub const DX_SURFACE_COPY_AND_READBACK: u32 = 1211;
+    pub const DX_MOVE_QUERY: u32 = 1212;
+    pub const DX_BIND_ALL_QUERY: u32 = 1213;
+    pub const DX_READBACK_ALL_QUERY: u32 = 1214;
+    pub const DX_PRED_TRANSFER_FROM_BUFFER: u32 = 1215;
+    pub const DX_MOB_FENCE_64: u32 = 1216;
+    pub const DX_BIND_ALL_SHADER: u32 = 1217;
+    pub const DX_HINT: u32 = 1218;
+    pub const DX_BUFFER_UPDATE: u32 = 1219;
+    pub const DX_SET_VS_CONSTANT_BUFFER_OFFSET: u32 = 1220;
+    pub const DX_SET_PS_CONSTANT_BUFFER_OFFSET: u32 = 1221;
+    pub const DX_SET_GS_CONSTANT_BUFFER_OFFSET: u32 = 1222;
+    pub const DX_SET_HS_CONSTANT_BUFFER_OFFSET: u32 = 1223;
+    pub const DX_SET_DS_CONSTANT_BUFFER_OFFSET: u32 = 1224;
+    pub const DX_SET_CS_CONSTANT_BUFFER_OFFSET: u32 = 1225;
+    pub const DX_COND_BIND_ALL_SHADER: u32 = 1226;
+    pub const DX_GROW_COTABLE: u32 = 1237;
+    pub const DX_RESOLVE_COPY: u32 = 1240;
+    pub const DX_PRED_RESOLVE_COPY: u32 = 1241;
+    pub const DX_PRED_CONVERT_REGION: u32 = 1242;
+    pub const DX_PRED_CONVERT: u32 = 1243;
+    pub const DX_DEFINE_UA_VIEW: u32 = 1245;
+    pub const DX_DESTROY_UA_VIEW: u32 = 1246;
+    pub const DX_CLEAR_UA_VIEW_UINT: u32 = 1247;
+    pub const DX_CLEAR_UA_VIEW_FLOAT: u32 = 1248;
+    pub const DX_COPY_STRUCTURE_COUNT: u32 = 1249;
+    pub const DX_SET_UA_VIEWS: u32 = 1250;
+    pub const DX_DRAW_INDEXED_INSTANCED_INDIRECT: u32 = 1251;
+    pub const DX_DRAW_INSTANCED_INDIRECT: u32 = 1252;
+    pub const DX_DISPATCH: u32 = 1253;
+    pub const DX_DISPATCH_INDIRECT: u32 = 1254;
+    pub const DX_TRANSFER_TO_BUFFER: u32 = 1257;
+    pub const DX_SET_STRUCTURE_COUNT: u32 = 1258;
+    pub const DX_COPY_COTABLE_INTO_MOB: u32 = 1265;
+    pub const DX_SET_CS_UA_VIEWS: u32 = 1268;
+    pub const DX_SET_MIN_LOD: u32 = 1269;
+    pub const DX_DEFINE_DEPTHSTENCIL_VIEW_V2: u32 = 1272;
+    pub const DX_DEFINE_STREAMOUTPUT_WITH_MOB: u32 = 1273;
+    pub const DX_SET_SHADER_IFACE: u32 = 1274;
+    pub const DX_BIND_STREAMOUTPUT: u32 = 1275;
+    pub const DX_BIND_SHADER_IFACE: u32 = 1277;
+    pub const DX_PRED_STAGING_COPY: u32 = 1281;
+    pub const DX_STAGING_COPY: u32 = 1282;
+    pub const DX_PRED_STAGING_COPY_REGION: u32 = 1283;
+    pub const DX_SET_VERTEX_BUFFERS_V2: u32 = 1284;
+    pub const DX_SET_INDEX_BUFFER_V2: u32 = 1285;
+    pub const DX_SET_VERTEX_BUFFERS_OFFSET_AND_SIZE: u32 = 1286;
+    pub const DX_SET_INDEX_BUFFER_OFFSET_AND_SIZE: u32 = 1287;
+    pub const DX_DEFINE_RASTERIZER_STATE_V2: u32 = 1288;
+    pub const DX_PRED_STAGING_CONVERT_REGION: u32 = 1289;
+    pub const DX_PRED_STAGING_CONVERT: u32 = 1290;
+    pub const DX_STAGING_BUFFER_COPY: u32 = 1291;
     /// One past the last 3D command known to this protocol version.
     pub const MAX: u32 = 1303;
     /// One past the last ID reserved for 3D-framed commands.
@@ -700,6 +820,87 @@ pub mod devcap {
             _ => None,
         }
     }
+}
+
+/// DirectX contexts: object kinds, limits and enumerations of the DX
+/// commands (`svga3d_dx.h`, `svga3d_types.h`).
+pub mod dx {
+    #![allow(missing_docs)]
+
+    /// `SVGA3dShaderType`.
+    pub mod shader {
+        pub const VS: u32 = 1;
+        pub const PS: u32 = 2;
+        pub const GS: u32 = 3;
+        pub const HS: u32 = 4;
+        pub const DS: u32 = 5;
+        pub const CS: u32 = 6;
+    }
+
+    /// `SVGACOTableType`: the per-context object tables.
+    pub mod cotable {
+        pub const RTVIEW: u32 = 0;
+        pub const DSVIEW: u32 = 1;
+        pub const SRVIEW: u32 = 2;
+        pub const ELEMENTLAYOUT: u32 = 3;
+        pub const BLENDSTATE: u32 = 4;
+        pub const DEPTHSTENCIL: u32 = 5;
+        pub const RASTERIZERSTATE: u32 = 6;
+        pub const SAMPLER: u32 = 7;
+        pub const STREAMOUTPUT: u32 = 8;
+        pub const DXQUERY: u32 = 9;
+        pub const DXSHADER: u32 = 10;
+        pub const UAVIEW: u32 = 11;
+        pub const MAX: u32 = 12;
+    }
+
+    /// `SVGA3dResourceType`: the dimension a view sees.
+    pub mod resource {
+        pub const BUFFER: u32 = 1;
+        pub const TEXTURE1D: u32 = 2;
+        pub const TEXTURE2D: u32 = 3;
+        pub const TEXTURE3D: u32 = 4;
+        pub const TEXTURECUBE: u32 = 5;
+        pub const BUFFEREX: u32 = 6;
+    }
+
+    /// `SVGA3dQueryType`.
+    pub mod query {
+        pub const OCCLUSION: u32 = 0;
+        pub const TIMESTAMP: u32 = 1;
+        pub const TIMESTAMPDISJOINT: u32 = 2;
+        pub const PIPELINESTATS: u32 = 3;
+        pub const OCCLUSIONPREDICATE: u32 = 4;
+        pub const STREAMOUTPUTSTATS: u32 = 5;
+        pub const STREAMOVERFLOWPREDICATE: u32 = 6;
+        pub const OCCLUSION64: u32 = 7;
+        pub const SOSTATS_STREAM0: u32 = 8;
+        pub const SOSTATS_STREAM1: u32 = 9;
+        pub const SOSTATS_STREAM2: u32 = 10;
+        pub const SOSTATS_STREAM3: u32 = 11;
+        pub const SOP_STREAM0: u32 = 12;
+        pub const SOP_STREAM1: u32 = 13;
+        pub const SOP_STREAM2: u32 = 14;
+        pub const SOP_STREAM3: u32 = 15;
+        pub const MAX: u32 = 16;
+    }
+
+    /// `SVGA3D_INPUT_*`: input element classification.
+    pub const INPUT_PER_INSTANCE_DATA: u32 = 1;
+
+    /// Bindings per draw (`SVGA3D_DX_MAX_*`).
+    pub const MAX_RENDER_TARGETS: usize = 8;
+    pub const MAX_VERTEXBUFFERS: usize = 32;
+    pub const MAX_SOTARGETS: usize = 4;
+    pub const MAX_SRVIEWS: usize = 128;
+    pub const MAX_CONSTBUFFERS: usize = 16;
+    pub const MAX_SAMPLERS: usize = 16;
+    pub const MAX_VIEWPORTS: usize = 16;
+    pub const MAX_SCISSORRECTS: usize = 16;
+    /// Elements of an input layout (`SVGACOTableDXElementLayoutEntry`).
+    pub const MAX_ELEMENTS: usize = 32;
+    /// Declarations of a stream-output object.
+    pub const MAX_STREAMOUT_DECLS: usize = 64;
 }
 
 /// What a surface format can do (`SVGA3D_DXFMT_*`), the value of its

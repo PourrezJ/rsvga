@@ -164,6 +164,10 @@ pub struct Stats {
     pub updates: u64,
     /// Commands ignored because they are not implemented yet.
     pub unsupported: u64,
+    /// DX context commands decoded (not executed yet).
+    pub dx: u64,
+    /// DX context commands refused by the decoder.
+    pub dx_refused: u64,
 }
 
 /// Mutable device state, behind the device lock.
@@ -362,7 +366,7 @@ impl Svga {
         let r = |i: u32| self.fifo.load_u32(reg_index(i));
         let state = self.lock();
         format!(
-            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
+            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} dx={} refused={} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
             r(fifo::MIN),
             r(fifo::MAX),
             r(fifo::NEXT_CMD),
@@ -375,6 +379,8 @@ impl Svga {
             r(fifo::CURSOR_Y),
             r(fifo::CURSOR_COUNT),
             state.stats.commands,
+            state.stats.dx,
+            state.stats.dx_refused,
             state.cb.completed,
             state.cb.failed,
             state.fifo_error,
@@ -477,7 +483,7 @@ impl Svga {
             });
             let progressed = !commands.is_empty();
             for command in commands {
-                self.execute(state, command);
+                self.execute(state, command, None);
             }
             if progressed {
                 let mask = state.regs.irq_mask();
@@ -492,14 +498,17 @@ impl Svga {
         }
     }
 
-    pub(crate) fn execute(&self, state: &mut State, command: Command) {
+    /// Executes a command; `dx_context`: the DX context of its command
+    /// buffer, if any.
+    pub(crate) fn execute(&self, state: &mut State, command: Command, dx_context: Option<u32>) {
         state.stats.commands = state.stats.commands.saturating_add(1);
         if trace_level() >= 1 {
             match &command {
                 Command::Fence(value) => trace(format!("FIFO Fence({value:#x})")),
                 // Guest-backed commands are traced by name below.
-                Command::Command3d { id, payload, .. }
-                    if svga_core::gb::parse(*id, payload).is_some() => {}
+                Command::Command3d { id, size, payload }
+                    if svga_core::gb::parse(*id, payload).is_some()
+                        || svga_core::dx::parse(*id, *size, payload).is_some() => {}
                 other => trace(format!("FIFO {}", command_name(other))),
             }
         }
@@ -519,6 +528,27 @@ impl Svga {
                 });
             if let Err(error) = result {
                 trace(format!("GB command {id} failed: {error}"));
+            }
+            return;
+        }
+        if let Command::Command3d { id, size, payload } = &command
+            && let Some(parsed) = svga_core::dx::parse(*id, *size, payload)
+        {
+            // Decoded only: execution comes with the renderer (M3).
+            match parsed {
+                Ok(dx_command) => {
+                    state.stats.dx = state.stats.dx.saturating_add(1);
+                    if trace_level() >= 1 {
+                        let mut text = format!("{dx_command:?}");
+                        text.truncate(200);
+                        let context = dx_context.map_or("-".to_string(), |c| c.to_string());
+                        trace(format!("DX {context} {text}"));
+                    }
+                }
+                Err(error) => {
+                    state.stats.dx_refused = state.stats.dx_refused.saturating_add(1);
+                    trace(format!("DX command refused: {error}"));
+                }
             }
             return;
         }
@@ -1280,6 +1310,34 @@ mod tests {
         assert_eq!(word(0x80), cb::status::COMPLETED, "queued buffer ran");
         assert_eq!(h.0.fifo.load_u32(fifo::FENCE as usize), 0x44);
 
+        // DX commands of a DX context's buffer are decoded (not executed
+        // yet); one with nine render targets is refused.
+        let mut dx = vec![svga_proto::cmd3d::DX_SET_TOPOLOGY, 4, 1];
+        dx.extend([svga_proto::cmd3d::DX_SET_RENDERTARGETS, 40]);
+        dx.extend([u32::MAX; 10]);
+        put(0x1400, &dx);
+        let length = 4 * dx.len() as u32;
+        put(
+            0x180,
+            &[
+                cb::status::NONE,
+                0,
+                2,
+                0,
+                cb::flag::DX_CONTEXT,
+                length,
+                0x10_1400,
+                0,
+            ],
+        );
+        put(0x180 + 32, &[0, 7, 0, 0, 0, 0, 0, 0]);
+        submit(&mut h, 0x180, cb::context::CONTEXT_0);
+        assert_eq!(word(0x180), cb::status::COMPLETED);
+        {
+            let state = h.0.lock();
+            assert_eq!((state.stats.dx, state.stats.dx_refused), (1, 1));
+        }
+
         // Bad headers and contexts are refused, not run.
         header(0x100, 6, 0x10_1200);
         submit(&mut h, 0x100, cb::context::CONTEXT_0);
@@ -1288,7 +1346,7 @@ mod tests {
         submit(&mut h, 0x140, 5);
         assert_eq!(word(0x140), cb::status::SUBMISSION_ERROR);
         let state = h.0.lock();
-        assert_eq!((state.cb.completed, state.cb.failed), (3, 3));
+        assert_eq!((state.cb.completed, state.cb.failed), (4, 3));
     }
 
     #[test]

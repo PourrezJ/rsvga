@@ -28,3 +28,10 @@ path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dx"
+path = "fuzz_targets/dx.rs"
+test = false
+doc = false
+bench = false

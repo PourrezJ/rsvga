@@ -25,7 +25,7 @@ GPU de l'hôte   : RX 6950 XT, via /dev/dri/renderD*
 | Crate | Rôle | Jalon |
 |---|---|---|
 | `svga-proto` | Constantes du protocole VMware, transcrites des en-têtes MIT du *SVGA Device Developer Kit*. `no_std`, sans code. | M0 |
-| `svga-core` | Logique pure du périphérique : FIFO, décodage des commandes, registres, objets. Sans I/O et sans `unsafe`. | M0 → M2 |
+| `svga-core` | Logique pure du périphérique : FIFO, décodage des commandes (2D, objets guest-backed, DX), registres, objets. Sans I/O et sans `unsafe`. | M0 → M3 |
 | `svga-render` | Moteur Vulkan et traducteur de shaders VGPU10 (bytecode SM4/SM5) vers SPIR-V. | M3 → M4 |
 | `vfio-user` | Protocole vfio-user côté serveur : messages, passage de descripteurs, boucle de requêtes. Sans `unsafe`. | M1 |
 | `rsvga-server` | Binaire : config PCI, BAR partagés (memfd scellés), ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre. Seul `shm.rs` contient de l'`unsafe`. | M1 |
@@ -111,7 +111,7 @@ La 3D reste derrière les variables de sonde (`RSVGA_PROBE_CAPS=9dc6c222 RSVGA_P
 
 ### Plan
 
-1. **Décodage des commandes DX** dans `svga-core` : les 52 que DWM envoie d'abord (contexte, COTables, `DEFINE/SET` des états, vues et shaders, `BUFFER_UPDATE`, `TRANSFER_FROM_BUFFER`, `UPDATE_SUBRESOURCE`, `PRED_COPY(_REGION)`, `CLEAR_RENDERTARGET_VIEW`, `DRAW(_INDEXED)(_INSTANCED)`, requêtes, `MOB_FENCE_64`), puis le reste du jeu DX, avec fuzzing.
+1. **Décodage des commandes DX** (fait) : `svga-core/src/dx.rs` décode 90 commandes DX : celles de DirectX 10/10.1 (contextes, tables d'objets, états, vues, shaders, liaisons, dessins, copies, requêtes, fences, transferts), plus les variantes `_V2`, `GROW_COTABLE` et les copies de résolution et de conversion. Chaque champ est typé, chaque tableau borné par les limites de Direct3D (8 cibles, 32 tampons de sommets, 128 vues...), les énumérations fermées vérifiées ; tests et cible de fuzzing (`fuzz/run.sh dx`). Le serveur décode et trace (`DX <contexte> <commande>`) sans exécuter encore. Vérifié avec DWM : 26 701 commandes en une minute de bureau, sur 6 contextes, aucune refusée ni inconnue. Les commandes du shader model 5 (UAV, calcul, dessins indirects) viendront avec M4.
 2. **`svga-render`** (Vulkan via `ash`, sur la RX 6950 XT) : surfaces en `VkImage`/`VkBuffer` gardées cohérentes avec leurs copies invitées (envoi aux `UPDATE`, relecture aux `READBACK`), vues, objets d'état, pipelines (rendu dynamique), synchronisation avec les fences du pilote.
 3. **Traducteur de shaders VGPU10 → SPIR-V** : bytecode SM4.1 (VS et PS d'abord, GS ensuite), validé par `spirv-val`.
 4. **Présentation** : Screen Targets alimentés depuis le GPU (copie vers la fenêtre d'abord, dmabuf plus tard).
