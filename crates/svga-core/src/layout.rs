@@ -131,6 +131,11 @@ impl SurfaceLayout {
         self.size
     }
 
+    /// Samples per pixel (1: not multisampled).
+    pub fn samples(&self) -> u32 {
+        self.samples
+    }
+
     /// Number of mip levels.
     pub fn mip_levels(&self) -> u32 {
         u32::try_from(self.mip_offsets.len().saturating_sub(1)).unwrap_or(0)

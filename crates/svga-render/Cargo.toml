@@ -1,0 +1,22 @@
+[package]
+name = "svga-render"
+description = "Vulkan backend of the rsvga device: surfaces on the host GPU"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ash = "0.38"
+svga-core = { path = "../svga-core" }
+svga-proto = { path = "../svga-proto" }
+
+# Vulkan is reached through `unsafe` calls: every block says why it holds.
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"

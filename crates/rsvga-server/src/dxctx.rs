@@ -253,7 +253,6 @@ impl DxContexts {
     }
 
     /// Context `cid`.
-    #[allow(dead_code, reason = "read by the renderer, next step of M3")]
     pub fn context(&self, cid: u32) -> Option<&Context> {
         self.contexts.get(&cid)
     }

@@ -160,6 +160,9 @@ impl Svga {
         for entry in entries {
             self.execute(state, entry.command, dx_context);
         }
+        if let Some(gpu) = state.gpu.as_mut() {
+            gpu.flush();
+        }
         match error {
             None => finish(state, pa, header, cb::status::COMPLETED, 0),
             Some((offset, error)) => {

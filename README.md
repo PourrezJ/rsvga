@@ -6,7 +6,7 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M2 atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D) en cours** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu, que rsvga n'exécute pas encore. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M2 atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D) en cours** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu ; rsvga les décode, garde l'état des contextes et exécute déjà effacements et copies sur le GPU de l'hôte (Vulkan). Les dessins viendront avec le traducteur de shaders. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
@@ -111,10 +111,11 @@ target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/
 - `svga-proto` : registres, FIFO, capacités et identifiants de commandes du protocole VMware SVGA II.
 - `svga-core` : FIFO validée, décodage de toutes les commandes 2D et de l'encadrement 3D, registres SVGA (modes, ID, palette...). Rust sûr, borné, protégé contre un invité qui modifierait une commande pendant sa lecture.
 - `vfio-user` : protocole vfio-user côté serveur, avec passage de descripteurs de fichiers.
+- `svga-render` : moteur Vulkan (`ash`) : surfaces de l'invité sur le GPU de l'hôte, effacements et copies. `RSVGA_GPU=<partie du nom>` choisit le GPU (par défaut le plus gros GPU dédié).
 - `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
 - `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
 - `guest/d3dprobe` : sonde Direct3D côté Windows.
-- 137 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; trois cibles de fuzzing.
+- 145 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; trois cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
 

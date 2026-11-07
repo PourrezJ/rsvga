@@ -15,6 +15,7 @@ rustix = { version = "1.1.6", features = ["event", "fs", "mm", "std"] }
 softbuffer = { version = "0.4", optional = true }
 svga-core = { path = "../svga-core" }
 svga-proto = { path = "../svga-proto" }
+svga-render = { path = "../svga-render" }
 vfio-user = { path = "../vfio-user" }
 winit = { version = "0.30", optional = true }
 

@@ -52,6 +52,8 @@ struct Mob {
 
 struct Surface {
     layout: SurfaceLayout,
+    /// `SVGA3D_SURFACE_*` flags.
+    flags: u64,
     mob: Option<u32>,
     /// Row pitch of the base level in the MOB; 0: tightly packed.
     mob_pitch: u64,
@@ -261,6 +263,25 @@ impl Gb {
 
     /// Makes sure the device copy of `sid` exists: loaded from its MOB, or
     /// zeroes if it has none (or if the MOB does not cover the surface).
+    /// Layout and `SVGA3D_SURFACE_*` flags of surface `sid`.
+    pub(crate) fn surface_shape(&self, sid: u32) -> Option<(SurfaceLayout, u64)> {
+        self.surfaces.get(&sid).map(|s| (s.layout.clone(), s.flags))
+    }
+
+    /// The device copy of surface `sid`, created (from its MOB) if needed.
+    pub(crate) fn host_copy(&mut self, guest: &GuestMemory, sid: u32) -> Result<&mut [u8], String> {
+        self.ensure_host(guest, sid)?;
+        self.surfaces
+            .get_mut(&sid)
+            .and_then(|s| s.host.as_deref_mut())
+            .ok_or_else(|| format!("surface {sid} has no device copy"))
+    }
+
+    /// The surface screen target `stid` shows, if any.
+    pub(crate) fn target_surface(&self, stid: u32) -> Option<u32> {
+        self.targets.get(&stid)?.image.map(|image| image.sid)
+    }
+
     fn ensure_host(&mut self, guest: &GuestMemory, sid: u32) -> Result<(), String> {
         let s = self
             .surfaces
@@ -366,6 +387,7 @@ impl Gb {
             def.sid,
             Surface {
                 layout,
+                flags: def.flags,
                 mob: None,
                 mob_pitch: 0,
                 host: None,

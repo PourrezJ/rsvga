@@ -14,6 +14,7 @@ mod device;
 mod display;
 mod dxctx;
 mod gb;
+mod gpu;
 mod guest;
 mod irq;
 mod pci;

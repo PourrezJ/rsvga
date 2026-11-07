@@ -192,6 +192,8 @@ pub struct State {
     pub gb: crate::gb::Gb,
     /// DirectX contexts.
     pub dx: crate::dxctx::DxContexts,
+    /// The host GPU (with 3D), and where each surface's newest copy is.
+    pub gpu: Option<crate::gpu::Gpu>,
     /// The INTx line.
     pub irq: Intx,
     /// Command buffer contexts.
@@ -243,6 +245,23 @@ fn probe_env(name: &str) -> Option<u32> {
     let value = u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()?;
     log!("PROBE {name} = {value:#x}: advertised, not implemented");
     Some(value)
+}
+
+/// The host GPU, when the device advertises 3D: rendering needs it.
+fn open_gpu(three_d: bool) -> Option<crate::gpu::Gpu> {
+    if !three_d {
+        return None;
+    }
+    match crate::gpu::Gpu::new() {
+        Ok(gpu) => {
+            log!("GPU: {}", gpu.name());
+            Some(gpu)
+        }
+        Err(e) => {
+            log!("GPU unavailable, 3D commands will not run: {e}");
+            None
+        }
+    }
 }
 
 /// Capabilities this run advertises: [`CAPABILITIES`], unless
@@ -314,6 +333,7 @@ impl Svga {
         regs.set_devcaps(crate::devcaps::table(
             regs.config().capabilities & cap::THREE_D != 0,
         ));
+        let three_d = regs.config().capabilities & cap::THREE_D != 0;
         let state = State {
             regs,
             pci: PciConfig::new(opts.vram_size, opts.fifo_size, rom_bar),
@@ -328,6 +348,7 @@ impl Svga {
                 max_width: opts.max_width,
                 max_height: opts.max_height,
             }),
+            gpu: open_gpu(three_d),
             dx: crate::dxctx::DxContexts::new(crate::dxctx::Limits {
                 contexts: crate::devcaps::MAX_CONTEXT_IDS,
                 code_bytes: DX_CODE_BYTES,
@@ -500,6 +521,9 @@ impl Svga {
             for command in commands {
                 self.execute(state, command, None);
             }
+            if let Some(gpu) = state.gpu.as_mut() {
+                gpu.flush();
+            }
             if progressed {
                 let mask = state.regs.irq_mask();
                 state.irq.raise(irq::FIFO_PROGRESS, mask);
@@ -530,7 +554,7 @@ impl Svga {
         if let Command::Command3d { id, payload, .. } = &command
             && let Some(parsed) = svga_core::gb::parse(*id, payload)
         {
-            let State { gb, guest, .. } = state;
+            let State { gb, guest, gpu, .. } = state;
             let result = parsed
                 .map_err(|short| short.to_string())
                 .and_then(|gb_command| {
@@ -539,7 +563,15 @@ impl Svga {
                         text.truncate(160);
                         trace(format!("GB {text}"));
                     }
-                    gb.execute(gb_command, guest)
+                    // GPU copies the command reads come back first.
+                    let Some(gpu) = gpu.as_mut() else {
+                        return gb.execute(gb_command, guest);
+                    };
+                    gpu.before_gb(&gb_command, gb, guest)?;
+                    let effects = gb_command.clone();
+                    gb.execute(gb_command, guest)?;
+                    gpu.after_gb(&effects, gb);
+                    Ok(())
                 });
             if let Err(error) = result {
                 trace(format!("GB command {id} failed: {error}"));
@@ -554,6 +586,7 @@ impl Svga {
                 gb,
                 guest,
                 stats,
+                gpu,
                 ..
             } = state;
             let result = parsed.map_err(|e| e.to_string()).and_then(|dx_command| {
@@ -563,7 +596,21 @@ impl Svga {
                     let context = dx_context.map_or("-".to_string(), |c| c.to_string());
                     trace(format!("DX {context} {text}"));
                 }
-                dx.execute(dx_command, dx_context, gb, guest)
+                let Some(gpu) = gpu.as_mut() else {
+                    return dx.execute(dx_command, dx_context, gb, guest);
+                };
+                gpu.before_dx(&dx_command, gb, guest)?;
+                let command = dx_command.clone();
+                let outcome = dx.execute(dx_command, dx_context, gb, guest)?;
+                gpu.after_dx(&command);
+                if outcome == crate::dxctx::Outcome::Deferred && crate::gpu::runs_on_gpu(&command) {
+                    let context = dx_context
+                        .and_then(|cid| dx.context(cid))
+                        .ok_or("DX command outside a DX context")?;
+                    gpu.execute_dx(&command, context, gb, guest)?;
+                    return Ok(crate::dxctx::Outcome::Done);
+                }
+                Ok(outcome)
             });
             match result {
                 Ok(crate::dxctx::Outcome::Done) => stats.dx = stats.dx.saturating_add(1),
@@ -1021,6 +1068,9 @@ impl Device for Handle {
         state.twod.reset();
         state.gb.reset();
         state.dx.reset();
+        if let Some(gpu) = state.gpu.as_mut() {
+            gpu.reset();
+        }
         state.cb.reset();
         state.fifo_error = None;
         state.last_mode = None;

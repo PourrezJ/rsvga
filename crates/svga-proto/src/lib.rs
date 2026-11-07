@@ -661,6 +661,20 @@ pub mod stflag {
 pub mod surface_flag {
     /// Six faces per layer.
     pub const CUBEMAP: u64 = 1 << 0;
+    /// A 3D texture.
+    pub const VOLUME: u64 = 1 << 15;
+    /// Shown by a screen target.
+    pub const SCREENTARGET: u64 = 1 << 16;
+    /// A 1D texture.
+    pub const ONE_D: u64 = 1 << 18;
+    /// A texture array.
+    pub const ARRAY: u64 = 1 << 19;
+    /// Usable as a render target.
+    pub const BIND_RENDER_TARGET: u64 = 1 << 24;
+    /// Usable as a depth-stencil target.
+    pub const BIND_DEPTH_STENCIL: u64 = 1 << 25;
+    /// Multisampled.
+    pub const MULTISAMPLE: u64 = 1 << 32;
 }
 
 /// Flags of `SVGA_3D_CMD_COND_BIND_GB_SURFACE`.
