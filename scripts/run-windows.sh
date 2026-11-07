@@ -11,7 +11,14 @@
 #
 # Usage:
 #   scripts/run-windows.sh --disk WINDOWS.qcow2 --vars OVMF_VARS.fd \
-#       [--overlay FILE] [--mem 6144] [--cpus 4] [--trace]
+#       [--overlay FILE] [--mem 6144] [--cpus 4] [--trace] [--diagnose]
+#
+# --diagnose saves each guest cursor and a screen capture per second in
+# the overlay's folder (cursors/, screen.png).
+#
+# A QEMU (HMP) monitor listens on $XDG_RUNTIME_DIR/rsvga-vm-hmp.sock, to look
+# at a stuck guest from outside, e.g.:
+#   echo 'info registers' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/rsvga-vm-hmp.sock
 #
 # Requires: target/qemu/install (build-qemu.sh), target/firmware (build-firmware.sh),
 # and rsvga built with the window: cargo build --release -p rsvga-server --features window
@@ -23,7 +30,7 @@ rsvga=$root/target/release/rsvga
 rom=$root/target/firmware/rsvga-gop.efi
 ovmf_code=/usr/share/OVMF/OVMF_CODE_4M.fd
 
-disk= vars= overlay=$root/target/vm/overlay.qcow2 mem=6144 cpus=4 trace=0
+disk= vars= overlay=$root/target/vm/overlay.qcow2 mem=6144 cpus=4 trace=0 diagnose=0
 while (($#)); do
   case $1 in
     --disk) disk=$2; shift 2 ;;
@@ -32,10 +39,11 @@ while (($#)); do
     --mem) mem=$2; shift 2 ;;
     --cpus) cpus=$2; shift 2 ;;
     --trace) trace=1; shift ;;
-    *) sed -n '2,17p' "$0"; exit 2 ;;
+    --diagnose) diagnose=1; trace=1; shift ;;
+    *) sed -n '2,22p' "$0"; exit 2 ;;
   esac
 done
-[[ -n $disk && -n $vars ]] || { sed -n '2,17p' "$0"; exit 2; }
+[[ -n $disk && -n $vars ]] || { sed -n '2,22p' "$0"; exit 2; }
 for f in "$qemu" "$rsvga" "$rom" "$ovmf_code" "$disk" "$vars"; do
   [[ -e $f ]] || { echo "missing: $f" >&2; exit 1; }
 done
@@ -61,13 +69,18 @@ nvram=${overlay%.qcow2}.vars.fd
 [[ -e $nvram ]] || cp "$vars" "$nvram"
 
 run=${XDG_RUNTIME_DIR:-/tmp}
-sock=$run/rsvga-vm.sock qmp=$run/rsvga-vm-qmp.sock
-rm -f "$sock" "$qmp"
+sock=$run/rsvga-vm.sock qmp=$run/rsvga-vm-qmp.sock hmp=$run/rsvga-vm-hmp.sock
+rm -f "$sock" "$qmp" "$hmp"
 
-RSVGA_TRACE=$trace "$rsvga" --socket "$sock" --rom "$rom" --window --qmp "$qmp" \
+extra=()
+if ((diagnose)); then
+  export RSVGA_CURSOR_DUMP=$state/cursors
+  extra=(--snapshot "$state/screen.png")
+fi
+RSVGA_TRACE=$trace "$rsvga" --socket "$sock" --rom "$rom" --window --qmp "$qmp" "${extra[@]}" \
   2> "$state/rsvga.log" &
 rsvga_pid=$!
-trap 'kill $rsvga_pid 2>/dev/null; rm -f "$sock" "$qmp"' EXIT
+trap 'kill $rsvga_pid 2>/dev/null; rm -f "$sock" "$qmp" "$hmp"' EXIT
 for _ in $(seq 50); do [[ -S $sock ]] && break; sleep 0.1; done
 
 echo "Windows starts in the rsvga window (logs: $state/rsvga.log)."
@@ -82,5 +95,5 @@ echo "Windows starts in the rsvga window (logs: $state/rsvga.log)."
   -device ide-hd,drive=osdisk,bus=sata.0 \
   -device qemu-xhci -device usb-tablet \
   -netdev user,id=net0 -device e1000e,netdev=net0 \
-  -qmp "unix:$qmp,server=on,wait=off" \
+  -qmp "unix:$qmp,server=on,wait=off" -monitor "unix:$hmp,server=on,wait=off" \
   -device "{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$sock\"}}"

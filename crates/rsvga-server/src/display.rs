@@ -17,54 +17,87 @@ pub struct Frame {
     pub pixels: Vec<u32>,
 }
 
+/// Result of [`Svga::capture`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shown {
+    /// The displayed mode.
+    pub mode: Mode,
+    /// Whether `frame` changed during this capture.
+    pub changed: bool,
+}
+
 impl Svga {
-    /// Copies the visible framebuffer into `frame`. Returns the mode, or
-    /// `None` when SVGA mode is off (the frame is left untouched).
-    pub fn capture(&self, frame: &mut Frame) -> Option<Mode> {
-        let state = self.lock();
+    /// Brings `frame` up to date with the guest display. Only the area the
+    /// guest reported as changed is copied, unless the guest writes the
+    /// framebuffer without telling us (FIFO off, firmware, traces on), in
+    /// which case the whole screen is read. `None` when SVGA mode is off.
+    pub fn capture(&self, frame: &mut Frame) -> Option<Shown> {
+        let mut state = self.lock();
         if state.twod.capture(frame) {
             // Screen objects replace the legacy framebuffer when defined.
-            return Some(Mode {
+            let mode = Mode {
                 width: frame.width as u32,
                 height: frame.height as u32,
                 bits_per_pixel: 32,
                 pitch: frame.width as u32 * 4,
                 offset: 0,
+            };
+            return Some(Shown {
+                mode,
+                changed: true,
             });
         }
         let mode = state.regs.mode()?;
+        let resized = frame.width != mode.width as usize || frame.height != mode.height as usize;
+        let untracked = !state.regs.config_done() || state.regs.traces();
+        if resized || untracked {
+            state.damage.all();
+        }
+        let area = state.damage.take(mode.width, mode.height);
         drop(state);
+
         let (width, height) = (mode.width as usize, mode.height as usize);
         frame.width = width;
         frame.height = height;
         frame.pixels.resize(width * height, 0);
+        let Some((x0, y0, x1, y1)) = area else {
+            return Some(Shown {
+                mode,
+                changed: false,
+            });
+        };
+        let (x0, x1) = (x0 as usize, x1 as usize);
         let vram = self.vram();
         let (offset, pitch) = (mode.offset as usize, mode.pitch as usize);
-        for (y, row) in frame.pixels.chunks_exact_mut(width).enumerate() {
+        for y in y0 as usize..y1 as usize {
+            let row = &mut frame.pixels[y * width + x0..y * width + x1];
             let line = offset + y * pitch;
             match mode.bits_per_pixel {
                 32 if line % 4 == 0 => {
-                    for (x, pixel) in row.iter_mut().enumerate() {
+                    for (x, pixel) in (x0..x1).zip(row.iter_mut()) {
                         *pixel = vram.load_u32(line / 4 + x) & 0x00ff_ffff;
                     }
                 }
                 32 => {
                     let mut bytes = [0u8; 4];
-                    for (x, pixel) in row.iter_mut().enumerate() {
+                    for (x, pixel) in (x0..x1).zip(row.iter_mut()) {
                         vram.read(line + 4 * x, &mut bytes);
                         *pixel = u32::from_le_bytes(bytes) & 0x00ff_ffff;
                     }
                 }
                 _ => {
                     let mut bytes = [0u8; 2];
-                    for (x, pixel) in row.iter_mut().enumerate() {
+                    for (x, pixel) in (x0..x1).zip(row.iter_mut()) {
                         vram.read(line + 2 * x, &mut bytes);
                         *pixel = rgb565_to_888(u16::from_le_bytes(bytes));
                     }
                 }
             }
         }
-        Some(mode)
+        Some(Shown {
+            mode,
+            changed: true,
+        })
     }
 }
 

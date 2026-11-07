@@ -6,6 +6,8 @@
 //!     "socket":{"type":"unix","path":"/run/user/1000/rsvga.sock"}}'
 //! ```
 
+mod cursor;
+mod damage;
 mod device;
 mod display;
 mod guest;
@@ -14,6 +16,8 @@ mod pci;
 #[cfg(any(feature = "window", test))]
 mod qmp;
 mod rom;
+#[cfg(any(feature = "window", test))]
+mod scale;
 mod shm;
 mod twod;
 #[cfg(feature = "window")]
@@ -163,11 +167,13 @@ fn main() {
             match stream {
                 Ok(stream) => {
                     log!("client connected");
+                    served.set_client(true);
                     let mut handle = Handle(served.clone());
                     match vfio_user::serve(stream, &mut handle) {
                         Ok(()) => log!("client disconnected"),
                         Err(error) => log!("connection closed: {error}"),
                     }
+                    served.set_client(false);
                     let _ = vfio_user::Device::reset(&mut handle);
                 }
                 Err(error) => log!("accept failed: {error}"),

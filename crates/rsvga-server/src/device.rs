@@ -10,12 +10,14 @@ use std::time::Duration;
 
 use svga_core::command::{Command, Rect};
 use svga_core::{Config, Effect, FifoMemory, Limits, Mode, Registers, Snapshot, StopReason, run};
-use svga_proto::{cap, fifo, fifo_cap, irq, port};
+use svga_proto::{cap, cursor_on, fifo, fifo_cap, irq, port};
 use vfio_user::wire::{
     Errno, device_flags, irq_info_flags, irq_set_flags, pci_irq, pci_region, region_flags,
 };
 use vfio_user::{Device, DeviceInfo, DmaMapping, IrqInfo, IrqSet, RegionInfo};
 
+use crate::cursor::{self as guest_cursor, CursorImage};
+use crate::damage::Damage;
 use crate::guest::GuestMemory;
 use crate::irq::Intx;
 use crate::log;
@@ -24,7 +26,12 @@ use crate::shm::SharedMem;
 use crate::twod::{Memory, TwoD};
 
 /// Device capabilities advertised in `SVGA_REG_CAPABILITIES` (M1: 2D only).
-pub const CAPABILITIES: u32 = cap::RECT_COPY | cap::EXTENDED_FIFO | cap::PITCHLOCK | cap::IRQMASK;
+pub const CAPABILITIES: u32 = cap::RECT_COPY
+    | cap::CURSOR
+    | cap::ALPHA_CURSOR
+    | cap::EXTENDED_FIFO
+    | cap::PITCHLOCK
+    | cap::IRQMASK;
 /// GMR limits advertised to the guest (64 regions, 1 GiB of pages).
 pub const GMR_MAX_IDS: u32 = 64;
 /// Total pages across all GMRs.
@@ -33,7 +40,7 @@ pub const GMR_MAX_PAGES: u32 = 256 * 1024;
 pub const GMR_MEMORY_SIZE: u32 = 1 << 30;
 
 /// FIFO capabilities written into `SVGA_FIFO_CAPABILITIES`.
-pub const FIFO_CAPABILITIES: u32 = fifo_cap::FENCE;
+pub const FIFO_CAPABILITIES: u32 = fifo_cap::FENCE | fifo_cap::CURSOR_BYPASS_3;
 
 /// Commands handled per FIFO pass, and passes per processing request: the
 /// guest cannot keep the device busy forever.
@@ -68,6 +75,24 @@ fn trace(line: String) {
     }
     log!("{line}");
     *last = (line, 0);
+}
+
+/// Diagnosis aid: with `RSVGA_CURSOR_DUMP=DIR`, saves each distinct guest
+/// cursor as `DIR/cursor-<fingerprint>.png` (over a checkerboard).
+fn dump_cursor(image: &CursorImage, print: u32) {
+    let Some(dir) = std::env::var_os("RSVGA_CURSOR_DUMP") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join(format!("cursor-{print:08x}.png"));
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let result = std::fs::File::create(&path)
+        .and_then(|mut file| crate::display::write_png(&mut file, &image.on_checkerboard()));
+    if let Err(error) = result {
+        log!("cannot save {}: {error}", path.display());
+    }
 }
 
 /// Short name of a command, for logs.
@@ -130,6 +155,11 @@ pub struct State {
     pub twod: TwoD,
     /// The INTx line.
     pub irq: Intx,
+    /// Framebuffer area changed since the display last copied it.
+    pub damage: Damage,
+    /// Last cursor image defined by the guest, and a counter of definitions.
+    cursor: Option<Arc<CursorImage>>,
+    cursor_serial: u64,
     /// Stops the thread watching QEMU's INTx unmask eventfd.
     unmask_watch: Option<Arc<AtomicBool>>,
     /// Counters.
@@ -142,6 +172,9 @@ pub struct Svga {
     fifo: SharedMem,
     state: Mutex<State>,
     limits: Limits,
+    /// Whether a VMM is connected, and whether one ever was.
+    client_connected: AtomicBool,
+    client_seen: AtomicBool,
     /// Expansion ROM image (empty: no ROM) and the size of its BAR.
     rom: Vec<u8>,
     rom_bar: u32,
@@ -195,6 +228,9 @@ impl Svga {
             guest: GuestMemory::default(),
             twod: TwoD::new(GMR_MAX_IDS, GMR_MAX_PAGES, opts.max_width, opts.max_height),
             irq: Intx::default(),
+            damage: Damage::default(),
+            cursor: None,
+            cursor_serial: 0,
             unmask_watch: None,
             stats: Stats::default(),
         };
@@ -205,6 +241,8 @@ impl Svga {
             limits: Limits::default(),
             rom,
             rom_bar,
+            client_connected: AtomicBool::new(false),
+            client_seen: AtomicBool::new(false),
         }))
     }
 
@@ -216,12 +254,26 @@ impl Svga {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Records that the VMM connected or disconnected.
+    pub fn set_client(&self, connected: bool) {
+        self.client_connected.store(connected, Ordering::Relaxed);
+        if connected {
+            self.client_seen.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the VMM was connected and has gone (the VM stopped).
+    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    pub fn client_gone(&self) -> bool {
+        self.client_seen.load(Ordering::Relaxed) && !self.client_connected.load(Ordering::Relaxed)
+    }
+
     /// One-line summary of the FIFO registers, for traces.
     pub fn fifo_status(&self) -> String {
         let r = |i: u32| self.fifo.load_u32(reg_index(i));
         let state = self.lock();
         format!(
-            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | commands={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
+            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
             r(fifo::MIN),
             r(fifo::MAX),
             r(fifo::NEXT_CMD),
@@ -229,6 +281,10 @@ impl Svga {
             r(fifo::FENCE),
             r(fifo::BUSY),
             r(fifo::CAPABILITIES),
+            r(fifo::CURSOR_ON),
+            r(fifo::CURSOR_X),
+            r(fifo::CURSOR_Y),
+            r(fifo::CURSOR_COUNT),
             state.stats.commands,
             state.fifo_error,
             state.regs.irq_mask(),
@@ -264,6 +320,7 @@ impl Svga {
             Effect::ModeChanged => {
                 // Writing the legacy mode registers destroys screen objects.
                 state.twod.clear_screens();
+                state.damage.all();
                 let mode = state.regs.mode();
                 if mode != state.last_mode {
                     match mode {
@@ -359,14 +416,29 @@ impl Svga {
             }
         }
         match command {
-            Command::Update(_) | Command::UpdateVerbose { .. } => {
-                // The display loop refreshes the whole framebuffer anyway.
+            Command::Update(rect) | Command::UpdateVerbose { rect, .. } => {
                 state.stats.updates = state.stats.updates.saturating_add(1);
+                state.damage.add(rect.x, rect.y, rect.width, rect.height);
             }
             Command::RectCopy { src_x, src_y, dst } => {
                 if let Some(mode) = state.regs.mode() {
                     self.rect_copy(mode, src_x, src_y, dst);
+                    state.damage.add(dst.x, dst.y, dst.width, dst.height);
                 }
+            }
+            Command::DefineAlphaCursor {
+                hotspot_x,
+                hotspot_y,
+                width,
+                height,
+                pixels,
+            } => {
+                let image = guest_cursor::from_alpha(width, height, hotspot_x, hotspot_y, &pixels);
+                self.set_cursor(state, image);
+            }
+            Command::DefineCursor(cursor) => {
+                let image = guest_cursor::from_masks(&cursor);
+                self.set_cursor(state, image);
             }
             Command::Fence(value) => {
                 let mut view = FifoView(&self.fifo);
@@ -393,12 +465,49 @@ impl Svga {
                     trace(format!("FIFO unsupported: {text}"));
                 } else if state.stats.unsupported == 0 {
                     log!(
-                        "ignoring unsupported command {other:?} (further ones are counted silently)"
+                        "ignoring unsupported command {} (further ones are counted silently)",
+                        command_name(&other)
                     );
                 }
                 state.stats.unsupported = state.stats.unsupported.saturating_add(1);
             }
         }
+    }
+
+    fn set_cursor(&self, state: &mut State, image: Option<CursorImage>) {
+        match image {
+            Some(image) => {
+                let print = image.fingerprint();
+                trace(format!(
+                    "guest cursor {}x{}, hotspot ({}, {}), image {print:08x}",
+                    image.width, image.height, image.hot_x, image.hot_y
+                ));
+                dump_cursor(&image, print);
+                state.cursor = Some(Arc::new(image));
+                state.cursor_serial = state.cursor_serial.wrapping_add(1);
+            }
+            None => trace("cursor definition ignored (unsupported format)".into()),
+        }
+    }
+
+    /// The guest cursor: a change counter, the image, and whether the guest
+    /// shows it. Visibility comes from the FIFO cursor registers once the
+    /// guest has used them (`CURSOR_COUNT` != 0); before that, shown.
+    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    pub fn cursor(&self) -> (u64, Option<Arc<CursorImage>>, bool) {
+        let state = self.lock();
+        let view = FifoView(&self.fifo);
+        let visible = match Snapshot::capture(&view) {
+            Ok(snap)
+                if state.regs.config_done()
+                    && snap.has_register(fifo::CURSOR_COUNT)
+                    && view.load(reg_index(fifo::CURSOR_COUNT)) != 0 =>
+            {
+                view.load(reg_index(fifo::CURSOR_ON)) != cursor_on::HIDE
+            }
+            _ => true,
+        };
+        (state.cursor_serial, state.cursor.clone(), visible)
     }
 
     /// Copies a rectangle inside the framebuffer. Rectangles that leave the
@@ -911,6 +1020,52 @@ mod tests {
             "no new signal"
         );
         assert_eq!(h.irq_info(pci_irq::INTX).unwrap().count, 1);
+    }
+
+    #[test]
+    fn only_reported_damage_is_copied() {
+        use crate::display::Frame;
+        let mut h = device();
+        set(&mut h, reg::WIDTH, 64);
+        set(&mut h, reg::HEIGHT, 64);
+        set(&mut h, reg::BITS_PER_PIXEL, 32);
+        set(&mut h, reg::ENABLE, 1);
+        enable_fifo(&mut h);
+        let mut frame = Frame::default();
+        assert!(
+            h.0.capture(&mut frame).unwrap().changed,
+            "first frame: everything"
+        );
+        assert!(
+            !h.0.capture(&mut frame).unwrap().changed,
+            "nothing reported"
+        );
+        h.0.vram.store_u32(64 + 1, 0x11); // (1, 1): inside the update
+        h.0.vram.store_u32(10 * 64 + 10, 0x22); // (10, 10): not reported
+        push(&h, &[cmd::UPDATE, 1, 1, 2, 2]);
+        set(&mut h, reg::SYNC, 1);
+        assert!(h.0.capture(&mut frame).unwrap().changed);
+        assert_eq!(frame.pixels[64 + 1], 0x11);
+        assert_eq!(
+            frame.pixels[10 * 64 + 10],
+            0,
+            "outside the update: not copied"
+        );
+    }
+
+    #[test]
+    fn the_guest_cursor_and_its_visibility() {
+        let mut h = device();
+        enable_fifo(&mut h);
+        assert_eq!(h.0.cursor().0, 0);
+        push(&h, &[cmd::DEFINE_ALPHA_CURSOR, 0, 0, 0, 1, 1, 0xff00_00ff]);
+        set(&mut h, reg::SYNC, 1);
+        let (serial, image, visible) = h.0.cursor();
+        assert_eq!((serial, visible), (1, true));
+        assert_eq!(image.unwrap().rgba, [0, 0, 255, 255]);
+        h.0.fifo.store_u32(fifo::CURSOR_COUNT as usize, 1);
+        h.0.fifo.store_u32(fifo::CURSOR_ON as usize, 0);
+        assert!(!h.0.cursor().2, "hidden by the guest");
     }
 
     #[test]

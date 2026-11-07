@@ -85,7 +85,14 @@ fn coalesce(events: Vec<Input>) -> Vec<Input> {
 /// Queue of input events, sent by a background thread.
 #[derive(Clone)]
 pub struct InputSink {
-    tx: Sender<Input>,
+    tx: Sender<Request>,
+}
+
+/// What the sender thread is asked to do.
+enum Request {
+    Input(Input),
+    /// Press the virtual power button (`system_powerdown`).
+    Powerdown,
 }
 
 impl InputSink {
@@ -99,7 +106,12 @@ impl InputSink {
 
     /// Queues an event; never blocks.
     pub fn send(&self, input: Input) {
-        let _ = self.tx.send(input);
+        let _ = self.tx.send(Request::Input(input));
+    }
+
+    /// Asks the guest to shut down (ACPI power button); never blocks.
+    pub fn powerdown(&self) {
+        let _ = self.tx.send(Request::Powerdown);
     }
 }
 
@@ -142,13 +154,19 @@ impl Connection {
     }
 }
 
-fn sender(path: &PathBuf, rx: &Receiver<Input>) {
+fn sender(path: &PathBuf, rx: &Receiver<Request>) {
     let mut conn: Option<Connection> = None;
     let mut warned = false;
     while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        batch.extend(rx.try_iter());
-        let batch = coalesce(batch);
+        let mut inputs = Vec::new();
+        let mut powerdown = false;
+        for request in std::iter::once(first).chain(rx.try_iter()) {
+            match request {
+                Request::Input(input) => inputs.push(input),
+                Request::Powerdown => powerdown = true,
+            }
+        }
+        let batch = coalesce(inputs);
         if conn.is_none() {
             match Connection::open(path) {
                 Ok(c) => {
@@ -166,8 +184,16 @@ fn sender(path: &PathBuf, rx: &Receiver<Input>) {
             }
         }
         if let Some(c) = conn.as_mut() {
-            if let Err(error) = c.command(&command_json(&batch)) {
-                log!("QMP input error: {error}");
+            let mut result = Ok(());
+            if !batch.is_empty() {
+                result = c.command(&command_json(&batch));
+            }
+            if result.is_ok() && powerdown {
+                log!("asking the guest to shut down (ACPI power button)");
+                result = c.command(r#"{"execute":"system_powerdown"}"#);
+            }
+            if let Err(error) = result {
+                log!("QMP error: {error}");
                 conn = None;
             }
         }
@@ -234,7 +260,7 @@ mod tests {
             let mut writer = stream;
             writer.write_all(b"{\"QMP\": {}}\n").unwrap();
             let mut lines = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 writer
@@ -249,9 +275,14 @@ mod tests {
             qcode: "ret",
             down: true,
         });
+        sink.powerdown();
         let lines = server.join().unwrap();
         assert!(lines[0].contains("qmp_capabilities"));
         assert!(lines[1].contains(r#""data":"ret""#));
+        assert!(
+            lines[2].contains("system_powerdown"),
+            "input first, then the power button"
+        );
         let _ = std::fs::remove_file(&dir);
     }
 }

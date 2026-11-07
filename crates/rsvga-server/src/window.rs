@@ -12,16 +12,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CustomCursor, Window, WindowId};
 
 use crate::device::Svga;
 use crate::display::Frame;
 use crate::log;
 use crate::qmp::{ABS_MAX, Input, InputSink};
+use crate::scale::{View, render};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -138,46 +139,13 @@ fn qcode(code: KeyCode) -> Option<&'static str> {
     })
 }
 
-/// Where the guest frame sits inside the window (letterboxed, aspect kept).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct View {
-    x: f64,
-    y: f64,
-    scale: f64,
-    frame_w: u32,
-    frame_h: u32,
-}
-
-impl View {
-    fn fit(window_w: u32, window_h: u32, frame_w: u32, frame_h: u32) -> Self {
-        if frame_w == 0 || frame_h == 0 {
-            return Self::default();
-        }
-        let scale = (f64::from(window_w) / f64::from(frame_w))
-            .min(f64::from(window_h) / f64::from(frame_h));
-        Self {
-            x: (f64::from(window_w) - f64::from(frame_w) * scale) / 2.0,
-            y: (f64::from(window_h) - f64::from(frame_h) * scale) / 2.0,
-            scale,
-            frame_w,
-            frame_h,
-        }
-    }
-
-    /// Absolute pointer coordinates (0..=ABS_MAX) of a window position.
-    fn pointer(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
-        if self.scale <= 0.0 {
-            return None;
-        }
-        let axis = |pos: f64, origin: f64, size: u32| {
-            let pixel = ((pos - origin) / self.scale).clamp(0.0, f64::from(size.saturating_sub(1)));
-            (pixel * f64::from(ABS_MAX) / f64::from(size.saturating_sub(1).max(1))).round() as u32
-        };
-        Some((
-            axis(position.x, self.x, self.frame_w),
-            axis(position.y, self.y, self.frame_h),
-        ))
-    }
+/// Absolute pointer coordinates (0..=ABS_MAX) of a window position.
+fn pointer(view: &View, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
+    let (fx, fy) = view.frame_position(position.x, position.y)?;
+    let axis = |pixel: f64, size: u32| {
+        (pixel * f64::from(ABS_MAX) / f64::from(size.saturating_sub(1).max(1))).round() as u32
+    };
+    Some((axis(fx, view.frame_w), axis(fy, view.frame_h)))
 }
 
 struct App {
@@ -189,6 +157,14 @@ struct App {
     frame: Frame,
     view: View,
     pressed: HashSet<&'static str>,
+    /// Guest resolution the window was last sized for.
+    sized_for: (usize, usize),
+    /// Guest cursor definition last applied, and its visibility.
+    cursor_serial: u64,
+    cursor_visible: bool,
+    /// The user closed the window once: the guest is shutting down.
+    closing: bool,
+    cursor_logged: bool,
     next_tick: Instant,
     last_snapshot: Instant,
 }
@@ -206,13 +182,19 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        if self.svga.client_gone() {
+            log!("the VM stopped: closing the window");
+            event_loop.exit();
+            return;
+        }
         {
             let mut state = self.svga.lock();
             self.svga.process_fifo(&mut state);
         }
-        let shown = self.svga.capture(&mut self.frame).is_some();
-        if let (Some(path), true) = (&self.snapshot, shown) {
+        let shown = self.svga.capture(&mut self.frame);
+        let changed = shown.is_some_and(|s| s.changed);
+        if let (Some(path), true) = (&self.snapshot, changed) {
             if self.last_snapshot.elapsed() >= Duration::from_secs(1) {
                 self.last_snapshot = Instant::now();
                 if let Err(error) = crate::save(path, &self.frame) {
@@ -220,8 +202,51 @@ impl App {
                 }
             }
         }
-        if let Some(window) = &self.window {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        // Follow the guest resolution so it is shown pixel for pixel.
+        let size = (self.frame.width, self.frame.height);
+        if shown.is_some() && size != self.sized_for && size.0 > 0 && size.1 > 0 {
+            self.sized_for = size;
+            let _ = window.request_inner_size(PhysicalSize::new(size.0 as u32, size.1 as u32));
+        }
+        if changed {
             window.request_redraw();
+        }
+        self.update_cursor(event_loop, &window);
+    }
+
+    /// Shows the guest's cursor as the window's cursor: no latency, and the
+    /// shape follows the guest (arrow, text, resize...).
+    fn update_cursor(&mut self, event_loop: &ActiveEventLoop, window: &Window) {
+        let (serial, image, visible) = self.svga.cursor();
+        if serial != self.cursor_serial {
+            self.cursor_serial = serial;
+            if let Some(image) = image {
+                let source = CustomCursor::from_rgba(
+                    image.rgba.clone(),
+                    image.width,
+                    image.height,
+                    image.hot_x,
+                    image.hot_y,
+                );
+                match source {
+                    Ok(source) => {
+                        window.set_cursor(event_loop.create_custom_cursor(source));
+                        if !self.cursor_logged {
+                            self.cursor_logged = true;
+                            log!("window now shows the guest cursor");
+                        }
+                    }
+                    Err(error) => log!("guest cursor rejected: {error}"),
+                }
+            }
+        }
+        if visible != self.cursor_visible {
+            log!("guest cursor {}", if visible { "shown" } else { "hidden" });
+            self.cursor_visible = visible;
+            window.set_cursor_visible(visible);
         }
     }
 
@@ -242,23 +267,7 @@ impl App {
         buffer.fill(0);
         let (fw, fh) = (self.frame.width as u32, self.frame.height as u32);
         self.view = View::fit(size.width, size.height, fw, fh);
-        if self.view.scale > 0.0 && self.frame.pixels.len() == self.frame.width * self.frame.height
-        {
-            let v = self.view;
-            let x0 = v.x.max(0.0) as u32;
-            let y0 = v.y.max(0.0) as u32;
-            let x1 = ((v.x + f64::from(fw) * v.scale) as u32).min(size.width);
-            let y1 = ((v.y + f64::from(fh) * v.scale) as u32).min(size.height);
-            for wy in y0..y1 {
-                let fy = (((f64::from(wy) - v.y) / v.scale) as usize).min(self.frame.height - 1);
-                let src = &self.frame.pixels[fy * self.frame.width..(fy + 1) * self.frame.width];
-                let dst = &mut buffer[(wy * size.width) as usize..((wy + 1) * size.width) as usize];
-                for wx in x0..x1 {
-                    let fx = (((f64::from(wx) - v.x) / v.scale) as usize).min(self.frame.width - 1);
-                    dst[wx as usize] = src[fx];
-                }
-            }
-        }
+        render(&self.view, &self.frame.pixels, &mut buffer, size.width);
         let _ = buffer.present();
     }
 }
@@ -296,8 +305,23 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.release_all();
-                log!("window closed");
-                event_loop.exit();
+                match (&self.input, self.closing) {
+                    // First close: shut the guest down cleanly; the window
+                    // closes by itself once QEMU stops.
+                    (Some(input), false) if !self.svga.client_gone() => {
+                        self.closing = true;
+                        input.powerdown();
+                        if let Some(window) = &self.window {
+                            window.set_title(
+                                "rsvga - Windows is shutting down (close again to force)",
+                            );
+                        }
+                    }
+                    _ => {
+                        log!("window closed");
+                        event_loop.exit();
+                    }
+                }
             }
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::Focused(false) => self.release_all(),
@@ -319,7 +343,7 @@ impl ApplicationHandler for App {
                 self.send(Input::Key { qcode, down });
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some((x, y)) = self.view.pointer(position) {
+                if let Some((x, y)) = pointer(&self.view, position) {
                     self.send(Input::Move { x, y });
                 }
             }
@@ -358,7 +382,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if now >= self.next_tick {
-            self.tick();
+            self.tick(event_loop);
             self.next_tick = now + FRAME_INTERVAL;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
@@ -383,6 +407,11 @@ pub fn run(svga: Arc<Svga>, snapshot: Option<PathBuf>, qmp: Option<PathBuf>) {
         frame: Frame::default(),
         view: View::default(),
         pressed: HashSet::new(),
+        sized_for: (0, 0),
+        cursor_serial: 0,
+        cursor_visible: true,
+        closing: false,
+        cursor_logged: false,
         next_tick: Instant::now(),
         last_snapshot: Instant::now(),
     };
@@ -396,28 +425,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn letterbox_and_pointer_mapping() {
-        // 1280x800 guest in a 1920x1080 window: scaled 1.35, bars left/right.
-        let view = View::fit(1920, 1080, 1280, 800);
-        assert!((view.scale - 1.35).abs() < 1e-9);
-        assert!((view.x - 96.0).abs() < 1e-9 && view.y.abs() < 1e-9);
-        assert_eq!(view.pointer(PhysicalPosition::new(96.0, 0.0)), Some((0, 0)));
+    fn pointer_covers_the_whole_guest_screen() {
+        let view = View::fit(2114, 1157, 1920, 1080);
         assert_eq!(
-            view.pointer(PhysicalPosition::new(5000.0, 5000.0)),
+            pointer(&view, PhysicalPosition::new(97.0, 38.0)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            pointer(&view, PhysicalPosition::new(5000.0, 5000.0)),
             Some((ABS_MAX, ABS_MAX))
         );
+        let (x, y) = pointer(&view, PhysicalPosition::new(97.0 + 960.0, 38.0 + 540.0)).unwrap();
+        assert!((i64::from(x) - 16_383).abs() < 30 && (i64::from(y) - 16_383).abs() < 30);
         assert_eq!(
-            view.pointer(PhysicalPosition::new(0.0, -10.0)),
-            Some((0, 0)),
-            "clamped"
-        );
-        let (x, y) = view.pointer(PhysicalPosition::new(960.0, 540.0)).unwrap();
-        assert!(
-            (x as i64 - 16_383).abs() < 30 && (y as i64 - 16_383).abs() < 30,
-            "centre"
-        );
-        assert_eq!(
-            View::default().pointer(PhysicalPosition::new(1.0, 1.0)),
+            pointer(&View::default(), PhysicalPosition::new(1.0, 1.0)),
             None
         );
     }

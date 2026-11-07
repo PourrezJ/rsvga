@@ -137,6 +137,12 @@ impl Registers {
         self.mem_start = fifo;
     }
 
+    /// Whether the guest asked for trace-based updates ([`reg::TRACES`]):
+    /// the device must then watch the framebuffer itself.
+    pub fn traces(&self) -> bool {
+        self.traces != 0
+    }
+
     /// Interrupt sources the guest enabled ([`reg::IRQMASK`]).
     pub fn irq_mask(&self) -> u32 {
         self.irq_mask
