@@ -6,7 +6,7 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M2 atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D) en cours** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu ; rsvga les décode, garde l'état des contextes, traduit ses shaders en SPIR-V et exécute dessins, effacements et copies sur le GPU de l'hôte (Vulkan) : **le bureau de Windows est composé par la RX 6950 XT**. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M2 atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D) en cours** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu ; rsvga les décode, garde l'état des contextes, traduit ses shaders en SPIR-V et exécute dessins, effacements et copies sur le GPU de l'hôte (Vulkan) : **le bureau de Windows est composé par la RX 6950 XT**, les 13 vérifications de `d3dtest` (Direct3D 11) passent et `dxdiag` ne trouve aucun problème. **Direct3D 9 dessine aussi** : rsvga exécute le protocole 3D ancien du pilote D3D9 de VMware (états de rendu, shaders Direct3D 9 traduits en SPIR-V) et les 37 vérifications de `d3d9test` passent (pipeline fixe, shader models 1 à 3, sRGB, sprites, plans de découpe, instanciation, cartes d'ombres...) ; **Unigine Heaven 4.0 tourne en Direct3D 9** avec un rendu juste, à 35–38 images par seconde en 1280×720 (WDDM 2.0) après deux passes de travail sur les performances (`RSVGA_PROFILE=1` montre où va le temps, GPU compris). La 3D reste à activer à la main en attendant des essais avec de vrais programmes. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
@@ -75,10 +75,16 @@ scripts/run-windows.sh --disk /chemin/windows.qcow2 --vars /chemin/OVMF_VARS_4M.
 
 Le pilote VMware se trouve dans les VMware Tools : il faut extraire `vm3d.inf` et ses fichiers, puis lancer `pnputil /add-driver vm3d.inf /install` dans Windows.
 
-Programmes de test côté invité (mingw-w64), donnés à la VM par `run-windows.sh --guest-tools` ; `d3dprobe.exe` rapporte à l'hôte, par la porte dérobée VMware, ce que Direct3D voit de la carte :
+Programmes de test côté invité (mingw-w64), donnés à la VM par `run-windows.sh --guest-tools` (lecteur `D:`) ; ils rapportent à l'hôte par la porte dérobée VMware (`qemu.log`) : `d3dtest` (vérifications de rendu Direct3D 11), `d3d9test` (la même chose en Direct3D 9), `d3dprobe` (ce que Direct3D voit de la carte), `hostcat` (envoie un fichier texte, par exemple le rapport de `dxdiag`), `wininfo` (fenêtres visibles), `umdcaps` (ce que le pilote D3D9 répondrait au runtime), `d3d9trace` (ce que le runtime D3D9 lui demande vraiment) :
 
 ```bash
 scripts/build-guest-tools.sh
+```
+
+Avec la VM de test lancée (`--diagnose --guest-tools`), `scripts/guest-run.sh` tape la commande dans Windows et affiche le résultat : `run` (d3dtest), `ninetest` (d3d9test), `heaven` puis `heavenrun` (Unigine Heaven en Direct3D 9, si son installateur est dans `target/unigine/download`), `diag` (dxdiag), `probe`, `info`, `events` (dernières erreurs), `umd` (umdcaps), `trace` (d3d9trace), `nine` (d3dprobe avec le journal du pilote D3D9 de débogage), `dxg` et `events` en `--admin` (canaux du noyau graphique) :
+
+```bash
+scripts/guest-run.sh run
 ```
 
 ## Lancer la carte
@@ -119,8 +125,8 @@ target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/
 - `svga-render` : moteur Vulkan (`ash`) : surfaces de l'invité sur le GPU de l'hôte, dessins (pipelines en cache, rendu dynamique), effacements et copies. `RSVGA_GPU=<partie du nom>` choisit le GPU (par défaut le plus gros GPU dédié).
 - `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
 - `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
-- `guest/d3dprobe` : sonde Direct3D côté Windows.
-- 156 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; quatre cibles de fuzzing.
+- `guest/` : programmes de test côté Windows (`d3dtest`, `d3dprobe`, `umdcaps`, `d3d9trace`, `hostcat`, `wininfo`).
+- 179 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; cinq cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
 

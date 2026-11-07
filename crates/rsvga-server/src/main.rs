@@ -7,6 +7,7 @@
 //! ```
 
 mod cmdbuf;
+mod ctx9;
 mod cursor;
 mod damage;
 mod devcaps;
@@ -18,6 +19,7 @@ mod gpu;
 mod guest;
 mod irq;
 mod pci;
+mod prof;
 #[cfg(any(feature = "window", test))]
 mod qmp;
 mod rom;
@@ -76,6 +78,9 @@ fn parse_args() -> Result<Args, String> {
         fifo_size: 2 << 20,
         max_width: 3840,
         max_height: 2160,
+        // RSVGA_SYNC_BUFFERS=1: command buffers inside the guest's
+        // register write, as before the worker (diagnostics).
+        asynchronous: std::env::var_os("RSVGA_SYNC_BUFFERS").is_none_or(|v| v == "0"),
     };
     let mut args = std::env::args().skip(1);
     if std::env::args().nth(1).as_deref() == Some("--vmport-args") {

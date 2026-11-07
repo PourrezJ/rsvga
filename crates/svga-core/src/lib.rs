@@ -13,6 +13,7 @@ pub mod fifo;
 pub mod gb;
 pub mod gmr;
 pub mod layout;
+pub mod legacy;
 pub mod mob;
 pub mod regs;
 pub mod screen;

@@ -263,6 +263,19 @@ impl Gb {
 
     /// Makes sure the device copy of `sid` exists: loaded from its MOB, or
     /// zeroes if it has none (or if the MOB does not cover the surface).
+    /// Format, `SVGA3D_SURFACE_*` flags, depth and layers of surface
+    /// `sid`: what draws look at, without copying the layout.
+    pub(crate) fn surface_info(&self, sid: u32) -> Option<(u32, u64, u32, u32)> {
+        self.surfaces.get(&sid).map(|s| {
+            (
+                s.layout.format(),
+                s.flags,
+                s.layout.mip_size(0).depth,
+                s.layout.layers(),
+            )
+        })
+    }
+
     /// Layout and `SVGA3D_SURFACE_*` flags of surface `sid`.
     pub(crate) fn surface_shape(&self, sid: u32) -> Option<(SurfaceLayout, u64)> {
         self.surfaces.get(&sid).map(|s| (s.layout.clone(), s.flags))
@@ -277,9 +290,22 @@ impl Gb {
             .ok_or_else(|| format!("surface {sid} has no device copy"))
     }
 
-    /// The surface screen target `stid` shows, if any.
-    pub(crate) fn target_surface(&self, stid: u32) -> Option<u32> {
-        self.targets.get(&stid)?.image.map(|image| image.sid)
+    /// Whether surface `sid` has a device copy now.
+    pub(crate) fn has_host_copy(&self, sid: u32) -> bool {
+        self.surfaces.get(&sid).is_some_and(|s| s.host.is_some())
+    }
+
+    /// Frees the device copy of surface `sid` (the GPU keeps the surface);
+    /// the next use creates it again from the MOB.
+    pub(crate) fn drop_host_copy(&mut self, sid: u32) {
+        if let Some(host) = self.surfaces.get_mut(&sid).and_then(|s| s.host.take()) {
+            self.host_bytes = self.host_bytes.saturating_sub(host.len() as u64);
+        }
+    }
+
+    /// Whether device copies use more than half of their budget.
+    pub(crate) fn host_pressure(&self) -> bool {
+        self.host_bytes > self.limits.surface_bytes / 2
     }
 
     fn ensure_host(&mut self, guest: &GuestMemory, sid: u32) -> Result<(), String> {
@@ -656,13 +682,7 @@ impl Gb {
         }
         outcome?;
         // Show it at once if a screen target displays the destination.
-        let shown: Vec<u32> = self
-            .targets
-            .iter()
-            .filter(|(_, t)| t.image == Some(dest))
-            .map(|(id, _)| *id)
-            .collect();
-        for stid in shown {
+        for stid in self.screens_showing(dest) {
             let rect = Rect {
                 x: dest_box.x,
                 y: dest_box.y,
@@ -708,25 +728,26 @@ impl Gb {
         }
     }
 
-    /// Copies `rect` of a screen target's image to the shown pixels.
-    fn present(&mut self, guest: &GuestMemory, stid: u32, rect: Rect) -> Result<(), String> {
+    /// The image the shown screen target `stid` displays and the part of
+    /// it `rect` covers (`[x0, y0, x1, y1]`, clipped to target and image):
+    /// `None` if rsvga does not show `stid`, it shows nothing, or the part
+    /// is empty.
+    pub(crate) fn screen_area(
+        &self,
+        stid: u32,
+        rect: Rect,
+    ) -> Result<Option<(ImageId, [u32; 4])>, String> {
         if self.screen.as_ref().is_none_or(|s| s.stid != stid) {
-            return Ok(()); // not the screen rsvga shows
+            return Ok(None); // not the screen rsvga shows
         }
-        let target = *self
+        let target = self
             .targets
             .get(&stid)
             .ok_or_else(|| format!("screen target {stid} is not defined"))?;
         let Some(image) = target.image else {
-            return Ok(());
+            return Ok(None);
         };
-        self.ensure_host(guest, image.sid)?;
-        // Field borrows (not `self.surface()`): the screen is mutated below.
-        let surface = self
-            .surfaces
-            .get(&image.sid)
-            .ok_or_else(|| format!("surface {} is not defined", image.sid))?;
-        let layout = &surface.layout;
+        let layout = &self.surface(image.sid)?.layout;
         let desc = layout.desc();
         if desc.bytes_per_block != 4 || desc.block_width != 1 || desc.block_height != 1 {
             return Err(format!(
@@ -740,9 +761,27 @@ impl Gb {
         let y0 = rect.y.min(h);
         let x1 = rect.x.saturating_add(rect.width).min(w);
         let y1 = rect.y.saturating_add(rect.height).min(h);
-        if x0 >= x1 || y0 >= y1 {
+        Ok((x0 < x1 && y0 < y1).then_some((image, [x0, y0, x1, y1])))
+    }
+
+    /// Copies `rect` of a screen target's image, from its device copy, to
+    /// the shown pixels.
+    pub(crate) fn present(
+        &mut self,
+        guest: &GuestMemory,
+        stid: u32,
+        rect: Rect,
+    ) -> Result<(), String> {
+        let Some((image, [x0, y0, x1, y1])) = self.screen_area(stid, rect)? else {
             return Ok(());
-        }
+        };
+        self.ensure_host(guest, image.sid)?;
+        // Field borrows (not `self.surface()`): the screen is mutated below.
+        let surface = self
+            .surfaces
+            .get(&image.sid)
+            .ok_or_else(|| format!("surface {} is not defined", image.sid))?;
+        let layout = &surface.layout;
         let base = layout
             .image_offset(image.face, image.mipmap)
             .ok_or("no such image")?;
@@ -764,6 +803,64 @@ impl Gb {
         }
         screen.damage.add(x0, y0, x1 - x0, y1 - y0);
         Ok(())
+    }
+
+    /// Shows `area` (`[x0, y0, x1, y1]`) of screen target `stid` from
+    /// `bytes`, its rows of 32-bit pixels tightly packed, read from the GPU
+    /// some time after [`Self::screen_area`] gave the area. False if the
+    /// screen changed since (another target, another size).
+    pub(crate) fn show_pixels(&mut self, stid: u32, area: [u32; 4], bytes: &[u8]) -> bool {
+        let [x0, y0, x1, y1] = area;
+        let Some(screen) = self.screen.as_mut() else {
+            return false;
+        };
+        let row = (x1.saturating_sub(x0) as usize).saturating_mul(4);
+        let rows = y1.saturating_sub(y0) as usize;
+        if screen.stid != stid
+            || x1 > screen.width
+            || y1 > screen.height
+            || row == 0
+            || bytes.len() != row.saturating_mul(rows)
+        {
+            return false;
+        }
+        let width = screen.width as usize;
+        for (y, line) in (y0 as usize..y1 as usize).zip(bytes.chunks_exact(row)) {
+            let start = y * width + x0 as usize;
+            for (out, px) in screen.pixels[start..start + row / 4]
+                .iter_mut()
+                .zip(line.chunks_exact(4))
+            {
+                *out = u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & 0x00ff_ffff;
+            }
+        }
+        screen.damage.add(x0, y0, x1 - x0, y1 - y0);
+        true
+    }
+
+    /// Binds `image` to screen target `stid` (an invalid ID unbinds), and
+    /// returns its whole area, which the binding shows.
+    pub(crate) fn bind_screen(&mut self, stid: u32, image: ImageId) -> Result<Rect, String> {
+        let t = self
+            .targets
+            .get_mut(&stid)
+            .ok_or_else(|| format!("screen target {stid} is not defined"))?;
+        t.image = (image.sid != INVALID_ID).then_some(image);
+        Ok(Rect {
+            x: 0,
+            y: 0,
+            width: t.width,
+            height: t.height,
+        })
+    }
+
+    /// The screen targets that show `image`.
+    pub(crate) fn screens_showing(&self, image: ImageId) -> Vec<u32> {
+        self.targets
+            .iter()
+            .filter(|(_, t)| t.image == Some(image))
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Brings `frame` up to date with the shown screen target, copying only
@@ -945,19 +1042,8 @@ impl Gb {
                 self.choose_screen();
             }
             GbCommand::BindScreenTarget { stid, image } => {
-                let t = self
-                    .targets
-                    .get_mut(&stid)
-                    .ok_or_else(|| format!("screen target {stid} is not defined"))?;
-                t.image = (image.sid != INVALID_ID).then_some(image);
-                let (width, height) = (t.width, t.height);
                 // Binding shows the new image at once.
-                let all = Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                };
+                let all = self.bind_screen(stid, image)?;
                 self.present(guest, stid, all)?;
             }
             GbCommand::UpdateScreenTarget { stid, rect } => self.present(guest, stid, rect)?,

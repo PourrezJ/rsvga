@@ -6,6 +6,7 @@
 //! the descriptors and interface locations it uses. Everything here treats
 //! the program as hostile input: safe Rust, bounded, never panics.
 
+pub mod d3d9;
 pub mod decode;
 pub mod opcode;
 pub mod spirv;

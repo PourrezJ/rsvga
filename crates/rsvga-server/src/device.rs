@@ -53,8 +53,14 @@ pub const GMR_MAX_IDS: u32 = 64;
 pub const GMR_MAX_PAGES: u32 = 256 * 1024;
 /// Guest memory usable through GMRs, in bytes.
 pub const GMR_MEMORY_SIZE: u32 = 1 << 30;
-/// Guest memory the guest may turn into memory objects (MOBs): 1 GiB.
-pub const GB_MEMORY_KB: u32 = 1 << 20;
+/// Guest memory the guest is told it may turn into memory objects
+/// (MOBs): 2 GiB. The driver sizes its graphics memory on it.
+pub const GB_MEMORY_KB: u32 = 2 << 20;
+/// Pages all MOBs together may hold: four times the budget above. The
+/// guest may go past its budget a little (object tables, page tables,
+/// frees still in flight); this bound only caps rsvga's bookkeeping
+/// (8 bytes per page: 16 MiB at most).
+pub const MOB_MAX_PAGES: u64 = 4 * (GB_MEMORY_KB as u64) * 1024 / 4096;
 /// Largest single MOB, in bytes.
 pub const MOB_MAX_SIZE: u32 = 256 << 20;
 /// Host memory all device copies of guest-backed surfaces may use.
@@ -157,6 +163,9 @@ pub struct Options {
     pub max_width: u32,
     /// Largest mode height.
     pub max_height: u32,
+    /// Regular command buffers run on a worker thread rather than inside
+    /// the guest's register write (see `cmdbuf.rs`).
+    pub asynchronous: bool,
 }
 
 /// Counters shown in the logs.
@@ -175,6 +184,10 @@ pub struct Stats {
     pub dx_deferred: u64,
     /// DX context commands refused (malformed, or invalid for the state).
     pub dx_refused: u64,
+    /// Legacy (Direct3D 9) context commands executed.
+    pub legacy: u64,
+    /// Legacy context commands refused.
+    pub legacy_refused: u64,
 }
 
 /// Mutable device state, behind the device lock.
@@ -192,6 +205,8 @@ pub struct State {
     pub gb: crate::gb::Gb,
     /// DirectX contexts.
     pub dx: crate::dxctx::DxContexts,
+    /// Legacy (Direct3D 9) contexts and shaders.
+    pub legacy: crate::ctx9::Legacy,
     /// The host GPU (with 3D), and where each surface's newest copy is.
     pub gpu: Option<crate::gpu::Gpu>,
     /// The INTx line.
@@ -221,6 +236,12 @@ pub struct Svga {
     /// Expansion ROM image (empty: no ROM) and the size of its BAR.
     rom: Vec<u8>,
     rom_bar: u32,
+    /// Whether command buffers run on the worker.
+    pub(crate) asynchronous: bool,
+    /// Wakes the worker.
+    pub(crate) work: std::sync::Condvar,
+    /// Signalled when the worker runs out of buffers.
+    pub(crate) idle: std::sync::Condvar,
 }
 
 /// FIFO memory seen through the [`FifoMemory`] trait of `svga-core`.
@@ -342,7 +363,7 @@ impl Svga {
             guest: GuestMemory::default(),
             twod: TwoD::new(GMR_MAX_IDS, GMR_MAX_PAGES, opts.max_width, opts.max_height),
             gb: crate::gb::Gb::new(crate::gb::Limits {
-                mob_pages: u64::from(GB_MEMORY_KB) * 1024 / 4096,
+                mob_pages: MOB_MAX_PAGES,
                 mob_size: MOB_MAX_SIZE,
                 surface_bytes: GB_SURFACE_BYTES,
                 max_width: opts.max_width,
@@ -354,6 +375,7 @@ impl Svga {
                 code_bytes: DX_CODE_BYTES,
                 shader_bytes: DX_SHADER_BYTES,
             }),
+            legacy: crate::ctx9::Legacy::default(),
             irq: Intx::default(),
             cb: CommandBuffers::default(),
             damage: Damage::default(),
@@ -362,7 +384,7 @@ impl Svga {
             unmask_watch: None,
             stats: Stats::default(),
         };
-        Ok(Arc::new(Self {
+        let svga = Arc::new(Self {
             vram,
             fifo,
             state: Mutex::new(state),
@@ -371,7 +393,17 @@ impl Svga {
             rom_bar,
             client_connected: AtomicBool::new(false),
             client_seen: AtomicBool::new(false),
-        }))
+            asynchronous: opts.asynchronous,
+            work: std::sync::Condvar::new(),
+            idle: std::sync::Condvar::new(),
+        });
+        if opts.asynchronous {
+            let worker = Arc::clone(&svga);
+            thread::Builder::new()
+                .name("rsvga-cb".into())
+                .spawn(move || worker.work())?;
+        }
+        Ok(svga)
     }
 
     /// Locks the device state. A panic while holding the lock cannot leave
@@ -524,7 +556,7 @@ impl Svga {
                 self.execute(state, command, None);
             }
             if let Some(gpu) = state.gpu.as_mut() {
-                gpu.flush();
+                gpu.flush(&mut state.gb, &state.guest);
             }
             if progressed {
                 let mask = state.regs.irq_mask();
@@ -549,13 +581,15 @@ impl Svga {
                 // Guest-backed commands are traced by name below.
                 Command::Command3d { id, size, payload }
                     if svga_core::gb::parse(*id, payload).is_some()
-                        || svga_core::dx::parse(*id, *size, payload).is_some() => {}
+                        || svga_core::dx::parse(*id, *size, payload).is_some()
+                        || svga_core::legacy::parse(*id, payload).is_some() => {}
                 other => trace(format!("FIFO {}", command_name(other))),
             }
         }
         if let Command::Command3d { id, payload, .. } = &command
             && let Some(parsed) = svga_core::gb::parse(*id, payload)
         {
+            let _span = crate::prof::span(crate::prof::Cat::Gb);
             let State { gb, guest, gpu, .. } = state;
             let result = parsed
                 .map_err(|short| short.to_string())
@@ -569,10 +603,13 @@ impl Svga {
                     let Some(gpu) = gpu.as_mut() else {
                         return gb.execute(gb_command, guest);
                     };
+                    if gpu.execute_gb(&gb_command, gb, guest)? {
+                        return Ok(());
+                    }
                     gpu.before_gb(&gb_command, gb, guest)?;
                     let effects = gb_command.clone();
                     gb.execute(gb_command, guest)?;
-                    gpu.after_gb(&effects, gb);
+                    gpu.after_gb(&effects);
                     Ok(())
                 });
             if let Err(error) = result {
@@ -583,6 +620,7 @@ impl Svga {
         if let Command::Command3d { id, size, payload } = &command
             && let Some(parsed) = svga_core::dx::parse(*id, *size, payload)
         {
+            let _span = crate::prof::span(crate::prof::Cat::Dx);
             let State {
                 dx,
                 gb,
@@ -623,6 +661,45 @@ impl Svga {
                     stats.dx_refused = stats.dx_refused.saturating_add(1);
                     let name = svga_proto::cmd3d_names::name(*id).unwrap_or("?");
                     trace(format!("DX {name} refused: {error}"));
+                }
+            }
+            return;
+        }
+        if let Command::Command3d { id, payload, .. } = &command
+            && let Some(parsed) = svga_core::legacy::parse(*id, payload)
+        {
+            let State {
+                legacy,
+                gb,
+                guest,
+                stats,
+                gpu,
+                ..
+            } = state;
+            let result = parsed.map_err(|e| e.to_string()).and_then(|command| {
+                if trace_level() >= 1 {
+                    let mut text = format!("{command:?}");
+                    text.truncate(300);
+                    trace(format!("D3D9 {text}"));
+                }
+                let outcome = {
+                    let _span = crate::prof::span(crate::prof::Cat::D3d9State);
+                    legacy.execute(&command, gb, guest, gpu.is_some())?
+                };
+                if outcome == crate::ctx9::Outcome::Gpu
+                    && let Some(gpu) = gpu.as_mut()
+                {
+                    let _span = crate::prof::span(crate::prof::Cat::D3d9Gpu);
+                    gpu.execute_legacy(&command, legacy, gb, guest)?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => stats.legacy = stats.legacy.saturating_add(1),
+                Err(error) => {
+                    stats.legacy_refused = stats.legacy_refused.saturating_add(1);
+                    let name = svga_proto::cmd3d_names::name(*id).unwrap_or("?");
+                    trace(format!("D3D9 {name} refused: {error}"));
                 }
             }
             return;
@@ -691,10 +768,17 @@ impl Svga {
             other => {
                 if trace_level() >= 1 {
                     let text = match &other {
-                        Command::Command3d { id, size, .. } => format!(
-                            "3D {} ({id}), {size} bytes",
-                            svga_proto::cmd3d_names::name(*id).unwrap_or("?")
-                        ),
+                        Command::Command3d { id, size, payload } => {
+                            // The first words, to see what an unknown
+                            // command carries.
+                            let words: Vec<String> =
+                                payload.iter().take(40).map(|w| format!("{w:x}")).collect();
+                            format!(
+                                "3D {} ({id}), {size} bytes: {}",
+                                svga_proto::cmd3d_names::name(*id).unwrap_or("?"),
+                                words.join(" ")
+                            )
+                        }
                         _ => {
                             let mut text = format!("{other:?}");
                             text.truncate(240);
@@ -944,6 +1028,17 @@ impl Device for Handle {
                         .regs
                         .port_write(offset as u16, u32::from_le_bytes(bytes));
                     if offset == u64::from(port::VALUE) || offset == u64::from(port::IRQ_STATUS) {
+                        // What must follow the buffers the worker holds.
+                        let ordered = match effect {
+                            Effect::CommandBuffer { context, .. } => {
+                                context == svga_proto::cb::context::DEVICE
+                            }
+                            Effect::Sync | Effect::ConfigDone(_) => true,
+                            _ => false,
+                        };
+                        if svga.asynchronous && ordered {
+                            state = svga.drain(state);
+                        }
                         svga.apply(&mut state, effect);
                     }
                 }
@@ -1070,6 +1165,7 @@ impl Device for Handle {
         state.twod.reset();
         state.gb.reset();
         state.dx.reset();
+        state.legacy.reset();
         if let Some(gpu) = state.gpu.as_mut() {
             gpu.reset();
         }
@@ -1094,6 +1190,7 @@ mod tests {
                     fifo_size: 64 << 10,
                     max_width: 2560,
                     max_height: 1600,
+                    asynchronous: false,
                 },
                 Vec::new(),
             )
@@ -1212,6 +1309,7 @@ mod tests {
             fifo_size: 64 << 10,
             max_width: 2560,
             max_height: 1600,
+            asynchronous: false,
         };
         let mut h = Handle(Svga::new(&opts, vec![0x55, 0xaa, 1]).unwrap());
         let info = h.region_info(pci_region::ROM).unwrap();
@@ -1420,6 +1518,33 @@ mod tests {
             assert_eq!(context.bindings.topology, 1);
         }
 
+        // Contents inside a MOB (SVGA_CB_FLAG_MOB, WDDM 2.0 drivers): MOB 9
+        // covers the page at 0x10_2000, the commands sit at its byte 0x10.
+        put(
+            0x1500,
+            &[
+                svga_proto::cmd3d::DEFINE_GB_MOB64,
+                20,
+                9,
+                svga_proto::mobfmt::RANGE,
+                0x102,
+                0,
+                4096,
+            ],
+        );
+        header(0x1c0, 28, 0x10_1500);
+        submit(&mut h, 0x1c0, cb::context::CONTEXT_0);
+        assert_eq!(word(0x1c0), cb::status::COMPLETED, "MOB defined");
+        put(0x2010, &[cmd::FENCE, 0x45]);
+        put(
+            0x200,
+            &[cb::status::NONE, 0, 3, 0, cb::flag::MOB, 8, 9, 0x10],
+        );
+        put(0x200 + 32, &[0; 8]);
+        submit(&mut h, 0x200, cb::context::CONTEXT_0);
+        assert_eq!(word(0x200), cb::status::COMPLETED, "buffer in a MOB");
+        assert_eq!(h.0.fifo.load_u32(fifo::FENCE as usize), 0x45);
+
         // Bad headers and contexts are refused, not run.
         header(0x100, 6, 0x10_1200);
         submit(&mut h, 0x100, cb::context::CONTEXT_0);
@@ -1428,7 +1553,7 @@ mod tests {
         submit(&mut h, 0x140, 5);
         assert_eq!(word(0x140), cb::status::SUBMISSION_ERROR);
         let state = h.0.lock();
-        assert_eq!((state.cb.completed, state.cb.failed), (4, 3));
+        assert_eq!((state.cb.completed, state.cb.failed), (6, 3));
     }
 
     #[test]

@@ -93,6 +93,9 @@ pub struct Binding {
 pub struct Shader {
     /// The SPIR-V module.
     pub spirv: Vec<u32>,
+    /// A hash of [`Self::spirv`] (FNV-1a), computed once: renderers key
+    /// their module caches with it rather than hash the code at each draw.
+    pub hash: u64,
     /// Stage.
     pub stage: Stage,
     /// Descriptors used.
@@ -101,6 +104,22 @@ pub struct Shader {
     pub inputs: Vec<u32>,
     /// Output locations (pixel shader: render targets).
     pub outputs: Vec<u32>,
+}
+
+impl Shader {
+    /// Sets the SPIR-V and its hash.
+    pub fn with_spirv(mut self, spirv: Vec<u32>) -> Self {
+        self.hash = spirv_hash(&spirv);
+        self.spirv = spirv;
+        self
+    }
+}
+
+/// FNV-1a over the words of a module.
+pub fn spirv_hash(words: &[u32]) -> u64 {
+    words.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &w| {
+        (h ^ u64::from(w)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// Binding number of a descriptor: 256 per stage.
@@ -303,13 +322,16 @@ pub fn translate(program: &Program, options: &Options) -> Result<Shader, Transla
     let mode_refs: Vec<&[u32]> = modes.iter().map(Vec::as_slice).collect();
     let interface = tx.interface.clone();
     tx.m.entry_point(model, function, &interface, &mode_refs);
+    let spirv = tx.m.finish(function);
     Ok(Shader {
-        spirv: tx.m.finish(function),
+        spirv: Vec::new(),
+        hash: 0,
         stage: program.stage,
         bindings: tx.bindings,
         inputs: tx.input_locations,
         outputs: tx.output_locations,
-    })
+    }
+    .with_spirv(spirv))
 }
 
 fn swizzle_of(select: Select) -> [u32; 4] {

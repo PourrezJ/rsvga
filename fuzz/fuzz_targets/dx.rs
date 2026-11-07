@@ -37,6 +37,9 @@ fuzz_target!(|data: &[u8]| {
             DxCommand::SetShaderResources { views, .. } => views.len() <= dx::MAX_SRVIEWS,
             DxCommand::SetSamplers { samplers, .. } => samplers.len() <= dx::MAX_SAMPLERS,
             DxCommand::SetVertexBuffers { buffers, .. } => buffers.len() <= dx::MAX_VERTEXBUFFERS,
+            DxCommand::SetVertexBuffersOffsetAndSize { ranges, .. } => {
+                ranges.len() <= dx::MAX_VERTEXBUFFERS
+            }
             DxCommand::SetRenderTargets { targets, .. } => targets.len() <= dx::MAX_RENDER_TARGETS,
             DxCommand::SetSoTargets { targets } => targets.len() <= dx::MAX_SOTARGETS,
             DxCommand::SetViewports { viewports } => viewports.len() <= dx::MAX_VIEWPORTS,

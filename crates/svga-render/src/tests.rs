@@ -38,6 +38,13 @@ fn pattern(len: usize) -> Vec<u8> {
 }
 
 #[test]
+fn copies_start_on_common_multiples() {
+    assert_eq!(lcm(16, 12), 48, "RGB32 texels after 16-byte constants");
+    assert_eq!(lcm(256, 4), 256);
+    assert_eq!(lcm(64, 0), 64);
+}
+
+#[test]
 fn bytes_go_to_the_gpu_and_back() {
     let Some(mut r) = renderer() else { return };
     // Two layers, three mips: every subresource at its guest offset.
@@ -96,6 +103,56 @@ fn clears_and_copies() {
     // Out of range.
     assert!(r.clear_color(1, 1, 0, 1, [0.0; 4]).is_err());
     assert!(r.copy_image(2, at(3, 3), 1, at(0, 0), [2, 2, 1]).is_err());
+}
+
+#[test]
+fn reads_finish_later_in_order() {
+    let Some(mut r) = renderer() else { return };
+    let l = layout(format::B8G8R8A8_UNORM, 8, 4, 1, 1);
+    r.create(1, &l, 0).unwrap();
+    let data = pattern(l.total_bytes() as usize);
+    r.upload(1, &data).unwrap();
+    let at = |x, y| At {
+        layer: 0,
+        mip: 0,
+        offset: [x, y, 0],
+    };
+    // A 3x2 box at (2, 1), rows packed; then a clear, and a second read.
+    let first = r.read_async(1, at(2, 1), [3, 2, 1]).unwrap();
+    r.clear_color(1, 0, 0, 1, [0.0, 0.0, 1.0, 1.0]).unwrap();
+    let second = r.read_async(1, at(0, 0), [1, 1, 1]).unwrap();
+    assert!(!r.read_done(first), "not submitted yet");
+    assert_eq!(r.take_read(first, false, |_| ()).unwrap(), None);
+    r.flush().unwrap();
+    let mut done = false;
+    for _ in 0..1000 {
+        r.poll().unwrap();
+        if r.read_done(second) {
+            done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(done, "the GPU finished");
+    assert!(r.read_done(first));
+    let bytes = r.take_read(first, false, <[u8]>::to_vec).unwrap().unwrap();
+    let mut want = Vec::new();
+    for y in 1..3 {
+        want.extend_from_slice(&data[(y * 8 + 2) * 4..(y * 8 + 5) * 4]);
+    }
+    assert_eq!(bytes, want, "the image as it was");
+    let blue = r.take_read(second, true, <[u8]>::to_vec).unwrap().unwrap();
+    assert_eq!(blue, [0xff, 0, 0, 0xff], "after the clear");
+    assert!(r.take_read(second, true, |_| ()).is_err(), "taken once");
+    // Waiting submits; boxes outside and buffers are refused.
+    let third = r.read_async(1, at(7, 3), [1, 1, 1]).unwrap();
+    assert!(r.take_read(third, true, |_| ()).unwrap().is_some());
+    assert!(r.read_async(1, at(7, 3), [2, 1, 1]).is_err());
+    let b = layout(format::BUFFER, 100, 1, 1, 1);
+    r.create(2, &b, 0).unwrap();
+    assert!(r.read_async(2, at(0, 0), [1, 1, 1]).is_err());
+    // A read left pending is freed with the renderer.
+    r.read_async(1, at(0, 0), [8, 4, 1]).unwrap();
 }
 
 #[test]
@@ -271,6 +328,7 @@ fn a_triangle_is_drawn_upright_with_its_constants() {
             binding: 0,
             sid: Some(2),
             offset: 0,
+            size: u64::MAX,
             stride: 32,
             per_instance: false,
         }],
@@ -298,6 +356,8 @@ fn a_triangle_is_drawn_upright_with_its_constants() {
                 size: 16,
             },
         }],
+        data: Vec::new(),
+        occlusion: None,
         call: Call::Draw {
             vertices: 3,
             instances: 1,
@@ -455,6 +515,7 @@ fn an_indexed_textured_quad_behind_and_in_front_of_depth() {
             binding: 0,
             sid: Some(4),
             offset: 0,
+            size: u64::MAX,
             stride: 32,
             per_instance: false,
         }],
@@ -491,6 +552,8 @@ fn an_indexed_textured_quad_behind_and_in_front_of_depth() {
                 },
             },
         ],
+        data: Vec::new(),
+        occlusion: None,
         call: Call::Indexed {
             indices: 6,
             instances: 1,
@@ -587,6 +650,7 @@ fn a_pixel_shader_reads_a_buffer_view() {
             binding: 0,
             sid: Some(2),
             offset: 0,
+            size: u64::MAX,
             stride: 32,
             per_instance: false,
         }],
@@ -608,6 +672,8 @@ fn a_pixel_shader_reads_a_buffer_view() {
                 size: 32,
             },
         }],
+        data: Vec::new(),
+        occlusion: None,
         call: Call::Draw {
             vertices: 3,
             instances: 1,
@@ -624,6 +690,74 @@ fn a_pixel_shader_reads_a_buffer_view() {
     assert!(
         back.chunks(4).all(|p| p == [0, 255, 0, 255]),
         "green on {}: {back:?}",
+        r.name()
+    );
+}
+
+#[test]
+fn resolves_blits_and_mipmaps() {
+    let Some(mut r) = renderer() else { return };
+    let red = [0u8, 0, 255, 255]; // B, G, R, A
+    let at = |layer, mip| At {
+        layer,
+        mip,
+        offset: [0; 3],
+    };
+    // Resolve: a 4x multisampled red image into a plain one.
+    let ms = SurfaceLayout::new(
+        format::B8G8R8A8_UNORM,
+        Size3 {
+            width: 4,
+            height: 4,
+            depth: 1,
+        },
+        1,
+        1,
+        4,
+        1 << 30,
+    )
+    .unwrap();
+    r.create(1, &ms, 0).unwrap();
+    r.create(2, &layout(format::B8G8R8A8_UNORM, 4, 4, 1, 1), 0)
+        .unwrap();
+    r.clear_color(1, 0, 0, 1, [1.0, 0.0, 0.0, 1.0]).unwrap();
+    r.resolve(2, at(0, 0), 1, at(0, 0)).unwrap();
+    let mut back = vec![0u8; 64];
+    r.download(2, &mut back).unwrap();
+    assert!(back.chunks(4).all(|p| p == red), "resolved on {}", r.name());
+    assert!(r.resolve(1, at(0, 0), 2, at(0, 0)).is_err(), "not into MS");
+    // Blit: 2x2 colors stretched (nearest) over 4x4.
+    r.create(3, &layout(format::B8G8R8A8_UNORM, 2, 2, 1, 1), 0)
+        .unwrap();
+    #[rustfmt::skip]
+    let quad = [0, 0, 255, 255,  0, 255, 0, 255,  255, 0, 0, 255,  255, 255, 255, 255];
+    r.upload(3, &quad).unwrap();
+    r.blit(2, at(0, 0), [4, 4, 1], 3, at(0, 0), [2, 2, 1], false)
+        .unwrap();
+    r.download(2, &mut back).unwrap();
+    let pixel = |x: usize, y: usize| back[(y * 4 + x) * 4..][..4].to_vec();
+    assert_eq!(pixel(1, 1), quad[0..4]);
+    assert_eq!(pixel(2, 1), quad[4..8]);
+    assert_eq!(pixel(1, 2), quad[8..12]);
+    assert_eq!(pixel(3, 3), quad[12..16]);
+    // Mipmaps of a black and white checkerboard: gray, level 0 kept.
+    let mipped = layout(format::B8G8R8A8_UNORM, 8, 8, 4, 1);
+    r.create(4, &mipped, 0).unwrap();
+    let mut texels = vec![0u8; mipped.total_bytes() as usize];
+    for i in 0..64 {
+        let v = if (i % 8 + i / 8) % 2 == 1 { 255 } else { 0 };
+        texels[i * 4..i * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+    }
+    r.upload(4, &texels).unwrap();
+    r.generate_mips(4, 0, u32::MAX, 0, 1).unwrap();
+    let mut out = vec![0u8; texels.len()];
+    r.download(4, &mut out).unwrap();
+    assert_eq!(out[..256], texels[..256], "level 0 kept");
+    let last = mipped.image_offset(0, 3).unwrap() as usize;
+    let gray = &out[last..last + 4];
+    assert!(
+        gray[..3].iter().all(|&c| (126..=129).contains(&c)) && gray[3] == 255,
+        "1x1 level {gray:?} on {}",
         r.name()
     );
 }

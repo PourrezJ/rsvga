@@ -46,6 +46,9 @@ pub struct VertexBuffer {
     pub sid: Option<u32>,
     /// Byte offset.
     pub offset: u64,
+    /// Bytes readable from `offset` (`u64::MAX`: to the end); reads past
+    /// them return zeros.
+    pub size: u64,
     /// Bytes per vertex.
     pub stride: u32,
     /// Advances per instance.
@@ -81,6 +84,8 @@ pub enum Resource {
     },
     /// A sampler.
     Sampler(SamplerState),
+    /// Constants given with the draw: element `n` of [`Draw::data`].
+    Data(usize),
     /// A shader resource view of a buffer: typed elements.
     TexelBuffer {
         /// Buffer surface.
@@ -147,6 +152,18 @@ pub enum Call {
     },
 }
 
+/// The attachments of an open rendering: a draw with the same ones (that
+/// reads none of them and counts no occlusion) continues it, without a
+/// barrier or a new rendering. Anything else recorded ends it first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pass {
+    colors: Vec<vk::ImageView>,
+    depth: vk::ImageView,
+    extent: (u32, u32),
+    /// Surfaces of the attachments.
+    sids: Vec<u32>,
+}
+
 /// Everything a draw uses.
 #[derive(Clone, Debug)]
 pub struct Draw<'a> {
@@ -178,6 +195,11 @@ pub struct Draw<'a> {
     pub scissors: Vec<ScissorRect>,
     /// Descriptors, for both stages.
     pub resources: Vec<Bound>,
+    /// Constant data of [`Resource::Data`] bindings.
+    pub data: Vec<Vec<u8>>,
+    /// Occlusion query slot counting the draw's samples
+    /// ([`Renderer::occlusion_slot`]).
+    pub occlusion: Option<u32>,
     /// The call.
     pub call: Call,
 }
@@ -205,6 +227,15 @@ pub(crate) struct Null {
     images: Vec<vk::Image>,
     /// By `VkImageViewType` raw value.
     views: HashMap<i32, vk::ImageView>,
+}
+
+/// A shader's hash: the one computed at translation, else its code's.
+fn shader_hash(shader: &Shader) -> u64 {
+    if shader.hash != 0 {
+        shader.hash
+    } else {
+        hash(&shader.spirv)
+    }
 }
 
 fn hash(words: &[u32]) -> u64 {
@@ -353,7 +384,7 @@ pub fn default_blend() -> BlendState {
 
 impl Renderer {
     fn module(&mut self, shader: &Shader) -> Result<vk::ShaderModule, Error> {
-        let key = hash(&shader.spirv);
+        let key = shader_hash(shader);
         if let Some(m) = self.draw.modules.get(&key) {
             return Ok(*m);
         }
@@ -463,7 +494,7 @@ impl Renderer {
         } else {
             (format, aspect)
         };
-        let total_mips = surface.layout.mip_levels();
+        let total_mips = surface.mips;
         let total_layers = surface.layout.layers();
         let first_mip = mips.0.min(total_mips.saturating_sub(1));
         let mip_count = mips.1.min(total_mips.saturating_sub(first_mip)).max(1);
@@ -769,6 +800,12 @@ impl Renderer {
         let Some((vk_topology, restart)) = topology(draw.topology) else {
             return err(format!("topology {}", draw.topology));
         };
+        // Many draws go to the GPU in pieces, so that it works while the
+        // rest is recorded (before anything of this draw is).
+        if self.draws >= super::DRAWS_PER_SUBMISSION {
+            self.flush()?;
+        }
+        self.draws = self.draws.saturating_add(1);
         // Attachments and the render area.
         let mut extent = (u32::MAX, u32::MAX);
         let mut samples = 1u32;
@@ -833,8 +870,30 @@ impl Renderer {
             samples,
         )?;
         let writes = self.descriptors(draw)?;
-        // Record.
-        let cmd = self.barrier()?;
+        // Record, continuing the open rendering when possible.
+        let pass = Pass {
+            colors: color_views[..used_targets].to_vec(),
+            depth: depth_view,
+            extent,
+            sids: draw
+                .targets
+                .iter()
+                .flatten()
+                .chain(draw.depth.iter())
+                .map(|t| t.sid)
+                .collect(),
+        };
+        let reads_attachment = draw.resources.iter().any(|b| match b.resource {
+            Resource::Texture { sid, .. } | Resource::TexelBuffer { sid, .. } => {
+                pass.sids.contains(&sid)
+            }
+            _ => false,
+        });
+        let continues = self.pass.as_ref() == Some(&pass)
+            && self.recording
+            && !reads_attachment
+            && draw.occlusion.is_none();
+        let cmd = if continues { self.cmd } else { self.barrier()? };
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = color_views[..used_targets]
             .iter()
             .map(|v| {
@@ -911,10 +970,30 @@ impl Renderer {
             .as_ref()
             .ok_or_else(|| Error("no push descriptors".into()))?;
         let null_buffer = self.draw.null.as_ref().map(|n| n.buffer);
+        let occlusion = match (draw.occlusion, self.occlusion) {
+            (Some(slot), Some((pool, _))) => Some((pool, slot)),
+            _ => None,
+        };
+        let precise = if self.features.precise_occlusion {
+            vk::QueryControlFlags::PRECISE
+        } else {
+            vk::QueryControlFlags::empty()
+        };
         // SAFETY: recording; every object is live and matches the pipeline
         // (formats, bindings, vertex inputs).
         unsafe {
-            self.device.cmd_begin_rendering(cmd, &rendering);
+            if !continues {
+                if let Some((pool, slot)) = occlusion {
+                    // Outside the rendering, as Vulkan requires.
+                    self.device.cmd_reset_query_pool(cmd, pool, slot, 1);
+                }
+                self.device.cmd_begin_rendering(cmd, &rendering);
+            }
+            // Open from here: whatever happens next ends it properly.
+            self.pass = Some(pass.clone());
+            if let Some((pool, slot)) = occlusion {
+                self.device.cmd_begin_query(cmd, pool, slot, precise);
+            }
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             self.device.cmd_set_viewport_with_count(cmd, &viewports);
@@ -935,11 +1014,14 @@ impl Renderer {
                 );
             }
             for vb in &draw.buffers {
-                let (buffer, offset) = match vb.sid.and_then(|sid| self.buffer(sid).ok()) {
-                    Some((b, size)) if vb.offset < size => (b, vb.offset),
+                let (buffer, offset, size) = match vb.sid.and_then(|sid| self.buffer(sid).ok()) {
+                    Some((b, total)) if vb.offset < total => {
+                        (b, vb.offset, vb.size.min(total.saturating_sub(vb.offset)))
+                    }
                     _ => (
                         null_buffer.ok_or_else(|| Error("no null buffer".into()))?,
                         0,
+                        vk::WHOLE_SIZE,
                     ),
                 };
                 self.device.cmd_bind_vertex_buffers2(
@@ -947,7 +1029,7 @@ impl Renderer {
                     vb.binding,
                     &[buffer],
                     &[offset],
-                    None,
+                    Some(&[size]),
                     Some(&[u64::from(vb.stride)]),
                 );
             }
@@ -968,7 +1050,11 @@ impl Renderer {
                     first_instance,
                 } => {
                     let Some((sid, format, offset)) = draw.index else {
+                        if let Some((pool, slot)) = occlusion {
+                            self.device.cmd_end_query(cmd, pool, slot);
+                        }
                         self.device.cmd_end_rendering(cmd);
+                        self.pass = None;
                         return err("indexed draw without an index buffer");
                     };
                     let (buffer, _) = self.buffer(sid)?;
@@ -988,7 +1074,12 @@ impl Renderer {
                     );
                 }
             }
-            self.device.cmd_end_rendering(cmd);
+            if let Some((pool, slot)) = occlusion {
+                self.device.cmd_end_query(cmd, pool, slot);
+                // A query's draw stands alone.
+                self.device.cmd_end_rendering(cmd);
+                self.pass = None;
+            }
         }
         Ok(())
     }
@@ -1018,6 +1109,23 @@ impl Renderer {
                             },
                         ),
                         _ => self.null_buffer(b.binding)?,
+                    }
+                }
+                (BindingKind::ConstantBuffer { .. }, Resource::Data(n)) => {
+                    match draw.data.get(n).filter(|d| !d.is_empty()) {
+                        Some(bytes) => {
+                            let bytes = &bytes[..bytes.len().min(65_536)];
+                            let (buffer, offset) = self.uniform_slice(bytes)?;
+                            Write::Buffer(
+                                b.binding,
+                                vk::DescriptorBufferInfo {
+                                    buffer,
+                                    offset,
+                                    range: bytes.len() as u64,
+                                },
+                            )
+                        }
+                        None => self.null_buffer(b.binding)?,
                     }
                 }
                 (BindingKind::ConstantBuffer { .. }, _) => self.null_buffer(b.binding)?,
@@ -1130,8 +1238,8 @@ impl Renderer {
         let (blend, _, sample_mask) = &draw.blend;
         // The key: everything fixed in the pipeline.
         let mut key = Key::default();
-        key.u64(hash(&draw.vs.spirv))
-            .u64(draw.ps.map_or(0, |p| hash(&p.spirv)))
+        key.u64(shader_hash(draw.vs))
+            .u64(draw.ps.map_or(0, shader_hash))
             .u64(layout.as_raw())
             .u32(u32::try_from(topology.as_raw()).unwrap_or(0))
             .u32(u32::from(restart));
@@ -1358,6 +1466,152 @@ impl Renderer {
         Ok(pipeline)
     }
 
+    /// Clears rectangles (x, y, width, height) of render targets, as
+    /// Direct3D 9's `Clear` does: `color` in every color target, `depth`
+    /// and `stencil` in the depth-stencil target when given.
+    pub fn clear_rects(
+        &mut self,
+        targets: &[Option<Target>; 8],
+        depth: Option<Target>,
+        color: Option<[f32; 4]>,
+        depth_stencil: (Option<f32>, Option<u8>),
+        rects: &[(u32, u32, u32, u32)],
+    ) -> Result<(), Error> {
+        let mut extent = (u32::MAX, u32::MAX);
+        let mut colors = Vec::new();
+        let mut attachments = Vec::new();
+        for t in targets.iter().flatten() {
+            let (f, aspect) = self.view_format(t.format)?;
+            let size = self.surface(t.sid)?.layout.mip_size(t.mip);
+            extent = (extent.0.min(size.width), extent.1.min(size.height));
+            let view = self.image_view(
+                t.sid,
+                f,
+                aspect,
+                vk::ImageViewType::TYPE_2D,
+                (t.mip, 1),
+                (t.first_layer, 1),
+                vk::ComponentMapping::default(),
+            )?;
+            if let Some(c) = color {
+                attachments.push(
+                    vk::ClearAttachment::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .color_attachment(u32::try_from(colors.len()).unwrap_or(0))
+                        .clear_value(vk::ClearValue {
+                            color: format::clear_value(f, c),
+                        }),
+                );
+            }
+            colors.push(view);
+        }
+        let mut depth_view = vk::ImageView::null();
+        let mut depth_aspect = vk::ImageAspectFlags::empty();
+        if let Some(t) = depth {
+            let (f, aspect) = self.view_format(t.format)?;
+            let size = self.surface(t.sid)?.layout.mip_size(t.mip);
+            extent = (extent.0.min(size.width), extent.1.min(size.height));
+            depth_aspect = aspect;
+            depth_view = self.image_view(
+                t.sid,
+                f,
+                aspect,
+                vk::ImageViewType::TYPE_2D,
+                (t.mip, 1),
+                (t.first_layer, 1),
+                vk::ComponentMapping::default(),
+            )?;
+            let mut clear = vk::ImageAspectFlags::empty();
+            if depth_stencil.0.is_some() && aspect.contains(vk::ImageAspectFlags::DEPTH) {
+                clear |= vk::ImageAspectFlags::DEPTH;
+            }
+            if depth_stencil.1.is_some() && aspect.contains(vk::ImageAspectFlags::STENCIL) {
+                clear |= vk::ImageAspectFlags::STENCIL;
+            }
+            if !clear.is_empty() {
+                attachments.push(
+                    vk::ClearAttachment::default()
+                        .aspect_mask(clear)
+                        .clear_value(vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: depth_stencil.0.unwrap_or(0.0).clamp(0.0, 1.0),
+                                stencil: u32::from(depth_stencil.1.unwrap_or(0)),
+                            },
+                        }),
+                );
+            }
+        }
+        if extent.0 == u32::MAX || attachments.is_empty() {
+            return Ok(());
+        }
+        let clip: Vec<vk::ClearRect> = rects
+            .iter()
+            .filter_map(|&(x, y, w, h)| {
+                let x1 = x.saturating_add(w).min(extent.0);
+                let y1 = y.saturating_add(h).min(extent.1);
+                (x < x1 && y < y1).then(|| vk::ClearRect {
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: x as i32,
+                            y: y as i32,
+                        },
+                        extent: vk::Extent2D {
+                            width: x1.saturating_sub(x),
+                            height: y1.saturating_sub(y),
+                        },
+                    },
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+            })
+            .collect();
+        if clip.is_empty() {
+            return Ok(());
+        }
+        let color_infos: Vec<vk::RenderingAttachmentInfo<'_>> = colors
+            .iter()
+            .map(|v| {
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(*v)
+                    .image_layout(vk::ImageLayout::GENERAL)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+            })
+            .collect();
+        let depth_info = vk::RenderingAttachmentInfo::default()
+            .image_view(depth_view)
+            .image_layout(vk::ImageLayout::GENERAL)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE);
+        let mut rendering = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: vk::Extent2D {
+                    width: extent.0.max(1),
+                    height: extent.1.max(1),
+                },
+            })
+            .layer_count(1)
+            .color_attachments(&color_infos);
+        if depth_view != vk::ImageView::null() {
+            if depth_aspect.contains(vk::ImageAspectFlags::DEPTH) {
+                rendering = rendering.depth_attachment(&depth_info);
+            }
+            if depth_aspect.contains(vk::ImageAspectFlags::STENCIL) {
+                rendering = rendering.stencil_attachment(&depth_info);
+            }
+        }
+        let cmd = self.barrier()?;
+        // SAFETY: recording; the views are live and the rectangles lie
+        // within the render area.
+        unsafe {
+            self.device.cmd_begin_rendering(cmd, &rendering);
+            self.device.cmd_clear_attachments(cmd, &attachments, &clip);
+            self.device.cmd_end_rendering(cmd);
+        }
+        Ok(())
+    }
+
     /// Clears a depth-stencil view: `flags` bit 1 depth, bit 2 stencil
     /// (`SVGA3D_CLEAR_*`).
     pub fn clear_depth_stencil(
@@ -1451,9 +1705,22 @@ fn default_sampler() -> SamplerState {
     }
 }
 
-/// View swizzles: X8 formats read alpha as one.
+/// View swizzles: X8 formats read alpha as one; Direct3D 9 depth
+/// textures read their depth in every component.
 fn swizzle(format: u32) -> vk::ComponentMapping {
     use svga_proto::format as f;
+    if matches!(
+        format,
+        f::Z_D16 | f::Z_D24S8 | f::Z_D24X8 | f::Z_DF16 | f::Z_DF24 | f::Z_D24S8_INT
+    ) {
+        let r = vk::ComponentSwizzle::R;
+        return vk::ComponentMapping {
+            r,
+            g: r,
+            b: r,
+            a: r,
+        };
+    }
     let one_alpha = matches!(
         format,
         f::X8R8G8B8

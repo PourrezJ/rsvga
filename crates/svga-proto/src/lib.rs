@@ -429,6 +429,42 @@ pub mod cmd3d {
     /// First 3D context command of the DX interface.
     pub const DX_DEFINE_CONTEXT: u32 = 1143;
 
+    // Legacy 3D contexts (VMware's Direct3D 9 driver): render states,
+    // texture stages, the fixed-function pipeline, Direct3D 9 shaders.
+    pub const SURFACE_STRETCHBLT: u32 = 1043;
+    pub const CONTEXT_DEFINE: u32 = 1045;
+    pub const CONTEXT_DESTROY: u32 = 1046;
+    pub const SETTRANSFORM: u32 = 1047;
+    pub const SETZRANGE: u32 = 1048;
+    pub const SETRENDERSTATE: u32 = 1049;
+    pub const SETRENDERTARGET: u32 = 1050;
+    pub const SETTEXTURESTATE: u32 = 1051;
+    pub const SETMATERIAL: u32 = 1052;
+    pub const SETLIGHTDATA: u32 = 1053;
+    pub const SETLIGHTENABLED: u32 = 1054;
+    pub const SETVIEWPORT: u32 = 1055;
+    pub const SETCLIPPLANE: u32 = 1056;
+    pub const CLEAR: u32 = 1057;
+    pub const SHADER_DEFINE: u32 = 1059;
+    pub const SHADER_DESTROY: u32 = 1060;
+    pub const SET_SHADER: u32 = 1061;
+    pub const SET_SHADER_CONST: u32 = 1062;
+    pub const DRAW_PRIMITIVES: u32 = 1063;
+    pub const SETSCISSORRECT: u32 = 1064;
+    pub const GENERATE_MIPMAPS: u32 = 1071;
+    pub const DEFINE_GB_CONTEXT: u32 = 1107;
+    pub const DESTROY_GB_CONTEXT: u32 = 1108;
+    pub const BIND_GB_CONTEXT: u32 = 1109;
+    pub const READBACK_GB_CONTEXT: u32 = 1110;
+    pub const INVALIDATE_GB_CONTEXT: u32 = 1111;
+    pub const DEFINE_GB_SHADER: u32 = 1112;
+    pub const DESTROY_GB_SHADER: u32 = 1113;
+    pub const BIND_GB_SHADER: u32 = 1114;
+    pub const BEGIN_GB_QUERY: u32 = 1116;
+    pub const END_GB_QUERY: u32 = 1117;
+    pub const WAIT_FOR_GB_QUERY: u32 = 1118;
+    pub const SET_GB_SHADERCONSTS_INLINE: u32 = 1130;
+
     // Guest-backed objects: memory objects (MOBs), object tables, surfaces
     // and screen targets.
     pub const SURFACE_COPY: u32 = 1042;
@@ -661,6 +697,9 @@ pub mod stflag {
 pub mod surface_flag {
     /// Six faces per layer.
     pub const CUBEMAP: u64 = 1 << 0;
+    /// The device keeps a whole mip chain behind the first level
+    /// (Direct3D 9 `AUTOGENMIPMAP`), filled by `GENERATE_MIPMAPS`.
+    pub const AUTOGENMIPMAPS: u64 = 1 << 10;
     /// A 3D texture.
     pub const VOLUME: u64 = 1 << 15;
     /// Shown by a screen target.
@@ -787,21 +826,94 @@ pub mod cb {
 pub mod devcap {
     #![allow(missing_docs)]
     pub const THREE_D: u32 = 0;
+    pub const MAX_LIGHTS: u32 = 1;
+    pub const MAX_TEXTURES: u32 = 2;
+    pub const MAX_CLIP_PLANES: u32 = 3;
     pub const VERTEX_SHADER_VERSION: u32 = 4;
     pub const VERTEX_SHADER: u32 = 5;
     pub const FRAGMENT_SHADER_VERSION: u32 = 6;
     pub const FRAGMENT_SHADER: u32 = 7;
     pub const MAX_RENDER_TARGETS: u32 = 8;
+    pub const S23E8_TEXTURES: u32 = 9;
+    pub const S10E5_TEXTURES: u32 = 10;
+    pub const MAX_FIXED_VERTEXBLEND: u32 = 11;
+    pub const D16_BUFFER_FORMAT: u32 = 12;
+    pub const D24S8_BUFFER_FORMAT: u32 = 13;
+    pub const D24X8_BUFFER_FORMAT: u32 = 14;
+    pub const QUERY_TYPES: u32 = 15;
+    pub const TEXTURE_GRADIENT_SAMPLING: u32 = 16;
+    /// A float.
+    pub const MAX_POINT_SIZE: u32 = 17;
+    pub const MAX_SHADER_TEXTURES: u32 = 18;
     pub const MAX_TEXTURE_WIDTH: u32 = 19;
     pub const MAX_TEXTURE_HEIGHT: u32 = 20;
     pub const MAX_VOLUME_EXTENT: u32 = 21;
     pub const MAX_TEXTURE_REPEAT: u32 = 22;
+    pub const MAX_TEXTURE_ASPECT_RATIO: u32 = 23;
     pub const MAX_TEXTURE_ANISOTROPY: u32 = 24;
     pub const MAX_PRIMITIVE_COUNT: u32 = 25;
     pub const MAX_VERTEX_INDEX: u32 = 26;
+    pub const MAX_VERTEX_SHADER_INSTRUCTIONS: u32 = 27;
+    pub const MAX_FRAGMENT_SHADER_INSTRUCTIONS: u32 = 28;
+    pub const MAX_VERTEX_SHADER_TEMPS: u32 = 29;
+    pub const MAX_FRAGMENT_SHADER_TEMPS: u32 = 30;
+    /// `D3DTEXOPCAPS_*` of fixed-function texture stages.
+    pub const TEXTURE_OPS: u32 = 31;
+    // `SVGA3DFORMAT_OP_*` of Direct3D 9 formats (see `format_op`).
+    pub const SURFACEFMT_X8R8G8B8: u32 = 32;
+    pub const SURFACEFMT_A8R8G8B8: u32 = 33;
+    pub const SURFACEFMT_A2R10G10B10: u32 = 34;
+    pub const SURFACEFMT_X1R5G5B5: u32 = 35;
+    pub const SURFACEFMT_A1R5G5B5: u32 = 36;
+    pub const SURFACEFMT_A4R4G4B4: u32 = 37;
+    pub const SURFACEFMT_R5G6B5: u32 = 38;
+    pub const SURFACEFMT_LUMINANCE16: u32 = 39;
+    pub const SURFACEFMT_LUMINANCE8_ALPHA8: u32 = 40;
+    pub const SURFACEFMT_ALPHA8: u32 = 41;
+    pub const SURFACEFMT_LUMINANCE8: u32 = 42;
+    pub const SURFACEFMT_Z_D16: u32 = 43;
+    pub const SURFACEFMT_Z_D24S8: u32 = 44;
+    pub const SURFACEFMT_Z_D24X8: u32 = 45;
+    pub const SURFACEFMT_DXT1: u32 = 46;
+    pub const SURFACEFMT_DXT2: u32 = 47;
+    pub const SURFACEFMT_DXT3: u32 = 48;
+    pub const SURFACEFMT_DXT4: u32 = 49;
+    pub const SURFACEFMT_DXT5: u32 = 50;
+    pub const SURFACEFMT_BUMPX8L8V8U8: u32 = 51;
+    pub const SURFACEFMT_A2W10V10U10: u32 = 52;
+    pub const SURFACEFMT_BUMPU8V8: u32 = 53;
+    pub const SURFACEFMT_Q8W8V8U8: u32 = 54;
+    pub const SURFACEFMT_CXV8U8: u32 = 55;
+    pub const SURFACEFMT_R_S10E5: u32 = 56;
+    pub const SURFACEFMT_R_S23E8: u32 = 57;
+    pub const SURFACEFMT_RG_S10E5: u32 = 58;
+    pub const SURFACEFMT_RG_S23E8: u32 = 59;
+    pub const SURFACEFMT_ARGB_S10E5: u32 = 60;
+    pub const SURFACEFMT_ARGB_S23E8: u32 = 61;
+    pub const MAX_VERTEX_SHADER_TEXTURES: u32 = 63;
     pub const MAX_SIMULTANEOUS_RENDER_TARGETS: u32 = 64;
+    pub const SURFACEFMT_V16U16: u32 = 65;
+    pub const SURFACEFMT_G16R16: u32 = 66;
+    pub const SURFACEFMT_A16B16G16R16: u32 = 67;
+    pub const SURFACEFMT_UYVY: u32 = 68;
+    pub const SURFACEFMT_YUY2: u32 = 69;
+    pub const AUTOGENMIPMAPS: u32 = 74;
+    pub const SURFACEFMT_NV12: u32 = 75;
     pub const MAX_CONTEXT_IDS: u32 = 77;
     pub const MAX_SURFACE_IDS: u32 = 78;
+    pub const SURFACEFMT_Z_DF16: u32 = 79;
+    pub const SURFACEFMT_Z_DF24: u32 = 80;
+    pub const SURFACEFMT_Z_D24S8_INT: u32 = 81;
+    pub const SURFACEFMT_ATI1: u32 = 82;
+    pub const SURFACEFMT_ATI2: u32 = 83;
+    pub const LINE_AA: u32 = 87;
+    pub const LINE_STIPPLE: u32 = 88;
+    /// A float.
+    pub const MAX_LINE_WIDTH: u32 = 89;
+    /// A float.
+    pub const MAX_AA_LINE_WIDTH: u32 = 90;
+    pub const SURFACEFMT_YV12: u32 = 91;
+    pub const TS_COLOR_KEY: u32 = 93;
     pub const DXCONTEXT: u32 = 95;
     pub const DX_MAX_VERTEXBUFFERS: u32 = 97;
     pub const DX_MAX_CONSTANT_BUFFERS: u32 = 98;
@@ -915,6 +1027,44 @@ pub mod dx {
     pub const MAX_ELEMENTS: usize = 32;
     /// Declarations of a stream-output object.
     pub const MAX_STREAMOUT_DECLS: usize = 64;
+}
+
+/// What a Direct3D 9 format can be used for (`SVGA3dFormatOp`, the bits of
+/// `D3DFORMAT_OP_*`): values of the legacy `SURFACEFMT_*` devcaps.
+pub mod format_op {
+    #![allow(missing_docs)]
+    pub const TEXTURE: u32 = 0x0000_0001;
+    pub const VOLUMETEXTURE: u32 = 0x0000_0002;
+    pub const CUBETEXTURE: u32 = 0x0000_0004;
+    pub const OFFSCREEN_RENDERTARGET: u32 = 0x0000_0008;
+    pub const SAME_FORMAT_RENDERTARGET: u32 = 0x0000_0010;
+    pub const ZSTENCIL: u32 = 0x0000_0040;
+    pub const ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH: u32 = 0x0000_0080;
+    pub const SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET: u32 = 0x0000_0100;
+    pub const DISPLAYMODE: u32 = 0x0000_0400;
+    pub const THREE_D_ACCELERATION: u32 = 0x0000_0800;
+    pub const PIXELSIZE: u32 = 0x0000_1000;
+    pub const CONVERT_TO_ARGB: u32 = 0x0000_2000;
+    pub const OFFSCREENPLAIN: u32 = 0x0000_4000;
+    pub const SRGBREAD: u32 = 0x0000_8000;
+    pub const BUMPMAP: u32 = 0x0001_0000;
+    pub const DMAP: u32 = 0x0002_0000;
+    pub const NOFILTER: u32 = 0x0004_0000;
+    pub const MEMBEROFGROUP_ARGB: u32 = 0x0008_0000;
+    pub const SRGBWRITE: u32 = 0x0010_0000;
+    pub const NOALPHABLEND: u32 = 0x0020_0000;
+    pub const AUTOGENMIPMAP: u32 = 0x0040_0000;
+    pub const VERTEXTEXTURE: u32 = 0x0080_0000;
+    pub const NOTEXCOORDWRAPNORMIP: u32 = 0x0100_0000;
+}
+
+/// Legacy shader model versions (`SVGA3dShaderVersion`).
+pub mod shader_version {
+    #![allow(missing_docs)]
+    pub const VS_30: u32 = 7;
+    pub const VS_40: u32 = 9;
+    pub const PS_30: u32 = 13;
+    pub const PS_40: u32 = 15;
 }
 
 /// What a surface format can do (`SVGA3D_DXFMT_*`), the value of its

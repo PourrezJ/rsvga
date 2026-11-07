@@ -101,7 +101,7 @@ pub fn kind(format: u32, d24s8: bool, a8: bool) -> Option<Kind> {
         f::DXT1 => color(V::BC1_RGBA_UNORM_BLOCK),
         f::DXT2 | f::DXT3 => color(V::BC2_UNORM_BLOCK),
         f::DXT4 | f::DXT5 => color(V::BC3_UNORM_BLOCK),
-        f::Z_D16 => Some(Kind::Depth(V::D16_UNORM)),
+        f::Z_D16 | f::Z_DF16 => Some(Kind::Depth(V::D16_UNORM)),
 
         // DXGI formats.
         f::R32G32B32A32_TYPELESS | f::R32G32B32A32_UINT => color(V::R32G32B32A32_UINT),
@@ -173,12 +173,22 @@ pub fn kind(format: u32, d24s8: bool, a8: bool) -> Option<Kind> {
         f::B4G4R4A4_UNORM => color(V::A4R4G4B4_UNORM_PACK16),
 
         // 24-bit depth: native where it exists.
-        f::Z_D24S8 | f::Z_D24X8 | f::D24_UNORM_S8_UINT | f::R24G8_TYPELESS if d24s8 => {
+        f::Z_D24S8
+        | f::Z_D24X8
+        | f::Z_DF24
+        | f::Z_D24S8_INT
+        | f::D24_UNORM_S8_UINT
+        | f::R24G8_TYPELESS
+            if d24s8 =>
+        {
             Some(Kind::Depth(V::D24_UNORM_S8_UINT))
         }
-        f::Z_D24S8 | f::Z_D24X8 | f::D24_UNORM_S8_UINT | f::R24G8_TYPELESS => {
-            Some(Kind::DepthConverted(V::D32_SFLOAT_S8_UINT))
-        }
+        f::Z_D24S8
+        | f::Z_D24X8
+        | f::Z_DF24
+        | f::Z_D24S8_INT
+        | f::D24_UNORM_S8_UINT
+        | f::R24G8_TYPELESS => Some(Kind::DepthConverted(V::D32_SFLOAT_S8_UINT)),
         f::D32_FLOAT_S8X24_UINT | f::R32G8X24_TYPELESS => {
             Some(Kind::DepthConverted(V::D32_SFLOAT_S8_UINT))
         }

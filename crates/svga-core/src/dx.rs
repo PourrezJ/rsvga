@@ -48,7 +48,7 @@ impl ShaderStage {
     }
 }
 
-/// A vertex buffer binding (`SVGA3dVertexBuffer`).
+/// A vertex buffer binding (`SVGA3dVertexBuffer`, `SVGA3dVertexBuffer_v2`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexBuffer {
     /// Buffer surface, or `SVGA3D_INVALID_ID` to unbind.
@@ -57,6 +57,24 @@ pub struct VertexBuffer {
     pub stride: u32,
     /// Byte offset of the first vertex.
     pub offset: u32,
+    /// Bytes readable from `offset` ([`WHOLE_SIZE`]: to the end).
+    pub size: u32,
+}
+
+/// The size of bindings made by the commands that give none: the rest of
+/// the buffer.
+pub const WHOLE_SIZE: u32 = u32::MAX;
+
+/// Stride, offset and size of a vertex buffer slot
+/// (`SVGA3dVertexBufferOffsetAndSize`): the surface stays bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VertexBufferRange {
+    /// Bytes between vertices.
+    pub stride: u32,
+    /// Byte offset of the first vertex.
+    pub offset: u32,
+    /// Bytes readable from `offset`.
+    pub size: u32,
 }
 
 /// A stream-output target (`SVGA3dSoTarget`).
@@ -480,14 +498,22 @@ pub enum DxCommand {
         /// Element layout (`SVGA3D_INVALID_ID`: none).
         layout: u32,
     },
-    /// Binds vertex buffers from slot `start`.
+    /// Binds vertex buffers from slot `start` (`_V2`: with sizes).
     SetVertexBuffers {
         /// First slot.
         start: u32,
         /// Bindings.
         buffers: Vec<VertexBuffer>,
     },
-    /// Binds the index buffer.
+    /// Changes stride, offset and size of the vertex buffers bound from
+    /// slot `start`.
+    SetVertexBuffersOffsetAndSize {
+        /// First slot.
+        start: u32,
+        /// New ranges.
+        ranges: Vec<VertexBufferRange>,
+    },
+    /// Binds the index buffer (`_V2`: with a size).
     SetIndexBuffer {
         /// Buffer surface (`SVGA3D_INVALID_ID`: none).
         sid: u32,
@@ -495,6 +521,17 @@ pub enum DxCommand {
         format: u32,
         /// Byte offset.
         offset: u32,
+        /// Bytes readable from `offset` ([`WHOLE_SIZE`]: to the end).
+        size: u32,
+    },
+    /// Changes format, offset and size of the bound index buffer.
+    SetIndexBufferOffsetAndSize {
+        /// `R16_UINT` or `R32_UINT`.
+        format: u32,
+        /// Byte offset.
+        offset: u32,
+        /// Bytes readable from `offset`.
+        size: u32,
     },
     /// Sets the primitive topology (`SVGA3dPrimitiveType`).
     SetTopology {
@@ -1051,7 +1088,11 @@ fn layout(id: u32) -> Option<(usize, usize, usize)> {
         DX_DRAW_AUTO => none(4),
         DX_SET_INPUT_LAYOUT => none(4),
         DX_SET_VERTEX_BUFFERS => Some((4, 12, dx::MAX_VERTEXBUFFERS)),
+        DX_SET_VERTEX_BUFFERS_V2 => Some((4, 16, dx::MAX_VERTEXBUFFERS)),
+        DX_SET_VERTEX_BUFFERS_OFFSET_AND_SIZE => Some((4, 12, dx::MAX_VERTEXBUFFERS)),
         DX_SET_INDEX_BUFFER => none(12),
+        DX_SET_INDEX_BUFFER_V2 => none(16),
+        DX_SET_INDEX_BUFFER_OFFSET_AND_SIZE => none(12),
         DX_SET_TOPOLOGY => none(4),
         DX_SET_RENDERTARGETS => Some((4, 4, dx::MAX_RENDER_TARGETS)),
         DX_SET_BLEND_STATE => none(24),
@@ -1324,7 +1365,7 @@ fn decode(id: u32, mut f: Fields<'_>, elements: &[&[u8]]) -> Result<DxCommand, D
         },
         DX_DRAW_AUTO => C::DrawAuto,
         DX_SET_INPUT_LAYOUT => C::SetInputLayout { layout: f.u32() },
-        DX_SET_VERTEX_BUFFERS => C::SetVertexBuffers {
+        DX_SET_VERTEX_BUFFERS | DX_SET_VERTEX_BUFFERS_V2 => C::SetVertexBuffers {
             start: f.u32(),
             buffers: elements
                 .iter()
@@ -1334,14 +1375,43 @@ fn decode(id: u32, mut f: Fields<'_>, elements: &[&[u8]]) -> Result<DxCommand, D
                         sid: e.u32(),
                         stride: e.u32(),
                         offset: e.u32(),
+                        size: if id == DX_SET_VERTEX_BUFFERS_V2 {
+                            e.u32()
+                        } else {
+                            WHOLE_SIZE
+                        },
                     }
                 })
                 .collect(),
         },
-        DX_SET_INDEX_BUFFER => C::SetIndexBuffer {
+        DX_SET_VERTEX_BUFFERS_OFFSET_AND_SIZE => C::SetVertexBuffersOffsetAndSize {
+            start: f.u32(),
+            ranges: elements
+                .iter()
+                .map(|e| {
+                    let mut e = Fields::new(e);
+                    VertexBufferRange {
+                        stride: e.u32(),
+                        offset: e.u32(),
+                        size: e.u32(),
+                    }
+                })
+                .collect(),
+        },
+        DX_SET_INDEX_BUFFER | DX_SET_INDEX_BUFFER_V2 => C::SetIndexBuffer {
             sid: f.u32(),
             format: f.u32(),
             offset: f.u32(),
+            size: if id == DX_SET_INDEX_BUFFER_V2 {
+                f.u32()
+            } else {
+                WHOLE_SIZE
+            },
+        },
+        DX_SET_INDEX_BUFFER_OFFSET_AND_SIZE => C::SetIndexBufferOffsetAndSize {
+            format: f.u32(),
+            offset: f.u32(),
+            size: f.u32(),
         },
         DX_SET_TOPOLOGY => C::SetTopology { topology: f.u32() },
         DX_SET_RENDERTARGETS => C::SetRenderTargets {
@@ -1975,14 +2045,60 @@ mod tests {
                     VertexBuffer {
                         sid: 20,
                         stride: 16,
-                        offset: 0
+                        offset: 0,
+                        size: WHOLE_SIZE
                     },
                     VertexBuffer {
                         sid: 21,
                         stride: 8,
-                        offset: 64
+                        offset: 64,
+                        size: WHOLE_SIZE
                     }
                 ]
+            })
+        );
+        // The WDDM 2.0 driver's variants, with sizes.
+        assert_eq!(
+            run(DX_SET_VERTEX_BUFFERS_V2, words(&[2, 20, 16, 32, 96])),
+            Ok(DxCommand::SetVertexBuffers {
+                start: 2,
+                buffers: vec![VertexBuffer {
+                    sid: 20,
+                    stride: 16,
+                    offset: 32,
+                    size: 96
+                }]
+            })
+        );
+        assert_eq!(
+            run(
+                DX_SET_VERTEX_BUFFERS_OFFSET_AND_SIZE,
+                words(&[0, 12, 0, 48])
+            ),
+            Ok(DxCommand::SetVertexBuffersOffsetAndSize {
+                start: 0,
+                ranges: vec![VertexBufferRange {
+                    stride: 12,
+                    offset: 0,
+                    size: 48
+                }]
+            })
+        );
+        assert_eq!(
+            run(DX_SET_INDEX_BUFFER_V2, words(&[5, 89, 8, 12])),
+            Ok(DxCommand::SetIndexBuffer {
+                sid: 5,
+                format: 89,
+                offset: 8,
+                size: 12
+            })
+        );
+        assert_eq!(
+            run(DX_SET_INDEX_BUFFER_OFFSET_AND_SIZE, words(&[77, 4, 400])),
+            Ok(DxCommand::SetIndexBufferOffsetAndSize {
+                format: 77,
+                offset: 4,
+                size: 400
             })
         );
         assert_eq!(

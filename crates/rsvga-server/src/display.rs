@@ -32,9 +32,14 @@ impl Svga {
     /// framebuffer without telling us (FIFO off, firmware, traces on), in
     /// which case the whole screen is read. `None` when SVGA mode is off.
     pub fn capture(&self, frame: &mut Frame) -> Option<Shown> {
-        let mut state = self.lock();
+        let mut guard = self.lock();
         // Screen targets (guest-backed objects) come first: a driver that
-        // uses them shows nothing anywhere else.
+        // uses them shows nothing anywhere else. What the GPU has finished
+        // reading for them is shown first.
+        let state = &mut *guard;
+        if let Some(gpu) = state.gpu.as_mut() {
+            gpu.poll_screen(&mut state.gb);
+        }
         if let Some(changed) = state.gb.capture(frame) {
             let mode = Mode {
                 width: frame.width as u32,
@@ -64,7 +69,7 @@ impl Svga {
             state.damage.all();
         }
         let area = state.damage.take(mode.width, mode.height);
-        drop(state);
+        drop(guard);
 
         let (width, height) = (mode.width as usize, mode.height as usize);
         frame.width = width;

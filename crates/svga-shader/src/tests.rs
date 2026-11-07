@@ -32,6 +32,11 @@ fn validate(name: &str, spirv: &[u32]) -> Option<Result<(), String>> {
     })
 }
 
+/// [`validate`] for the other test modules.
+pub(crate) fn validate_spirv(name: &str, spirv: &[u32]) -> Option<Result<(), String>> {
+    validate(name, spirv)
+}
+
 fn check(name: &str, words: &[u32]) -> Shader {
     let shader =
         translate_words(words, &Options::default()).unwrap_or_else(|e| panic!("{name}: {e}"));

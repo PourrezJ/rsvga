@@ -43,3 +43,9 @@ path = "fuzz_targets/shader.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nine"
+path = "fuzz_targets/nine.rs"
+test = false
+doc = false

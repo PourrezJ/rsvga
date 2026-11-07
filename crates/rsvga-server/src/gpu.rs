@@ -15,13 +15,19 @@
 //! - a write to the device copy makes it the newer one; the next GPU use
 //!   uploads it.
 //!
-//! On the GPU: draws, clears and copies between surfaces. A draw gathers
+//! On the GPU: draws, clears, copies between surfaces (plain, scaled or
+//! converting), multisample resolves and mipmap generation. A draw gathers
 //! the context's bindings ([`Context::bindings`]) into a
 //! [`svga_render::Draw`]; its shaders are translated again when the
 //! vertex formats or render target views hold integers (the SPIR-V types
 //! must match), and those translations are cached. Geometry, hull and
 //! domain shaders, stream output, and raw or structured buffer views are
 //! not drawn yet.
+//!
+//! A device copy made only to fill a GPU copy is freed at once, and under
+//! memory pressure device copies of surfaces the GPU holds are freed after
+//! each command buffer: GPU copies are the ones that count, device copies
+//! come back (downloaded) when the guest or the CPU path needs them.
 //!
 //! Surfaces whose bytes cannot go to the GPU as they are (24-bit depth on
 //! AMD, multisampled images) live on the GPU only: their device copies
@@ -38,6 +44,9 @@ use svga_render::{At, Renderer};
 use svga_shader::{BindingKind, Options, Scalar, Shader};
 
 use crate::dxctx::Context;
+
+mod nine;
+mod screen;
 use crate::gb::Gb;
 use crate::guest::GuestMemory;
 
@@ -58,6 +67,24 @@ pub struct Gpu {
     newer: HashMap<u32, Newer>,
     /// Shaders translated with other than the default options.
     shaders: HashMap<(Arc<[u8]>, Options), Translation>,
+    /// Direct3D 9 shaders, by code and options.
+    shaders9: HashMap<(nine::Code, svga_shader::d3d9::Options), nine::Translation9>,
+    /// The device's own Direct3D 9 programs (pretransformed vertices by
+    /// vertex inputs, the default pixel shader), made once.
+    programs9: HashMap<Vec<(u32, u32)>, Arc<[u32]>>,
+    /// The legacy occlusion query being counted: context, its first
+    /// occlusion slot, and the samples of its slots already read.
+    query9: Option<(u32, u32, u64)>,
+    /// Ended queries waiting for their draws: MOB, offset, first and end
+    /// slot, samples already read. Written at the next flush, or at once
+    /// when the guest waits for one.
+    ended9: Vec<(u32, u32, u32, u32, u64)>,
+    /// Parts of the screen being read from the GPU, in order.
+    screen_reads: Vec<screen::ScreenRead>,
+}
+
+fn gpu_err(e: svga_render::Error) -> String {
+    e.to_string()
 }
 
 /// A translated shader, or why there is none.
@@ -78,7 +105,7 @@ struct Effects {
     gone: Vec<u32>,
 }
 
-fn gb_effects(command: &GbCommand, gb: &Gb) -> Effects {
+fn gb_effects(command: &GbCommand) -> Effects {
     let mut e = Effects::default();
     match command {
         GbCommand::DefineSurface(def) => e.gone.push(def.sid),
@@ -112,8 +139,6 @@ fn gb_effects(command: &GbCommand, gb: &Gb) -> Effects {
             e.host_uses.extend([*src, *dest]);
             e.host_writes.push(*dest);
         }
-        GbCommand::BindScreenTarget { image, .. } => e.host_uses.push(image.sid),
-        GbCommand::UpdateScreenTarget { stid, .. } => e.host_uses.extend(gb.target_surface(*stid)),
         _ => {}
     }
     e
@@ -145,6 +170,10 @@ pub fn runs_on_gpu(command: &DxCommand) -> bool {
             | DxCommand::DrawIndexedInstanced { .. }
             | DxCommand::PredCopy { .. }
             | DxCommand::PredCopyRegion { .. }
+            | DxCommand::ResolveCopy { .. }
+            | DxCommand::PredConvert { .. }
+            | DxCommand::PredConvertRegion { .. }
+            | DxCommand::GenMips { .. }
             | DxCommand::BufferCopy { .. }
             | DxCommand::TransferFromBuffer { .. }
             | DxCommand::SurfaceCopyAndReadback { .. }
@@ -172,6 +201,11 @@ impl Gpu {
             renderer,
             newer: HashMap::new(),
             shaders: HashMap::new(),
+            shaders9: HashMap::new(),
+            programs9: HashMap::new(),
+            query9: None,
+            ended9: Vec::new(),
+            screen_reads: Vec::new(),
         })
     }
 
@@ -182,6 +216,7 @@ impl Gpu {
 
     /// Forgets every surface (device reset).
     pub fn reset(&mut self) {
+        self.drop_screen_reads();
         for sid in self.newer.keys().copied().collect::<Vec<_>>() {
             self.drop_surface(sid);
         }
@@ -205,6 +240,7 @@ impl Gpu {
             return Ok(());
         }
         let host = gb.host_copy(guest, sid)?;
+        let _span = crate::prof::span(crate::prof::Cat::Download);
         self.renderer
             .download(sid, host)
             .map_err(|e| format!("GPU: reading surface {sid}: {e}"))
@@ -228,11 +264,20 @@ impl Gpu {
         if newer == Newer::Host && !self.renderer.copyable(sid) {
             self.newer.insert(sid, Newer::Same);
         } else if newer == Newer::Host {
+            // A device copy made only for this upload is not kept: the
+            // GPU copy becomes the only one.
+            let kept = gb.has_host_copy(sid);
+            let _span = crate::prof::span(crate::prof::Cat::Upload);
             let host = gb.host_copy(guest, sid)?;
             self.renderer
                 .upload(sid, host)
                 .map_err(|e| format!("GPU: filling surface {sid}: {e}"))?;
-            self.newer.insert(sid, Newer::Same);
+            if kept {
+                self.newer.insert(sid, Newer::Same);
+            } else {
+                gb.drop_host_copy(sid);
+                self.newer.insert(sid, Newer::Gpu);
+            }
         }
         Ok(())
     }
@@ -264,6 +309,143 @@ impl Gpu {
         }
     }
 
+    /// Runs a guest-backed command on the GPU when that saves a round trip
+    /// through the device copies; true if it did: `SURFACE_COPY` and
+    /// `DX_PRESENTBLT` of a source the GPU holds, and what screen targets
+    /// show (read from the GPU without waiting, see `screen`).
+    pub fn execute_gb(
+        &mut self,
+        command: &GbCommand,
+        gb: &mut Gb,
+        guest: &GuestMemory,
+    ) -> Result<bool, String> {
+        match *command {
+            GbCommand::SurfaceCopy {
+                src,
+                dest,
+                ref boxes,
+            } => return self.surface_copy(src, dest, boxes, gb, guest),
+            GbCommand::BindScreenTarget { stid, image } => {
+                // Binding shows the new image at once.
+                let all = gb.bind_screen(stid, image)?;
+                self.show(gb, guest, stid, all)?;
+                return Ok(true);
+            }
+            GbCommand::UpdateScreenTarget { stid, rect } => {
+                self.show(gb, guest, stid, rect)?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+        let GbCommand::PresentBlt {
+            src,
+            src_sub,
+            dest,
+            dest_sub,
+            src_box,
+            dest_box,
+            ..
+        } = *command
+        else {
+            return Ok(false);
+        };
+        if src == dest || self.newer.get(&src) != Some(&Newer::Gpu) {
+            return Ok(false);
+        }
+        let (from, to) = (
+            gb.subresource(src, src_sub)?,
+            gb.subresource(dest, dest_sub)?,
+        );
+        if [src_box.w, src_box.h, dest_box.w, dest_box.h].contains(&0) {
+            return Ok(false);
+        }
+        self.sync_gpu(gb, guest, dest)?;
+        let scaled = (src_box.w, src_box.h) != (dest_box.w, dest_box.h);
+        let done = self.renderer.blit(
+            dest,
+            At {
+                layer: to.face,
+                mip: to.mipmap,
+                offset: [dest_box.x, dest_box.y, 0],
+            },
+            [dest_box.w, dest_box.h, 1],
+            src,
+            At {
+                layer: from.face,
+                mip: from.mipmap,
+                offset: [src_box.x, src_box.y, 0],
+            },
+            [src_box.w, src_box.h, 1],
+            scaled,
+        );
+        match done {
+            Ok(()) => {
+                self.gpu_wrote(dest);
+                // Shown at once where a screen target displays it.
+                let rect = svga_core::command::Rect {
+                    x: dest_box.x,
+                    y: dest_box.y,
+                    width: dest_box.w,
+                    height: dest_box.h,
+                };
+                for stid in gb.screens_showing(to) {
+                    self.show(gb, guest, stid, rect)?;
+                }
+                Ok(true)
+            }
+            // Formats the GPU cannot blit: the device copies do it.
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// `SURFACE_COPY` on the GPU, when the source is there and both
+    /// images are on it (or can be). False: the device copies do it.
+    fn surface_copy(
+        &mut self,
+        src: svga_core::gb::ImageId,
+        dest: svga_core::gb::ImageId,
+        boxes: &[svga_core::gb::CopyBox],
+        gb: &mut Gb,
+        guest: &GuestMemory,
+    ) -> Result<bool, String> {
+        if src.sid == dest.sid || self.newer.get(&src.sid) != Some(&Newer::Gpu) {
+            return Ok(false);
+        }
+        if !self.renderer.has(src.sid) {
+            return Ok(false);
+        }
+        self.sync_gpu(gb, guest, dest.sid)?;
+        for (n, b) in boxes.iter().enumerate() {
+            let copied = self.renderer.copy_image(
+                dest.sid,
+                At {
+                    layer: dest.face,
+                    mip: dest.mipmap,
+                    offset: [b.dest.x, b.dest.y, b.dest.z],
+                },
+                src.sid,
+                At {
+                    layer: src.face,
+                    mip: src.mipmap,
+                    offset: [b.src.0, b.src.1, b.src.2],
+                },
+                [b.dest.w, b.dest.h, b.dest.d.max(1)],
+            );
+            match copied {
+                Ok(()) => {}
+                // Nothing done yet: the device copies try.
+                Err(_) if n == 0 => return Ok(false),
+                Err(e) => {
+                    // Boxes done on the GPU stay there.
+                    self.gpu_wrote(dest.sid);
+                    return Err(format!("GPU: surface copy: {e}"));
+                }
+            }
+        }
+        self.gpu_wrote(dest.sid);
+        Ok(true)
+    }
+
     /// Before a guest-backed command: GPU copies it reads come back, and
     /// surfaces it redefines leave the GPU.
     pub fn before_gb(
@@ -272,12 +454,30 @@ impl Gpu {
         gb: &mut Gb,
         guest: &GuestMemory,
     ) -> Result<(), String> {
-        self.apply_before(&gb_effects(command, gb), gb, guest)
+        let effects = gb_effects(command);
+        if effects
+            .host_uses
+            .iter()
+            .any(|sid| self.newer.get(sid) == Some(&Newer::Gpu))
+        {
+            crate::prof::count(match command {
+                GbCommand::SurfaceCopy { .. } => "readback for SurfaceCopy",
+                GbCommand::PresentBlt { .. } => "readback for PresentBlt",
+                GbCommand::ReadbackSurface { .. } => "readback for ReadbackSurface",
+                GbCommand::ReadbackImage { .. } => "readback for ReadbackImage",
+                GbCommand::ReadbackImagePartial { .. } => "readback for ReadbackImagePartial",
+                GbCommand::UpdateImage { .. } => "readback for UpdateImage",
+                GbCommand::UpdateSurface { .. } => "readback for UpdateSurface",
+                GbCommand::CondBindSurface { .. } => "readback for CondBindSurface",
+                _ => "readback for another GB command",
+            });
+        }
+        self.apply_before(&gb_effects(command), gb, guest)
     }
 
     /// After a guest-backed command: device copies it wrote are newer.
-    pub fn after_gb(&mut self, command: &GbCommand, gb: &Gb) {
-        self.apply_after(&gb_effects(command, gb));
+    pub fn after_gb(&mut self, command: &GbCommand) {
+        self.apply_after(&gb_effects(command));
     }
 
     /// Before a DX command that the context model executes on device
@@ -288,7 +488,15 @@ impl Gpu {
         gb: &mut Gb,
         guest: &GuestMemory,
     ) -> Result<(), String> {
-        self.apply_before(&dx_host_effects(command), gb, guest)
+        let effects = dx_host_effects(command);
+        if effects
+            .host_uses
+            .iter()
+            .any(|sid| self.newer.get(sid) == Some(&Newer::Gpu))
+        {
+            crate::prof::count("readback for a DX command");
+        }
+        self.apply_before(&effects, gb, guest)
     }
 
     /// After such a command.
@@ -310,7 +518,6 @@ impl Gpu {
         gb: &mut Gb,
         guest: &GuestMemory,
     ) -> Result<(), String> {
-        let gpu_err = |e: svga_render::Error| e.to_string();
         match *command {
             DxCommand::ClearRenderTargetView { view, color } => {
                 let Some(Object::RenderTargetView(target, range)) =
@@ -354,6 +561,117 @@ impl Gpu {
             | DxCommand::DrawIndexed { .. }
             | DxCommand::DrawInstanced { .. }
             | DxCommand::DrawIndexedInstanced { .. } => self.draw(command, context, gb, guest)?,
+            DxCommand::ResolveCopy {
+                dest,
+                dest_sub,
+                src,
+                src_sub,
+                ..
+            } => {
+                let (dl, dm) = Self::image_of(gb, dest, dest_sub)?;
+                let (sl, sm) = Self::image_of(gb, src, src_sub)?;
+                self.sync_gpu(gb, guest, src)?;
+                self.sync_gpu(gb, guest, dest)?;
+                let at = |layer, mip| At {
+                    layer,
+                    mip,
+                    offset: [0; 3],
+                };
+                self.renderer
+                    .resolve(dest, at(dl, dm), src, at(sl, sm))
+                    .map_err(gpu_err)?;
+                self.gpu_wrote(dest);
+            }
+            DxCommand::PredConvertRegion {
+                dest,
+                dest_sub,
+                dest_box,
+                src,
+                src_sub,
+                src_box,
+            } => {
+                let (dl, dm) = Self::image_of(gb, dest, dest_sub)?;
+                let (sl, sm) = Self::image_of(gb, src, src_sub)?;
+                self.sync_gpu(gb, guest, src)?;
+                self.sync_gpu(gb, guest, dest)?;
+                let scaled =
+                    (dest_box.w, dest_box.h, dest_box.d) != (src_box.w, src_box.h, src_box.d);
+                self.renderer
+                    .blit(
+                        dest,
+                        At {
+                            layer: dl,
+                            mip: dm,
+                            offset: [dest_box.x, dest_box.y, dest_box.z],
+                        },
+                        [dest_box.w, dest_box.h, dest_box.d],
+                        src,
+                        At {
+                            layer: sl,
+                            mip: sm,
+                            offset: [src_box.x, src_box.y, src_box.z],
+                        },
+                        [src_box.w, src_box.h, src_box.d],
+                        scaled,
+                    )
+                    .map_err(gpu_err)?;
+                self.gpu_wrote(dest);
+            }
+            DxCommand::PredConvert { dest, src } => {
+                self.sync_gpu(gb, guest, src)?;
+                self.sync_gpu(gb, guest, dest)?;
+                let shape = |sid| {
+                    gb.surface_shape(sid)
+                        .map(|(l, _)| l)
+                        .ok_or_else(|| format!("surface {sid} is not defined"))
+                };
+                let (s, d) = (shape(src)?, shape(dest)?);
+                // Every subresource both have, each scaled to fit.
+                for layer in 0..s.layers().min(d.layers()) {
+                    for mip in 0..s.mip_levels().min(d.mip_levels()) {
+                        let (a, b) = (s.mip_size(mip), d.mip_size(mip));
+                        let at = At {
+                            layer,
+                            mip,
+                            offset: [0; 3],
+                        };
+                        self.renderer
+                            .blit(
+                                dest,
+                                at,
+                                [b.width, b.height, b.depth],
+                                src,
+                                at,
+                                [a.width, a.height, a.depth],
+                                (a.width, a.height) != (b.width, b.height),
+                            )
+                            .map_err(gpu_err)?;
+                    }
+                }
+                self.gpu_wrote(dest);
+            }
+            DxCommand::GenMips { view } => {
+                let Some(Object::ShaderResourceView(t, range)) =
+                    context.object(dx::cotable::SRVIEW, view)
+                else {
+                    return Err(format!("shader resource view {view} is not defined"));
+                };
+                let SrvRange::Texture {
+                    most_detailed_mip,
+                    mip_levels,
+                    first_slice,
+                    slices,
+                } = *range
+                else {
+                    return Err("mipmaps of a buffer view".into());
+                };
+                let sid = t.sid;
+                self.sync_gpu(gb, guest, sid)?;
+                self.renderer
+                    .generate_mips(sid, most_detailed_mip, mip_levels, first_slice, slices)
+                    .map_err(gpu_err)?;
+                self.gpu_wrote(sid);
+            }
             DxCommand::PredCopy { dest, src } => {
                 self.sync_gpu(gb, guest, src)?;
                 self.sync_gpu(gb, guest, dest)?;
@@ -622,6 +940,10 @@ impl Gpu {
                 binding: slot,
                 sid: vb.map(|v| v.sid),
                 offset: vb.map_or(0, |v| u64::from(v.offset)),
+                size: vb.map_or(u64::MAX, |v| match v.size {
+                    svga_core::dx::WHOLE_SIZE => u64::MAX,
+                    size => u64::from(size),
+                }),
                 stride: vb.map_or(0, |v| v.stride),
                 per_instance,
             });
@@ -654,13 +976,14 @@ impl Gpu {
                 binding: free,
                 sid: None,
                 offset: 0,
+                size: u64::MAX,
                 stride: 0,
                 per_instance: false,
             });
         }
         let index = match call {
             Call::Indexed { .. } => {
-                let (sid, format, offset) = b.index_buffer;
+                let (sid, format, offset, _) = b.index_buffer;
                 if sid == INVALID_ID {
                     return Ok(());
                 }
@@ -780,6 +1103,8 @@ impl Gpu {
             viewports: b.viewports.clone(),
             scissors: b.scissors.clone(),
             resources,
+            data: Vec::new(),
+            occlusion: None,
             call,
         };
         self.renderer.draw(&draw).map_err(|e| e.to_string())?;
@@ -838,10 +1163,26 @@ impl Gpu {
         Ok(())
     }
 
-    /// Submits recorded GPU work (end of a command buffer).
-    pub fn flush(&mut self) {
+    /// Submits recorded GPU work (end of a command buffer). When device
+    /// copies use much of their budget, those of surfaces the GPU holds
+    /// are freed: they come back from the GPU when needed.
+    pub fn flush(&mut self, gb: &mut Gb, guest: &GuestMemory) {
         if let Err(e) = self.renderer.flush() {
             crate::log!("GPU: {e}");
+        }
+        let (busy, submissions) = self.renderer.gpu_time();
+        crate::prof::add(crate::prof::Cat::Gpu, busy, submissions);
+        self.poll_screen(gb);
+        if let Err(e) = self.settle_queries(gb, guest) {
+            crate::log!("GPU: occlusion queries: {e}");
+        }
+        if gb.host_pressure() {
+            for (sid, newer) in &mut self.newer {
+                if *newer != Newer::Host && self.renderer.copyable(*sid) {
+                    gb.drop_host_copy(*sid);
+                    *newer = Newer::Gpu;
+                }
+            }
         }
     }
 }
@@ -887,7 +1228,7 @@ mod tests {
         let run_gb = |gpu: &mut Gpu, gb: &mut Gb, c: GbCommand| {
             gpu.before_gb(&c, gb, &guest).unwrap();
             gb.execute(c.clone(), &guest).unwrap();
-            gpu.after_gb(&c, gb);
+            gpu.after_gb(&c);
         };
         // MOB 1: the staging surface's guest copy; MOB 2: the RTV table.
         for (id, page) in [(1, 1), (2, 2)] {
@@ -966,7 +1307,7 @@ mod tests {
         gpu.execute_dx(&clear, context, &mut gb, &guest).unwrap();
         let copy = DxCommand::PredCopy { dest: 11, src: 10 };
         gpu.execute_dx(&copy, context, &mut gb, &guest).unwrap();
-        gpu.flush();
+        gpu.flush(&mut gb, &guest);
         let mut pixel = [0u8; 4];
         assert!(ram.read(4096, &mut pixel));
         assert_eq!(pixel, [0; 4], "not read back yet");
@@ -1045,7 +1386,7 @@ mod draw_tests {
         fn gb(&mut self, c: GbCommand) {
             self.gpu.before_gb(&c, &mut self.gb, &self.guest).unwrap();
             self.gb.execute(c.clone(), &self.guest).unwrap();
-            self.gpu.after_gb(&c, &self.gb);
+            self.gpu.after_gb(&c);
         }
 
         fn dx(&mut self, c: DxCommand) {
@@ -1231,6 +1572,7 @@ mod draw_tests {
                 sid: 12,
                 stride: 20,
                 offset: 0,
+                size: svga_core::dx::WHOLE_SIZE,
             }],
         });
         rig.dx(DxCommand::SetTopology { topology: 1 });
@@ -1252,7 +1594,7 @@ mod draw_tests {
             vertex_count: 3,
             start_vertex: 0,
         });
-        rig.gpu.flush();
+        rig.gpu.flush(&mut rig.gb, &rig.guest);
         // The guest reads its target back.
         rig.gb(GbCommand::ReadbackSurface { sid: 10 });
         let mut pixels = [0u8; 64];

@@ -4,8 +4,14 @@
 //! A surface keeps the layout of its guest copy ([`SurfaceLayout`]): its
 //! bytes go to the GPU ([`Renderer::upload`]) and come back
 //! ([`Renderer::download`]) without conversion, through host-visible
-//! staging buffers. Operations are recorded into one command buffer and
-//! submitted at [`Renderer::flush`] (a download flushes first).
+//! staging buffers (small uploads share the recycled chunks of draw
+//! constants). Operations are recorded into one command buffer and
+//! submitted at [`Renderer::flush`], or every few hundred draws so that
+//! the GPU starts while the rest is recorded; a download flushes first
+//! and waits. [`Renderer::read_async`] reads texels back without waiting:
+//! the bytes are taken once the GPU is done ([`Renderer::poll`]).
+//! Timestamps around each submission measure the GPU's own time
+//! ([`Renderer::gpu_time`]).
 //!
 //! Draws ([`Renderer::draw`], module `draw`) turn Direct3D 10 pipeline
 //! state into cached Vulkan pipelines, recorded with dynamic rendering and
@@ -94,6 +100,9 @@ type ViewKey = (i32, u32, i32, [u32; 4], [i32; 4]);
 struct Surface {
     resource: Storage,
     layout: SurfaceLayout,
+    /// Mip levels on the GPU: the layout's, or a whole chain behind a
+    /// single guest level (`AUTOGENMIPMAPS`).
+    mips: u32,
     /// Image views made for draws, destroyed with the surface.
     views: HashMap<ViewKey, vk::ImageView>,
     /// Buffer views (format, offset, bytes), likewise.
@@ -105,6 +114,60 @@ struct Staging {
     memory: vk::DeviceMemory,
 }
 
+/// Submissions in flight at most: the device goes on recording while the
+/// GPU runs the previous ones, and waits only to read results back.
+const FRAMES: usize = 4;
+
+/// Draws recorded before they are submitted, even in the middle of a
+/// command buffer of the guest.
+const DRAWS_PER_SUBMISSION: u32 = 512;
+
+/// A submission: its command buffer and fence, and what must live until
+/// the GPU is done with it.
+struct Frame {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// Submitted and not yet waited for.
+    busy: bool,
+    /// Timestamps were written at its start and end.
+    timed: bool,
+    /// Its number among submissions (see [`Renderer::submitted`]).
+    serial: u64,
+    staging: Vec<Staging>,
+    chunks: Vec<Chunk>,
+}
+
+/// A copy of image texels to host memory ([`Renderer::read_async`]).
+struct Read {
+    ticket: u64,
+    /// The submission that copies: done once `completed` reaches it.
+    serial: u64,
+    buffer: ReadBuffer,
+    /// Bytes read.
+    len: usize,
+}
+
+/// A mapped host buffer for reads: buffer, memory, address, size.
+type ReadBuffer = (vk::Buffer, vk::DeviceMemory, usize, u64);
+
+/// Read buffers kept for the next reads.
+const READ_BUFFERS_KEPT: usize = 4;
+
+/// GPU time of submissions, from timestamps written at their start and
+/// end (queries `2 i` and `2 i + 1` for frame `i`).
+struct Timing {
+    pool: vk::QueryPool,
+    /// Nanoseconds per tick.
+    period: f64,
+    /// The bits timestamps hold.
+    mask: u64,
+    /// Nanoseconds and submissions measured since last taken.
+    busy: (f64, u64),
+}
+
+/// A mapped chunk of draw constants: buffer, memory, mapping address.
+type Chunk = (vk::Buffer, vk::DeviceMemory, usize);
+
 /// The GPU and the surfaces on it.
 pub struct Renderer {
     _entry: ash::Entry,
@@ -113,8 +176,11 @@ pub struct Renderer {
     device: ash::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
+    /// The command buffer being recorded: that of `frames[current]`.
     cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    /// Submissions: recorded one at a time, several in flight.
+    frames: Vec<Frame>,
+    current: usize,
     memory: vk::PhysicalDeviceMemoryProperties,
     name: String,
     d24s8: bool,
@@ -125,6 +191,45 @@ pub struct Renderer {
     features: Features,
     push: Option<ash::khr::push_descriptor::Device>,
     draw: draw::Caches,
+    /// The occlusion query pool and the slots in use.
+    occlusion: Option<(vk::QueryPool, u32)>,
+    /// The rendering left open by the last draw, for the next draw with
+    /// the same attachments (see `draw.rs`).
+    pass: Option<draw::Pass>,
+    /// Constants given with draws.
+    uniforms: Uniforms,
+    /// `minUniformBufferOffsetAlignment`.
+    uniform_align: u64,
+    /// GPU time measurement, if the queue has timestamps.
+    timing: Option<Timing>,
+    /// Draws recorded since the last submission.
+    draws: u32,
+    /// Submissions made, and the last one known to be done (every
+    /// submission waits for the ones before it: see `barrier`).
+    submitted: u64,
+    completed: u64,
+    /// Reads not yet taken, in the order started.
+    reads: Vec<Read>,
+    next_read: u64,
+    /// Read buffers free again.
+    read_buffers: Vec<ReadBuffer>,
+}
+
+/// Bytes of a chunk of [`Uniforms`].
+const UNIFORM_CHUNK: u64 = 4 << 20;
+/// Chunks kept from one submission to the next.
+const UNIFORM_CHUNKS_KEPT: usize = 4;
+
+/// Constants given with draws ([`draw::Resource::Data`]): suballocated
+/// from mapped chunks, reused once the GPU is done with a submission.
+#[derive(Default)]
+struct Uniforms {
+    /// Chunks of the submission being recorded; the last is being filled.
+    active: Vec<Chunk>,
+    /// Bytes used in the last one.
+    used: u64,
+    /// Chunks free again.
+    free: Vec<Chunk>,
 }
 
 /// Optional device features in use.
@@ -139,7 +244,12 @@ struct Features {
     anisotropy: bool,
     /// `MIRROR_CLAMP_TO_EDGE` addressing (Direct3D's `MIRROR_ONCE`).
     mirror_once: bool,
+    /// Exact sample counts in occlusion queries.
+    precise_occlusion: bool,
 }
+
+/// Occlusion queries of draws (see [`Renderer::occlusion_slot`]).
+const OCCLUSION_SLOTS: u32 = 1024;
 
 /// Preference of a device: higher is better.
 fn score(props: &vk::PhysicalDeviceProperties, memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
@@ -286,6 +396,7 @@ impl Renderer {
             sample_rate_shading: have.sample_rate_shading,
             image_cube_array: have.image_cube_array,
             shader_clip_distance: have.shader_clip_distance,
+            occlusion_query_precise: have.occlusion_query_precise,
             ..Default::default()
         };
         let features = Features {
@@ -294,6 +405,7 @@ impl Renderer {
             depth_clamp: have.depth_clamp == vk::TRUE,
             maintenance5: maintenance5 && m5.maintenance5 == vk::TRUE,
             anisotropy: have.sampler_anisotropy == vk::TRUE,
+            precise_occlusion: have.occlusion_query_precise == vk::TRUE,
             mirror_once: v12.sampler_mirror_clamp_to_edge == vk::TRUE,
         };
         let mut v11_on = vk::PhysicalDeviceVulkan11Features::default()
@@ -335,16 +447,27 @@ impl Renderer {
                         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                     None,
                 )?;
-                let cmd = device.allocate_command_buffers(
+                let cmds = device.allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
-                        .command_buffer_count(1),
-                )?[0];
-                let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-                Ok((pool, cmd, fence))
+                        .command_buffer_count(u32::try_from(FRAMES).unwrap_or(1)),
+                )?;
+                let mut frames = Vec::new();
+                for cmd in cmds {
+                    frames.push(Frame {
+                        cmd,
+                        fence: device.create_fence(&vk::FenceCreateInfo::default(), None)?,
+                        busy: false,
+                        timed: false,
+                        serial: 0,
+                        staging: Vec::new(),
+                        chunks: Vec::new(),
+                    });
+                }
+                Ok((pool, frames))
             }
         })();
-        let (pool, cmd, fence) = match objects {
+        let (pool, frames) = match objects {
             Ok(o) => o,
             Err(e) => {
                 // SAFETY: the device is idle and owns nothing else.
@@ -376,6 +499,29 @@ impl Renderer {
         let push = features
             .draw
             .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        // SAFETY: a device of this instance.
+        let limits = unsafe { instance.get_physical_device_properties(physical) }.limits;
+        let uniform_align = limits.min_uniform_buffer_offset_alignment.max(16);
+        let bits = families
+            .get(family as usize)
+            .map_or(0, |f| f.timestamp_valid_bits);
+        let timing = (bits > 0 && limits.timestamp_period > 0.0)
+            .then(|| {
+                let info = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(u32::try_from(FRAMES * 2).unwrap_or(2));
+                // SAFETY: a valid create info on a live device.
+                unsafe { device.create_query_pool(&info, None) }.ok()
+            })
+            .flatten()
+            .map(|pool| Timing {
+                pool,
+                period: f64::from(limits.timestamp_period),
+                mask: u64::MAX
+                    .checked_shr(64u32.saturating_sub(bits))
+                    .unwrap_or(u64::MAX),
+                busy: (0.0, 0),
+            });
         Ok(Self {
             _entry: entry,
             instance,
@@ -383,8 +529,9 @@ impl Renderer {
             device,
             queue,
             pool,
-            cmd,
-            fence,
+            cmd: frames[0].cmd,
+            frames,
+            current: 0,
             memory,
             name: device_name,
             d24s8,
@@ -392,6 +539,17 @@ impl Renderer {
             features,
             push,
             draw: draw::Caches::default(),
+            occlusion: None,
+            pass: None,
+            uniforms: Uniforms::default(),
+            uniform_align,
+            timing,
+            draws: 0,
+            submitted: 0,
+            completed: 0,
+            reads: Vec::new(),
+            next_read: 0,
+            read_buffers: Vec::new(),
             recording: false,
             staging: Vec::new(),
             surfaces: HashMap::new(),
@@ -445,16 +603,43 @@ impl Renderer {
         Ok(unsafe { self.device.allocate_memory(&info, None) }?)
     }
 
-    /// The command buffer being recorded, begun if needed.
+    /// The command buffer being recorded, begun if needed, outside any
+    /// rendering (an open one ends).
     fn cmd(&mut self) -> Result<vk::CommandBuffer, Error> {
+        self.end_pass();
         if !self.recording {
+            // This slot's previous submission must be done.
+            self.retire(self.current)?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            // SAFETY: the buffer is not in use (flush waited for it).
+            // SAFETY: the buffer is not in use (retired above).
             unsafe { self.device.begin_command_buffer(self.cmd, &begin) }?;
             self.recording = true;
+            if let Some(t) = &self.timing {
+                let first = u32::try_from(self.current.saturating_mul(2)).unwrap_or(0);
+                // SAFETY: recording, outside any rendering; the queries
+                // belong to this frame, whose last use was retired.
+                unsafe {
+                    self.device.cmd_reset_query_pool(self.cmd, t.pool, first, 2);
+                    self.device.cmd_write_timestamp(
+                        self.cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        t.pool,
+                        first,
+                    );
+                }
+                self.frames[self.current].timed = true;
+            }
         }
         Ok(self.cmd)
+    }
+
+    /// Ends the rendering a draw left open.
+    fn end_pass(&mut self) {
+        if self.pass.take().is_some() && self.recording {
+            // SAFETY: recording, inside the rendering the last draw began.
+            unsafe { self.device.cmd_end_rendering(self.cmd) };
+        }
     }
 
     /// Orders everything recorded so far before what follows.
@@ -478,42 +663,442 @@ impl Renderer {
         Ok(cmd)
     }
 
-    /// Submits what was recorded and waits for the GPU.
+    /// A slot of the occlusion query pool for one draw ([`Draw::occlusion`]),
+    /// or `None` when all are in use: [`Self::occlusion_collect`] frees
+    /// them.
+    pub fn occlusion_slot(&mut self) -> Result<Option<u32>, Error> {
+        if self.occlusion.is_none() {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::OCCLUSION)
+                .query_count(OCCLUSION_SLOTS);
+            // SAFETY: a valid create info on a live device.
+            let pool = unsafe { self.device.create_query_pool(&info, None) }?;
+            self.occlusion = Some((pool, 0));
+        }
+        let Some((_, used)) = self.occlusion.as_mut() else {
+            return Ok(None);
+        };
+        if *used >= OCCLUSION_SLOTS {
+            return Ok(None);
+        }
+        let slot = *used;
+        *used = used.saturating_add(1);
+        Ok(Some(slot))
+    }
+
+    /// Occlusion slots handed out since the last [`Self::occlusion_read`].
+    pub fn occlusion_used(&self) -> u32 {
+        self.occlusion.map_or(0, |(_, used)| used)
+    }
+
+    /// Waits for the draws of the occlusion slots in use, and returns the
+    /// samples each passed; the slots are free again.
+    pub fn occlusion_read(&mut self) -> Result<Vec<u64>, Error> {
+        let Some((pool, used)) = self.occlusion else {
+            return Ok(Vec::new());
+        };
+        if used == 0 {
+            return Ok(Vec::new());
+        }
+        self.wait_idle()?;
+        let mut results = vec![0u64; used as usize];
+        // SAFETY: slots 0..used were reset and written by submitted draws,
+        // which flush waited for.
+        unsafe {
+            self.device.get_query_pool_results(
+                pool,
+                0,
+                &mut results,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }?;
+        self.occlusion = Some((pool, 0));
+        Ok(results)
+    }
+
+    /// Submits what was recorded, without waiting for the GPU: what it
+    /// needs lives until its submission is retired.
     pub fn flush(&mut self) -> Result<(), Error> {
+        self.end_pass();
         if !self.recording {
             return Ok(());
         }
         self.recording = false;
+        self.draws = 0;
+        let i = self.current;
+        if let Some(t) = &self.timing
+            && self.frames[i].timed
+        {
+            let last = u32::try_from(i.saturating_mul(2).saturating_add(1)).unwrap_or(1);
+            // SAFETY: recording, outside any rendering (ended above).
+            unsafe {
+                self.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    t.pool,
+                    last,
+                );
+            }
+        }
         let cmds = [self.cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        // SAFETY: the buffer was begun by `cmd`; the fence is unsignaled.
+        // SAFETY: the buffer was begun by `cmd`; the fence is unsignaled
+        // (reset when retired).
         let result = unsafe {
-            self.device
-                .end_command_buffer(self.cmd)
-                .and_then(|()| self.device.queue_submit(self.queue, &[submit], self.fence))
-                .and_then(|()| self.device.wait_for_fences(&[self.fence], true, u64::MAX))
-                .and_then(|()| self.device.reset_fences(&[self.fence]))
-                .and_then(|()| {
-                    self.device
-                        .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                })
+            self.device.end_command_buffer(self.cmd).and_then(|()| {
+                self.device
+                    .queue_submit(self.queue, &[submit], self.frames[i].fence)
+            })
         };
-        for s in self.staging.drain(..) {
-            // SAFETY: the GPU is done with the staging buffers.
+        let frame = &mut self.frames[i];
+        frame.busy = result.is_ok();
+        if frame.busy {
+            self.submitted = self.submitted.saturating_add(1);
+            frame.serial = self.submitted;
+        }
+        frame.staging.append(&mut self.staging);
+        frame.chunks.append(&mut self.uniforms.active);
+        self.uniforms.used = 0;
+        if result.is_err() {
+            // Nothing will signal the fence: free now (the GPU never saw it).
+            self.free_frame(i);
+        }
+        self.current = i.wrapping_add(1) % FRAMES;
+        self.cmd = self.frames[self.current].cmd;
+        Ok(result?)
+    }
+
+    /// Waits for submission `i` if it is in flight, then frees what it
+    /// needed.
+    fn retire(&mut self, i: usize) -> Result<(), Error> {
+        let frame = &self.frames[i];
+        if frame.busy {
+            // SAFETY: the fence belongs to this submission.
+            unsafe {
+                self.device
+                    .wait_for_fences(&[frame.fence], true, u64::MAX)?;
+                self.device.reset_fences(&[frame.fence])?;
+                self.device
+                    .reset_command_buffer(frame.cmd, vk::CommandBufferResetFlags::empty())?;
+            }
+            self.frames[i].busy = false;
+            self.completed = self.completed.max(self.frames[i].serial);
+            if self.frames[i].timed
+                && let Some(t) = self.timing.as_mut()
+            {
+                let mut stamps = [0u64; 2];
+                let first = u32::try_from(i.saturating_mul(2)).unwrap_or(0);
+                // SAFETY: both queries were written by this submission,
+                // which is done.
+                let read = unsafe {
+                    self.device.get_query_pool_results(
+                        t.pool,
+                        first,
+                        &mut stamps,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                };
+                if read.is_ok() {
+                    let ticks = stamps[1].wrapping_sub(stamps[0]) & t.mask;
+                    #[allow(clippy::cast_precision_loss, clippy::arithmetic_side_effects)]
+                    {
+                        t.busy.0 += ticks as f64 * t.period;
+                    }
+                    t.busy.1 = t.busy.1.saturating_add(1);
+                }
+            }
+        }
+        self.frames[i].timed = false;
+        self.free_frame(i);
+        Ok(())
+    }
+
+    /// The GPU time of the submissions finished since the last call, and
+    /// their number (none without timestamps).
+    pub fn gpu_time(&mut self) -> (std::time::Duration, u64) {
+        let Some(t) = self.timing.as_mut() else {
+            return (std::time::Duration::ZERO, 0);
+        };
+        let (nanos, count) = std::mem::take(&mut t.busy);
+        (
+            std::time::Duration::from_secs_f64(nanos.max(0.0) / 1e9),
+            count,
+        )
+    }
+
+    /// Retires the submissions the GPU has finished, without waiting.
+    pub fn poll(&mut self) -> Result<(), Error> {
+        for i in 0..FRAMES {
+            if !self.frames[i].busy {
+                continue;
+            }
+            // SAFETY: the fence belongs to this submission.
+            if unsafe { self.device.get_fence_status(self.frames[i].fence) }? {
+                self.retire(i)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts copying the texels of `extent` at `at` in image `sid` to
+    /// host memory, rows tightly packed, without waiting for the GPU: the
+    /// copy runs with the next submission. [`Self::take_read`] gives the
+    /// bytes, by the returned ticket.
+    pub fn read_async(&mut self, sid: u32, at: At, extent: [u32; 3]) -> Result<u64, Error> {
+        self.check_box(sid, at, extent)?;
+        let surface = self.surface(sid)?;
+        let Storage::Image {
+            image,
+            aspect,
+            copyable,
+            ..
+        } = surface.resource
+        else {
+            return err(format!("surface {sid} is a buffer"));
+        };
+        let desc = surface.layout.desc();
+        if !copyable || (desc.block_width, desc.block_height, desc.block_depth) != (1, 1, 1) {
+            return err(format!("surface {sid} cannot be read texel by texel"));
+        }
+        let len = u64::from(extent[0])
+            .saturating_mul(u64::from(extent[1]))
+            .saturating_mul(u64::from(extent[2]))
+            .saturating_mul(u64::from(desc.bytes_per_block));
+        let Ok(bytes) = usize::try_from(len) else {
+            return err("read too large");
+        };
+        let buffer = self.read_buffer(len)?;
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(layers_of(aspect, at.mip, at.layer, 1))
+            .image_offset(vk::Offset3D {
+                x: i32::try_from(at.offset[0]).unwrap_or(0),
+                y: i32::try_from(at.offset[1]).unwrap_or(0),
+                z: i32::try_from(at.offset[2]).unwrap_or(0),
+            })
+            .image_extent(vk::Extent3D {
+                width: extent[0],
+                height: extent[1],
+                depth: extent[2],
+            });
+        let cmd = match self.barrier() {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                self.recycle(buffer);
+                return Err(e);
+            }
+        };
+        let to_host = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+        // SAFETY: recording; the region lies within the image (checked),
+        // the buffer holds `len` bytes.
+        unsafe {
+            if len > 0 {
+                self.device.cmd_copy_image_to_buffer(
+                    cmd,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    buffer.0,
+                    &[region],
+                );
+            }
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[to_host],
+                &[],
+                &[],
+            );
+        }
+        let ticket = self.next_read;
+        self.next_read = self.next_read.wrapping_add(1);
+        self.reads.push(Read {
+            ticket,
+            serial: self.submitted.saturating_add(1),
+            buffer,
+            len: bytes,
+        });
+        Ok(ticket)
+    }
+
+    /// Whether read `ticket` is done (as of the last [`Self::poll`]).
+    pub fn read_done(&self, ticket: u64) -> bool {
+        self.reads
+            .iter()
+            .find(|r| r.ticket == ticket)
+            .is_some_and(|r| r.serial <= self.completed)
+    }
+
+    /// Gives the bytes of read `ticket` to `f`, then frees them: `None`
+    /// if the GPU has not finished it, unless `wait`, which submits and
+    /// waits for it.
+    pub fn take_read<R>(
+        &mut self,
+        ticket: u64,
+        wait: bool,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Option<R>, Error> {
+        let Some(pos) = self.reads.iter().position(|r| r.ticket == ticket) else {
+            return err(format!("no read {ticket}"));
+        };
+        let serial = self.reads[pos].serial;
+        if serial > self.completed && wait {
+            if serial > self.submitted {
+                self.flush()?;
+            }
+            for i in 0..FRAMES {
+                if self.frames[i].busy && self.frames[i].serial <= serial {
+                    self.retire(i)?;
+                }
+            }
+        }
+        if serial > self.completed {
+            return Ok(None);
+        }
+        let read = self.reads.remove(pos);
+        // SAFETY: the submission that copied is done and made its writes
+        // visible to the host (barrier above); the buffer is mapped at its
+        // address for at least `len` bytes and nothing else uses it.
+        let bytes = unsafe { std::slice::from_raw_parts(read.buffer.2 as *const u8, read.len) };
+        let out = f(bytes);
+        self.recycle(read.buffer);
+        Ok(Some(out))
+    }
+
+    /// A free read buffer of at least `size` bytes.
+    fn read_buffer(&mut self, size: u64) -> Result<ReadBuffer, Error> {
+        if let Some(pos) = self
+            .read_buffers
+            .iter()
+            .position(|b| b.3 >= size && b.3 / 2 <= size)
+        {
+            return Ok(self.read_buffers.swap_remove(pos));
+        }
+        let (buffer, ptr) = self.staging(size)?;
+        // It outlives submissions: out of the staging list.
+        let Some(staging) = self.staging.pop() else {
+            return err("read buffer lost");
+        };
+        Ok((buffer, staging.memory, ptr as usize, size))
+    }
+
+    /// Keeps a read buffer for later reads, or frees it.
+    fn recycle(&mut self, buffer: ReadBuffer) {
+        self.read_buffers.push(buffer);
+        if self.read_buffers.len() > READ_BUFFERS_KEPT {
+            let (buffer, memory, ..) = self.read_buffers.remove(0);
+            // SAFETY: no read uses it (taken or never submitted with it).
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+        }
+    }
+
+    /// Frees the staging buffers of submission `i`; its constant chunks
+    /// are free again.
+    fn free_frame(&mut self, i: usize) {
+        for s in std::mem::take(&mut self.frames[i].staging) {
+            // SAFETY: the GPU is done with them (retired or never used).
             unsafe {
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
             }
         }
-        Ok(result?)
+        let chunks = std::mem::take(&mut self.frames[i].chunks);
+        self.uniforms.free.extend(chunks);
+        while self.uniforms.free.len() > UNIFORM_CHUNKS_KEPT {
+            if let Some((buffer, memory, _)) = self.uniforms.free.pop() {
+                // SAFETY: as above.
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+            }
+        }
+    }
+
+    /// Submits what was recorded and waits for every submission.
+    pub fn wait_idle(&mut self) -> Result<(), Error> {
+        self.flush()?;
+        for i in 0..FRAMES {
+            self.retire(i)?;
+        }
+        Ok(())
+    }
+
+    /// Whether submissions may still be running.
+    fn in_flight(&self) -> bool {
+        self.recording || self.frames.iter().any(|f| f.busy)
     }
 
     /// A host-visible buffer of `size` bytes, mapped; freed at the next
     /// flush.
     fn staging(&mut self, size: u64) -> Result<(vk::Buffer, *mut c_void), Error> {
+        self.staging_usage(size, vk::BufferUsageFlags::empty())
+    }
+
+    /// Room for `bytes` of draw constants: buffer and offset, valid until
+    /// the next submission completes.
+    pub(crate) fn uniform_slice(&mut self, bytes: &[u8]) -> Result<(vk::Buffer, u64), Error> {
+        self.chunk_slice(bytes, self.uniform_align)
+    }
+
+    /// [`Self::uniform_slice`] at a multiple of `align`, for constants and
+    /// small uploads alike.
+    fn chunk_slice(&mut self, bytes: &[u8], align: u64) -> Result<(vk::Buffer, u64), Error> {
+        let size = bytes.len() as u64;
+        if size > UNIFORM_CHUNK {
+            return err(format!("{size} bytes in a {UNIFORM_CHUNK}-byte chunk"));
+        }
+        loop {
+            let u = &mut self.uniforms;
+            let offset = u.used.next_multiple_of(align.max(1));
+            if let Some(&(buffer, _, address)) = u.active.last()
+                && offset.saturating_add(size) <= UNIFORM_CHUNK
+            {
+                // SAFETY: the chunk is mapped for its life at `address`,
+                // holds UNIFORM_CHUNK bytes, and this range is not in use
+                // by the GPU (chunks of a submission are reused only once
+                // it is retired).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        (address as *mut u8).add(usize::try_from(offset).unwrap_or(0)),
+                        bytes.len(),
+                    );
+                }
+                u.used = offset.saturating_add(size);
+                return Ok((buffer, offset));
+            }
+            u.used = 0;
+            if let Some(chunk) = u.free.pop() {
+                u.active.push(chunk);
+                continue;
+            }
+            let (buffer, ptr) =
+                self.staging_usage(UNIFORM_CHUNK, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+            // The chunk outlives submissions: out of the staging list.
+            let Some(staging) = self.staging.pop() else {
+                return err("uniform chunk lost");
+            };
+            self.uniforms
+                .active
+                .push((buffer, staging.memory, ptr as usize));
+        }
+    }
+
+    /// [`Self::staging`], also usable as `usage`.
+    pub(crate) fn staging_usage(
+        &mut self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(vk::Buffer, *mut c_void), Error> {
         let info = vk::BufferCreateInfo::default()
             .size(size.max(1))
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | usage);
         // SAFETY: a valid create info on a live device.
         let buffer = unsafe { self.device.create_buffer(&info, None) }?;
         // SAFETY: a buffer of this device.
@@ -570,6 +1155,10 @@ impl Renderer {
         self.surfaces.insert(
             sid,
             Surface {
+                mips: match resource {
+                    Storage::Buffer { .. } => 1,
+                    Storage::Image { .. } => gpu_mips(layout, flags),
+                },
                 resource,
                 layout: layout.clone(),
                 views: HashMap::new(),
@@ -685,7 +1274,7 @@ impl Renderer {
                 height: size.height.max(1),
                 depth: if three_d { size.depth.max(1) } else { 1 },
             })
-            .mip_levels(layout.mip_levels().max(1))
+            .mip_levels(gpu_mips(layout, flags))
             .array_layers(layers.max(1))
             .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -761,10 +1350,12 @@ impl Renderer {
         if !self.surfaces.contains_key(&sid) {
             return Ok(());
         }
-        // Recorded work may use it.
-        self.flush()?;
+        // Recorded or running work may use it.
+        if self.in_flight() {
+            self.wait_idle()?;
+        }
         if let Some(surface) = self.surfaces.remove(&sid) {
-            // SAFETY: the GPU is idle (flushed); the handles are ours.
+            // SAFETY: the GPU is idle (waited); the handles are ours.
             unsafe {
                 for view in surface.views.into_values() {
                     self.device.destroy_image_view(view, None);
@@ -843,21 +1434,37 @@ impl Renderer {
                 surface.layout.total_bytes()
             ));
         }
+        let block = u64::from(surface.layout.desc().bytes_per_block).max(1);
         let target = match &surface.resource {
             Storage::Buffer { buffer, .. } => Ok(*buffer),
             Storage::Image { image, .. } => Err((*image, Self::whole_regions(surface)?)),
         };
-        let (staging, ptr) = self.staging(data.len() as u64)?;
-        // SAFETY: the mapping holds at least `data.len()` bytes and nothing
-        // else accesses it until the copy is submitted.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len()) };
+        let len = data.len() as u64;
+        // Small uploads share the chunks of the submission (copies start on
+        // a multiple of the texel block); large ones get their own buffer.
+        let (staging, base) = if len > 0 && len <= UNIFORM_CHUNK {
+            let align = lcm(self.uniform_align, block);
+            self.chunk_slice(data, align)?
+        } else {
+            let (staging, ptr) = self.staging(len)?;
+            // SAFETY: the mapping holds at least `data.len()` bytes and
+            // nothing else accesses it until the copy is submitted.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len()) };
+            (staging, 0)
+        };
+        let target = target.map_err(|(image, mut regions)| {
+            for r in &mut regions {
+                r.buffer_offset = r.buffer_offset.saturating_add(base);
+            }
+            (image, regions)
+        });
         let cmd = self.barrier()?;
         // SAFETY: recording; source and destination are live and large
         // enough (checked against the layout above).
         unsafe {
             match target {
                 Ok(buffer) => {
-                    let region = vk::BufferCopy::default().size(data.len() as u64);
+                    let region = vk::BufferCopy::default().src_offset(base).size(len);
                     if !data.is_empty() {
                         self.device.cmd_copy_buffer(cmd, staging, buffer, &[region]);
                     }
@@ -931,35 +1538,22 @@ impl Renderer {
     }
 
     fn submit_and_read(&mut self, ptr: *mut c_void, out: &mut [u8]) -> Result<(), Error> {
-        // Flush, but read the staging memory before it is freed.
-        self.recording = false;
-        let cmds = [self.cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        // SAFETY: the buffer was begun by `cmd`; the fence is unsignaled.
-        let result = unsafe {
+        // Submit, wait (this submission's fence covers every earlier one),
+        // read the staging memory, and only then free it.
+        let i = self.current;
+        self.flush()?;
+        // SAFETY: the fence belongs to submission `i`, just made.
+        unsafe {
             self.device
-                .end_command_buffer(self.cmd)
-                .and_then(|()| self.device.queue_submit(self.queue, &[submit], self.fence))
-                .and_then(|()| self.device.wait_for_fences(&[self.fence], true, u64::MAX))
-                .and_then(|()| self.device.reset_fences(&[self.fence]))
-                .and_then(|()| {
-                    self.device
-                        .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                })
-        };
-        if result.is_ok() {
-            // SAFETY: the GPU finished writing the mapping (fence waited,
-            // host barrier recorded), which holds `out.len()` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), out.len()) };
+                .wait_for_fences(&[self.frames[i].fence], true, u64::MAX)?;
+            // The GPU finished writing the mapping (host barrier recorded),
+            // which holds `out.len()` bytes.
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), out.len());
         }
-        for s in self.staging.drain(..) {
-            // SAFETY: the GPU is done with the staging buffers.
-            unsafe {
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
-            }
+        for j in 0..FRAMES {
+            self.retire(j)?;
         }
-        Ok(result?)
+        Ok(())
     }
 
     // ---- operations -----------------------------------------------------
@@ -1255,6 +1849,257 @@ impl Renderer {
         }
         Ok(())
     }
+
+    // ---- resolves, blits, mipmaps ----------------------------------------
+
+    fn format_features(&self, format: vk::Format) -> vk::FormatFeatureFlags {
+        // SAFETY: a device of this instance.
+        unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical, format)
+        }
+        .optimal_tiling_features
+    }
+
+    /// Checks that `extent` texels from `at` lie within surface `sid`.
+    fn check_box(&self, sid: u32, at: At, extent: [u32; 3]) -> Result<(), Error> {
+        let layout = &self.surface(sid)?.layout;
+        let size = layout.mip_size(at.mip);
+        let inside = |o: u32, e: u32, s: u32| o.checked_add(e).is_some_and(|end| end <= s);
+        if at.mip < layout.mip_levels()
+            && at.layer < layout.layers()
+            && inside(at.offset[0], extent[0], size.width)
+            && inside(at.offset[1], extent[1], size.height)
+            && inside(at.offset[2], extent[2], size.depth)
+        {
+            Ok(())
+        } else {
+            err(format!("box outside surface {sid}"))
+        }
+    }
+
+    /// Resolves subresource `from` of multisampled color image `src` into
+    /// `to` of single-sampled `dest`, of the same format.
+    pub fn resolve(&mut self, dest: u32, to: At, src: u32, from: At) -> Result<(), Error> {
+        let (dst_image, dst_format, dst_aspect, _) = self.image(dest)?;
+        let (src_image, src_format, src_aspect, _) = self.image(src)?;
+        if dst_aspect != vk::ImageAspectFlags::COLOR || src_aspect != dst_aspect {
+            return err("resolving a depth image");
+        }
+        if dst_format != src_format {
+            return err(format!("resolving {src_format:?} into {dst_format:?}"));
+        }
+        if self.surface(src)?.layout.samples() < 2 || self.surface(dest)?.layout.samples() != 1 {
+            return err("resolve from a single-sampled or into a multisampled image");
+        }
+        let a = self.surface(src)?.layout.mip_size(from.mip);
+        let b = self.surface(dest)?.layout.mip_size(to.mip);
+        let extent = [a.width.min(b.width), a.height.min(b.height), 1];
+        self.check_box(
+            src,
+            At {
+                offset: [0; 3],
+                ..from
+            },
+            extent,
+        )?;
+        self.check_box(
+            dest,
+            At {
+                offset: [0; 3],
+                ..to
+            },
+            extent,
+        )?;
+        let region = vk::ImageResolve::default()
+            .src_subresource(layers_of(src_aspect, from.mip, from.layer, 1))
+            .dst_subresource(layers_of(dst_aspect, to.mip, to.layer, 1))
+            .extent(vk::Extent3D {
+                width: extent[0],
+                height: extent[1],
+                depth: 1,
+            });
+        let cmd = self.barrier()?;
+        // SAFETY: recording; both subresources exist (checked), formats
+        // match, the source is multisampled and the destination is not.
+        unsafe {
+            self.device.cmd_resolve_image(
+                cmd,
+                src_image,
+                vk::ImageLayout::GENERAL,
+                dst_image,
+                vk::ImageLayout::GENERAL,
+                &[region],
+            );
+        }
+        Ok(())
+    }
+
+    /// Copies box `src_extent` at `from` of `src` onto box `dest_extent`
+    /// at `to` of `dest`, scaling and converting formats; `linear` filters
+    /// when scaling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit(
+        &mut self,
+        dest: u32,
+        to: At,
+        dest_extent: [u32; 3],
+        src: u32,
+        from: At,
+        src_extent: [u32; 3],
+        linear: bool,
+    ) -> Result<(), Error> {
+        let (dst_image, dst_format, dst_aspect, _) = self.image(dest)?;
+        let (src_image, src_format, src_aspect, _) = self.image(src)?;
+        if dst_aspect != src_aspect {
+            return err("blit between color and depth images");
+        }
+        let src_features = self.format_features(src_format);
+        if !src_features.contains(vk::FormatFeatureFlags::BLIT_SRC)
+            || !self
+                .format_features(dst_format)
+                .contains(vk::FormatFeatureFlags::BLIT_DST)
+        {
+            return err(format!(
+                "no blit from {src_format:?} to {dst_format:?} on {}",
+                self.name
+            ));
+        }
+        if self.surface(src)?.layout.samples() != 1 || self.surface(dest)?.layout.samples() != 1 {
+            return err("blit of a multisampled image");
+        }
+        self.check_box(src, from, src_extent)?;
+        self.check_box(dest, to, dest_extent)?;
+        if src_extent.contains(&0) || dest_extent.contains(&0) {
+            return Ok(());
+        }
+        let filter = if linear
+            && src_aspect == vk::ImageAspectFlags::COLOR
+            && src_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+        {
+            vk::Filter::LINEAR
+        } else {
+            vk::Filter::NEAREST
+        };
+        let corners = |at: At, e: [u32; 3]| {
+            let o = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+            [
+                vk::Offset3D {
+                    x: o(at.offset[0]),
+                    y: o(at.offset[1]),
+                    z: o(at.offset[2]),
+                },
+                vk::Offset3D {
+                    x: o(at.offset[0].saturating_add(e[0])),
+                    y: o(at.offset[1].saturating_add(e[1])),
+                    z: o(at.offset[2].saturating_add(e[2])),
+                },
+            ]
+        };
+        let region = vk::ImageBlit::default()
+            .src_subresource(layers_of(src_aspect, from.mip, from.layer, 1))
+            .src_offsets(corners(from, src_extent))
+            .dst_subresource(layers_of(dst_aspect, to.mip, to.layer, 1))
+            .dst_offsets(corners(to, dest_extent));
+        let cmd = self.barrier()?;
+        // SAFETY: recording; both boxes lie within live single-sampled
+        // images whose formats support blits.
+        unsafe {
+            self.device.cmd_blit_image(
+                cmd,
+                src_image,
+                vk::ImageLayout::GENERAL,
+                dst_image,
+                vk::ImageLayout::GENERAL,
+                &[region],
+                filter,
+            );
+        }
+        Ok(())
+    }
+
+    /// Fills mip levels `first_mip + 1 ..` of `mips` levels (`u32::MAX`:
+    /// all), for `layers` layers from `first_layer`, each from the level
+    /// above it with a linear (box) filter, as `GenerateMips` does.
+    pub fn generate_mips(
+        &mut self,
+        sid: u32,
+        first_mip: u32,
+        mips: u32,
+        first_layer: u32,
+        layers: u32,
+    ) -> Result<(), Error> {
+        let (image, format, aspect, three_d) = self.image(sid)?;
+        if aspect != vk::ImageAspectFlags::COLOR {
+            return err("mipmaps of a depth image");
+        }
+        let needed = vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::BLIT_DST
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        if !self.format_features(format).contains(needed) {
+            return err(format!("{format:?} cannot be filtered on {}", self.name));
+        }
+        let surface = self.surface(sid)?;
+        let (layout, total) = (surface.layout.clone(), surface.mips);
+        let last = first_mip.saturating_add(mips.max(1)).min(total);
+        let (first_layer, layers) = if three_d {
+            (0, 1)
+        } else {
+            let first = first_layer.min(layout.layers().saturating_sub(1));
+            (
+                first,
+                layers.max(1).min(layout.layers().saturating_sub(first)),
+            )
+        };
+        let corner = |mip: u32| {
+            let s = layout.mip_size(mip);
+            let o = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+            [
+                vk::Offset3D::default(),
+                vk::Offset3D {
+                    x: o(s.width),
+                    y: o(s.height),
+                    z: o(s.depth),
+                },
+            ]
+        };
+        for mip in first_mip..last.saturating_sub(1) {
+            let next = mip.saturating_add(1);
+            let region = vk::ImageBlit::default()
+                .src_subresource(layers_of(aspect, mip, first_layer, layers))
+                .src_offsets(corner(mip))
+                .dst_subresource(layers_of(aspect, next, first_layer, layers))
+                .dst_offsets(corner(next));
+            // Each level reads the one written just before.
+            let cmd = self.barrier()?;
+            // SAFETY: recording; levels and layers lie within the live
+            // image, whose format supports filtered blits.
+            unsafe {
+                self.device.cmd_blit_image(
+                    cmd,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &[region],
+                    vk::Filter::LINEAR,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mip levels of a surface's image: the layout's, or a whole chain behind
+/// a single level with `AUTOGENMIPMAPS`.
+fn gpu_mips(layout: &SurfaceLayout, flags: u64) -> u32 {
+    let size = layout.size();
+    if flags & surface_flag::AUTOGENMIPMAPS != 0 && layout.mip_levels() <= 1 {
+        let largest = size.width.max(size.height).max(size.depth).max(1);
+        32u32.saturating_sub(largest.leading_zeros())
+    } else {
+        layout.mip_levels().max(1)
+    }
 }
 
 fn range(
@@ -1272,6 +2117,20 @@ fn range(
         .layer_count(layers)
 }
 
+/// Least common multiple of two sizes (alignments).
+fn lcm(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a.max(1), b.max(1));
+    while let Some(r) = x.checked_rem(y)
+        && y != 0
+    {
+        (x, y) = (y, r);
+    }
+    a.max(1)
+        .checked_div(x)
+        .unwrap_or(1)
+        .saturating_mul(b.max(1))
+}
+
 fn layers_of(
     aspect: vk::ImageAspectFlags,
     mip: u32,
@@ -1287,7 +2146,7 @@ fn layers_of(
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        let _ = self.flush();
+        let _ = self.wait_idle();
         let sids: Vec<u32> = self.surfaces.keys().copied().collect();
         for sid in sids {
             let _ = self.destroy(sid);
@@ -1296,7 +2155,27 @@ impl Drop for Renderer {
         // SAFETY: the GPU is idle and every object below is ours.
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_fence(self.fence, None);
+            if let Some((pool, _)) = self.occlusion.take() {
+                self.device.destroy_query_pool(pool, None);
+            }
+            if let Some(t) = self.timing.take() {
+                self.device.destroy_query_pool(t.pool, None);
+            }
+            let reads = std::mem::take(&mut self.reads)
+                .into_iter()
+                .map(|r| r.buffer);
+            for (buffer, memory, ..) in reads.chain(std::mem::take(&mut self.read_buffers)) {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+            let uniforms = std::mem::take(&mut self.uniforms);
+            for (buffer, memory, _) in uniforms.active.into_iter().chain(uniforms.free) {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+            for frame in &self.frames {
+                self.device.destroy_fence(frame.fence, None);
+            }
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);

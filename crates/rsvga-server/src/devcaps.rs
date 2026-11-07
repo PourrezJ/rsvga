@@ -22,8 +22,20 @@
 //! one (bump maps, 16-bit depth with 1-bit stencil...) are left out until
 //! the Direct3D 9 path needs them. The values here are what rsvga intends
 //! to render; the Vulkan backend will drop whatever the host GPU lacks.
+//!
+//! The legacy devcaps (indices below 100) describe a Direct3D 9 device
+//! (shader model 3, fixed-function limits) for VMware's Direct3D 9 driver,
+//! which speaks the legacy SVGA3D protocol. Its format list comes from the
+//! `SURFACEFMT_*` entries (`SVGA3DFORMAT_OP_*`, Direct3D 9's
+//! `D3DFORMAT_OP_*`): Windows' Direct3D 9 runtime offers no hardware
+//! device (`D3DERR_NOTAVAILABLE`) unless the display format is marked
+//! "3D accelerated". Formats without a Vulkan twin of the same layout stay
+//! 0. That runtime also disables the driver over some combinations
+//! (`d3d9.dll`, `FetchDirectDrawData`): "3D accelerated" on an alpha format
+//! or without "display mode", `MEMBEROFGROUP_ARGB` outside its formats
+//! (A4R4G4B4 is not one), R5G6B5 and X1R5G5B5 both as display modes.
 
-use svga_proto::{devcap, dxfmt, fifo, fifo_caps_record, format as f};
+use svga_proto::{devcap, dxfmt, fifo, fifo_caps_record, format as f, format_op as op};
 
 use crate::log;
 
@@ -66,6 +78,100 @@ const SAMPLED: u32 =
 const COMPRESSED_TYPELESS: u32 = dxfmt::SUPPORTED | dxfmt::MIPS | dxfmt::ARRAY | dxfmt::VOLUME;
 /// Usable as a vertex attribute format.
 const VB: u32 = dxfmt::DX_VERTEX_BUFFER;
+
+/// Direct3D 9 texture uses: 2D, volume and cube.
+const OP_TEXTURE: u32 = op::TEXTURE | op::VOLUMETEXTURE | op::CUBETEXTURE;
+/// Render target uses.
+const OP_TARGET: u32 = op::OFFSCREEN_RENDERTARGET | op::SAME_FORMAT_RENDERTARGET;
+/// The 8-bit and 16-bit RGB formats: textures, targets, plain surfaces,
+/// convertible to each other.
+const OP_RGB: u32 = OP_TEXTURE
+    | OP_TARGET
+    | op::OFFSCREENPLAIN
+    | op::CONVERT_TO_ARGB
+    | op::MEMBEROFGROUP_ARGB
+    | op::AUTOGENMIPMAP;
+/// Formats the desktop can be in, with 3D on them.
+const OP_DISPLAY: u32 = op::DISPLAYMODE | op::THREE_D_ACCELERATION;
+/// Depth buffers.
+const OP_DEPTH: u32 = op::ZSTENCIL | op::ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH;
+/// Float formats: textures and targets.
+const OP_FLOAT: u32 = OP_TEXTURE | OP_TARGET | op::OFFSCREENPLAIN | op::VERTEXTEXTURE;
+
+/// `SVGA3DFORMAT_OP_*` of each legacy `SURFACEFMT_*` devcap.
+const FORMAT_OPS: &[(u32, u32)] = &[
+    (
+        devcap::SURFACEFMT_X8R8G8B8,
+        OP_RGB | OP_DISPLAY | op::SRGBREAD | op::SRGBWRITE | op::VERTEXTEXTURE,
+    ),
+    (
+        devcap::SURFACEFMT_A8R8G8B8,
+        OP_RGB
+            | op::SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET
+            | op::SRGBREAD
+            | op::SRGBWRITE
+            | op::VERTEXTEXTURE,
+    ),
+    (devcap::SURFACEFMT_A2R10G10B10, OP_RGB),
+    (devcap::SURFACEFMT_X1R5G5B5, OP_RGB),
+    (
+        devcap::SURFACEFMT_A1R5G5B5,
+        OP_RGB | op::SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET,
+    ),
+    // Not a member of the ARGB group for Direct3D 9: its runtime disables
+    // the whole driver if A4R4G4B4 claims it.
+    (
+        devcap::SURFACEFMT_A4R4G4B4,
+        OP_RGB & !op::MEMBEROFGROUP_ARGB,
+    ),
+    (devcap::SURFACEFMT_R5G6B5, OP_RGB | OP_DISPLAY),
+    (
+        devcap::SURFACEFMT_LUMINANCE16,
+        OP_TEXTURE | op::OFFSCREENPLAIN,
+    ),
+    (
+        devcap::SURFACEFMT_LUMINANCE8_ALPHA8,
+        OP_TEXTURE | op::OFFSCREENPLAIN,
+    ),
+    (devcap::SURFACEFMT_ALPHA8, OP_TEXTURE | op::OFFSCREENPLAIN),
+    (
+        devcap::SURFACEFMT_LUMINANCE8,
+        OP_TEXTURE | op::OFFSCREENPLAIN,
+    ),
+    // Depth textures, as "hardware shadow maps": D16 and D24S8 compare
+    // (NVIDIA's way), DF16, DF24 and INTZ read the depth (ATI's and the
+    // later common way). Unigine refuses Direct3D 9 without one of them.
+    (devcap::SURFACEFMT_Z_D16, OP_DEPTH | op::TEXTURE),
+    (devcap::SURFACEFMT_Z_D24S8, OP_DEPTH | op::TEXTURE),
+    (devcap::SURFACEFMT_Z_D24X8, OP_DEPTH | op::TEXTURE),
+    (devcap::SURFACEFMT_Z_DF16, OP_DEPTH | op::TEXTURE),
+    (devcap::SURFACEFMT_Z_DF24, OP_DEPTH | op::TEXTURE),
+    (devcap::SURFACEFMT_Z_D24S8_INT, OP_DEPTH | op::TEXTURE),
+    (devcap::SURFACEFMT_DXT1, OP_TEXTURE),
+    (devcap::SURFACEFMT_DXT2, OP_TEXTURE),
+    (devcap::SURFACEFMT_DXT3, OP_TEXTURE),
+    (devcap::SURFACEFMT_DXT4, OP_TEXTURE),
+    (devcap::SURFACEFMT_DXT5, OP_TEXTURE),
+    (devcap::SURFACEFMT_BUMPU8V8, OP_TEXTURE | op::BUMPMAP),
+    (devcap::SURFACEFMT_Q8W8V8U8, OP_TEXTURE | op::BUMPMAP),
+    (devcap::SURFACEFMT_V16U16, OP_TEXTURE | op::BUMPMAP),
+    (devcap::SURFACEFMT_R_S10E5, OP_FLOAT),
+    (devcap::SURFACEFMT_R_S23E8, OP_FLOAT),
+    (devcap::SURFACEFMT_RG_S10E5, OP_FLOAT),
+    (devcap::SURFACEFMT_RG_S23E8, OP_FLOAT),
+    (devcap::SURFACEFMT_ARGB_S10E5, OP_FLOAT),
+    (devcap::SURFACEFMT_ARGB_S23E8, OP_FLOAT),
+    (
+        devcap::SURFACEFMT_G16R16,
+        OP_TEXTURE | OP_TARGET | op::OFFSCREENPLAIN | op::AUTOGENMIPMAP,
+    ),
+    (
+        devcap::SURFACEFMT_A16B16G16R16,
+        OP_TEXTURE | OP_TARGET | op::OFFSCREENPLAIN | op::AUTOGENMIPMAP,
+    ),
+    (devcap::SURFACEFMT_ATI1, OP_TEXTURE),
+    (devcap::SURFACEFMT_ATI2, OP_TEXTURE),
+];
 
 /// The `DXFMT` value of a surface format.
 pub fn dxfmt(format: u32) -> u32 {
@@ -176,6 +282,33 @@ pub const MAX_CONTEXT_IDS: u32 = 256;
 /// `(devcap, value)` of everything but the formats.
 const CAPS: &[(u32, u32)] = &[
     (devcap::THREE_D, 1),
+    // Direct3D 9 fixed function and shader model 3 limits.
+    (devcap::MAX_LIGHTS, 8),
+    (devcap::MAX_TEXTURES, 8),
+    (devcap::MAX_CLIP_PLANES, 6),
+    (devcap::S23E8_TEXTURES, 1),
+    (devcap::S10E5_TEXTURES, 1),
+    (devcap::MAX_FIXED_VERTEXBLEND, 4),
+    (devcap::D16_BUFFER_FORMAT, 1),
+    (devcap::D24S8_BUFFER_FORMAT, 1),
+    (devcap::D24X8_BUFFER_FORMAT, 1),
+    // Occlusion queries (bit SVGA3D_QUERYTYPE_OCCLUSION).
+    (devcap::QUERY_TYPES, 1),
+    (devcap::TEXTURE_GRADIENT_SAMPLING, 1),
+    (devcap::MAX_POINT_SIZE, 0x4380_0000), // 256.0
+    (devcap::MAX_SHADER_TEXTURES, 16),
+    (devcap::MAX_TEXTURE_ASPECT_RATIO, 16_384),
+    (devcap::MAX_VERTEX_SHADER_INSTRUCTIONS, 32_768),
+    (devcap::MAX_FRAGMENT_SHADER_INSTRUCTIONS, 32_768),
+    (devcap::MAX_VERTEX_SHADER_TEMPS, 32),
+    (devcap::MAX_FRAGMENT_SHADER_TEMPS, 32),
+    // Every D3DTEXOPCAPS_* operation, DISABLE to LERP.
+    (devcap::TEXTURE_OPS, 0x03ff_ffff),
+    (devcap::MAX_VERTEX_SHADER_TEXTURES, 4),
+    (devcap::AUTOGENMIPMAPS, 1),
+    (devcap::LINE_AA, 1),
+    (devcap::MAX_LINE_WIDTH, 0x3f80_0000),    // 1.0
+    (devcap::MAX_AA_LINE_WIDTH, 0x3f80_0000), // 1.0
     // Shader model 4.1, in the legacy enumerations: SVGA3DVSVERSION_40
     // and SVGA3DPSVERSION_40.
     (devcap::VERTEX_SHADER_VERSION, 9),
@@ -214,7 +347,7 @@ pub fn table(three_d: bool) -> Vec<u32> {
         return Vec::new();
     }
     let mut table = vec![0u32; devcap::MAX as usize];
-    for &(index, value) in CAPS {
+    for &(index, value) in CAPS.iter().chain(FORMAT_OPS) {
         table[index as usize] = value;
     }
     for format in 1..=f::R11G11B10_TYPELESS {
@@ -308,6 +441,70 @@ mod tests {
         let mut t = vec![0u32; 300];
         apply_probe(&mut t, "258=1, 0x10=0x20,bad,999=1,");
         assert_eq!((t[258], t[16]), (1, 0x20));
+    }
+
+    #[test]
+    fn direct3d_9_sees_a_shader_model_3_device_with_a_3d_display_format() {
+        let t = table(true);
+        // VMware's Direct3D 9 driver maps these to D3DCAPS9 (checked in the
+        // guest with guest/umdcaps: VS and PS 3.0, 16384 textures).
+        assert!(t[devcap::VERTEX_SHADER_VERSION as usize] >= svga_proto::shader_version::VS_30);
+        assert!(t[devcap::FRAGMENT_SHADER_VERSION as usize] >= svga_proto::shader_version::PS_30);
+        assert_eq!(t[devcap::MAX_TEXTURE_WIDTH as usize], 16_384);
+        // Without "display mode, 3D accelerated" on the desktop format,
+        // Windows offers no Direct3D 9 hardware device.
+        let x8r8g8b8 = t[devcap::SURFACEFMT_X8R8G8B8 as usize];
+        assert_eq!(x8r8g8b8 & op::DISPLAYMODE, op::DISPLAYMODE);
+        assert_eq!(
+            x8r8g8b8 & op::THREE_D_ACCELERATION,
+            op::THREE_D_ACCELERATION
+        );
+        // The rules of Windows' Direct3D 9 runtime, which otherwise
+        // disables the driver: 3D acceleration only with display mode and
+        // never on an alpha format; the ARGB group only on its formats;
+        // not both 16-bit RGB formats as display modes.
+        let alpha = [
+            devcap::SURFACEFMT_A8R8G8B8,
+            devcap::SURFACEFMT_A1R5G5B5,
+            devcap::SURFACEFMT_A4R4G4B4,
+            devcap::SURFACEFMT_A2R10G10B10,
+        ];
+        for &(index, ops) in FORMAT_OPS {
+            if ops & op::THREE_D_ACCELERATION != 0 {
+                assert_ne!(ops & op::DISPLAYMODE, 0, "devcap {index}");
+                assert!(!alpha.contains(&index), "devcap {index}");
+            }
+        }
+        let argb_group = [
+            devcap::SURFACEFMT_X8R8G8B8,
+            devcap::SURFACEFMT_A8R8G8B8,
+            devcap::SURFACEFMT_R5G6B5,
+            devcap::SURFACEFMT_X1R5G5B5,
+            devcap::SURFACEFMT_A1R5G5B5,
+            devcap::SURFACEFMT_A2R10G10B10,
+            devcap::SURFACEFMT_ARGB_S10E5,
+            devcap::SURFACEFMT_ARGB_S23E8,
+        ];
+        for &(index, ops) in FORMAT_OPS {
+            if ops & op::MEMBEROFGROUP_ARGB != 0 {
+                assert!(argb_group.contains(&index), "devcap {index}");
+            }
+        }
+        let display = |i: u32| t[i as usize] & op::DISPLAYMODE != 0;
+        assert!(!(display(devcap::SURFACEFMT_R5G6B5) && display(devcap::SURFACEFMT_X1R5G5B5)));
+        // Depth formats are depth buffers and shadow map textures.
+        for depth in [
+            devcap::SURFACEFMT_Z_D16,
+            devcap::SURFACEFMT_Z_D24S8,
+            devcap::SURFACEFMT_Z_DF16,
+            devcap::SURFACEFMT_Z_DF24,
+            devcap::SURFACEFMT_Z_D24S8_INT,
+        ] {
+            assert_ne!(t[depth as usize] & op::TEXTURE, 0);
+            assert_ne!(t[depth as usize] & op::ZSTENCIL, 0);
+        }
+        // The float entries hold IEEE bits.
+        assert_eq!(f32::from_bits(t[devcap::MAX_POINT_SIZE as usize]), 256.0);
     }
 
     #[test]

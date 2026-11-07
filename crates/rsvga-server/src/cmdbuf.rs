@@ -1,9 +1,18 @@
 //! Command buffer execution (`SVGA_CAP_COMMAND_BUFFERS`).
 //!
-//! Buffers run synchronously, inside the guest's write to
+//! Device-context buffers run synchronously, inside the guest's write to
 //! `SVGA_REG_COMMAND_LOW`: when the write returns, the status is already in
-//! the header. Drivers read it right away (device-context commands must
-//! complete that way) and otherwise wait for `SVGA_IRQFLAG_COMMAND_BUFFER`.
+//! the header, as drivers expect. Regular buffers run on a worker thread
+//! when the device is asynchronous ([`crate::device::Options`]): the write
+//! returns at once (QEMU waits for every vfio-user write of this device,
+//! so the guest's CPU would otherwise stand still while the device and the
+//! GPU work), the worker takes the device lock per command, and the guest
+//! learns of completion from the header's status and
+//! `SVGA_IRQFLAG_COMMAND_BUFFER`. Buffers run in submission order, and
+//! everything else waits for them ([`Svga::drain`]): device-context
+//! commands (Windows' WDDM 2.0 scheduler preempts context 0 all the time,
+//! and buffers handed back then would be resubmitted out of order) and
+//! FIFO commands.
 //!
 //! A context stops when one of its buffers fails, as on the real device:
 //! the driver then preempts what it queued meanwhile and restarts the
@@ -11,6 +20,7 @@
 //! context wait in its queue, with status `NONE`.
 
 use std::collections::VecDeque;
+use std::sync::MutexGuard;
 
 use svga_core::cmdbuf::{
     self, DeviceCommand, ERROR_OFFSET_OFFSET, Header, Location, STATUS_OFFSET,
@@ -19,6 +29,9 @@ use svga_proto::{cb, irq};
 
 use crate::device::{State, Svga, trace, trace_level};
 use crate::log;
+
+/// A decoded buffer: its commands, and where decoding stopped, if it did.
+type Prepared = (Vec<cmdbuf::Entry>, Option<(u32, String)>);
 
 /// One regular context.
 #[derive(Debug)]
@@ -43,6 +56,11 @@ impl Default for Context {
 #[derive(Debug, Default)]
 pub struct CommandBuffers {
     contexts: [Context; cb::context::MAX as usize],
+    /// Buffers of running contexts waiting for the worker: header address
+    /// and context, in submission order.
+    pending: VecDeque<(u64, u32)>,
+    /// Whether the worker is running a buffer.
+    running: bool,
     /// Buffers that completed.
     pub completed: u64,
     /// Buffers that failed (header or command error).
@@ -65,21 +83,25 @@ fn read_header(state: &State, pa: u64) -> Option<Header> {
     state.guest.read(pa, &mut raw).then(|| Header::parse(&raw))
 }
 
-/// The buffer contents as words, or `None` if they are not in guest RAM.
-fn read_contents(state: &State, header: &Header) -> Option<Vec<u32>> {
-    let Location::Physical(base) = header.location else {
-        return None; // MOBs come with guest-backed objects
-    };
-    let mut bytes = vec![0u8; usize::try_from(header.length).ok()?];
-    if !state.guest.read(base, &mut bytes) {
-        return None;
+/// The buffer contents as words: at a guest physical address, or inside a
+/// MOB (`SVGA_CB_FLAG_MOB`, used by the Windows driver in WDDM 2.0 mode).
+fn read_contents(state: &State, header: &Header) -> Result<Vec<u32>, String> {
+    let mut bytes = vec![0u8; usize::try_from(header.length).map_err(|e| e.to_string())?];
+    match header.location {
+        Location::Physical(base) => {
+            if !state.guest.read(base, &mut bytes) {
+                return Err("contents not in guest RAM".into());
+            }
+        }
+        Location::Mob { id, offset } => state
+            .gb
+            .read_mob(&state.guest, id, u64::from(offset), &mut bytes)
+            .map_err(|e| format!("contents in MOB: {e}"))?,
     }
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 /// Writes the outcome into the header, then raises the interrupt.
@@ -128,22 +150,129 @@ impl Svga {
             ctx.queued.push_back(pa);
             return;
         }
-        self.run_buffer(state, pa, &header, context);
+        self.dispatch(state, pa, &header, context);
+    }
+
+    /// Runs a buffer now, or hands it to the worker.
+    fn dispatch(&self, state: &mut State, pa: u64, header: &Header, context: u32) {
+        if self.asynchronous {
+            state.cb.pending.push_back((pa, context));
+            self.work.notify_one();
+        } else {
+            self.run_buffer(state, pa, header, context);
+        }
+    }
+
+    /// The worker: runs pending buffers forever, taking the device lock
+    /// for each command rather than for the whole buffer.
+    pub(crate) fn work(&self) {
+        loop {
+            let (pa, context, header, prepared) = {
+                let mut state = self.lock();
+                let (pa, context) = loop {
+                    if let Some(next) = state.cb.pending.pop_front() {
+                        break next;
+                    }
+                    state = self
+                        .work
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                };
+                let Some(header) = read_header(&state, pa) else {
+                    log!("command buffer header at {pa:#x} vanished from guest memory");
+                    continue;
+                };
+                // A context stopped meanwhile keeps its buffers queued.
+                if !state.cb.context(context).is_some_and(|c| c.running) {
+                    let later: Vec<u64> = state
+                        .cb
+                        .pending
+                        .iter()
+                        .filter(|(_, c)| *c == context)
+                        .map(|(p, _)| *p)
+                        .collect();
+                    state.cb.pending.retain(|(_, c)| *c != context);
+                    if let Some(ctx) = state.cb.context(context) {
+                        for p in later.into_iter().rev() {
+                            ctx.queued.push_front(p);
+                        }
+                        ctx.queued.push_front(pa);
+                    }
+                    self.idle.notify_all();
+                    continue;
+                }
+                let prepared = self.prepare(&mut state, pa, &header, context);
+                state.cb.running = prepared.is_some();
+                if !state.cb.running {
+                    self.idle.notify_all();
+                }
+                (pa, context, header, prepared)
+            };
+            let Some((entries, error)) = prepared else {
+                continue;
+            };
+            let span = crate::prof::span(crate::prof::Cat::Buffer);
+            let dx_context =
+                (header.flags & cb::flag::DX_CONTEXT != 0).then_some(header.dx_context);
+            for entry in entries {
+                let mut state = self.lock();
+                self.execute(&mut state, entry.command, dx_context);
+            }
+            let mut state = self.lock();
+            self.conclude(&mut state, pa, &header, context, error);
+            state.cb.running = false;
+            self.idle.notify_all();
+            drop(span);
+            crate::prof::report();
+        }
+    }
+
+    /// Waits until the worker has run every buffer handed to it.
+    pub(crate) fn drain<'a>(&'a self, mut state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+        while !state.cb.pending.is_empty() || state.cb.running {
+            state = self
+                .idle
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state
     }
 
     /// Runs the commands of a regular context's buffer.
     fn run_buffer(&self, state: &mut State, pa: u64, header: &Header, context: u32) {
+        let span = crate::prof::span(crate::prof::Cat::Buffer);
+        let Some((entries, error)) = self.prepare(state, pa, header, context) else {
+            return;
+        };
+        // DX commands apply to the context the header names.
+        let dx_context = (header.flags & cb::flag::DX_CONTEXT != 0).then_some(header.dx_context);
+        for entry in entries {
+            self.execute(state, entry.command, dx_context);
+        }
+        self.conclude(state, pa, header, context, error);
+        drop(span);
+        crate::prof::report();
+    }
+
+    /// Reads and decodes a buffer; `None` (and the buffer finished) if its
+    /// header or contents are bad.
+    fn prepare(
+        &self,
+        state: &mut State,
+        pa: u64,
+        header: &Header,
+        context: u32,
+    ) -> Option<Prepared> {
         let contents = header
             .validate(cb::MAX_SIZE_DEFAULT)
             .map_err(|error| error.to_string())
-            .and_then(|()| {
-                read_contents(state, header).ok_or_else(|| "contents not in guest RAM".into())
-            });
+            .and_then(|()| read_contents(state, header));
         let words = match contents {
             Ok(words) => words,
             Err(error) => {
                 log!("command buffer refused: {error}");
-                return finish(state, pa, header, cb::status::CB_HEADER_ERROR, 0);
+                finish(state, pa, header, cb::status::CB_HEADER_ERROR, 0);
+                return None;
             }
         };
         let limits = cmdbuf::buffer_limits(&self.limits);
@@ -155,13 +284,21 @@ impl Svga {
                 entries.len()
             ));
         }
-        // DX commands apply to the context the header names.
-        let dx_context = (header.flags & cb::flag::DX_CONTEXT != 0).then_some(header.dx_context);
-        for entry in entries {
-            self.execute(state, entry.command, dx_context);
-        }
+        Some((entries, error.map(|(offset, e)| (offset, e.to_string()))))
+    }
+
+    /// After a buffer's commands: the GPU work done, the status written.
+    fn conclude(
+        &self,
+        state: &mut State,
+        pa: u64,
+        header: &Header,
+        context: u32,
+        error: Option<(u32, String)>,
+    ) {
         if let Some(gpu) = state.gpu.as_mut() {
-            gpu.flush();
+            let _flush = crate::prof::span(crate::prof::Cat::Flush);
+            gpu.flush(&mut state.gb, &state.guest);
         }
         match error {
             None => finish(state, pa, header, cb::status::COMPLETED, 0),
@@ -179,10 +316,11 @@ impl Svga {
     fn run_device(&self, state: &mut State, pa: u64, header: &Header) {
         let words = header
             .validate(cb::MAX_SIZE_DEFAULT)
-            .ok()
-            .and_then(|()| read_contents(state, header));
+            .map_err(|error| error.to_string())
+            .and_then(|()| read_contents(state, header))
+            .map_err(|error| log!("device context buffer refused: {error}"))
+            .ok();
         let Some(words) = words else {
-            log!("device context buffer refused");
             return finish(state, pa, header, cb::status::CB_HEADER_ERROR, 0);
         };
         let start = usize::try_from(header.offset.div_euclid(4)).unwrap_or(usize::MAX);
@@ -232,18 +370,28 @@ impl Svga {
                 break;
             };
             if let Some(header) = read_header(state, pa) {
-                self.run_buffer(state, pa, &header, context);
+                self.dispatch(state, pa, &header, context);
             }
         }
         true
     }
 
-    /// Hands queued buffers back to the guest with status `PREEMPTED`.
+    /// Hands queued buffers back to the guest with status `PREEMPTED`
+    /// (those the worker has not started too).
     fn preempt(&self, state: &mut State, context: u32, ignore_id_zero: bool) -> bool {
+        let pending: Vec<u64> = state
+            .cb
+            .pending
+            .iter()
+            .filter(|(_, c)| *c == context)
+            .map(|(p, _)| *p)
+            .collect();
+        state.cb.pending.retain(|(_, c)| *c != context);
         let Some(ctx) = state.cb.context(context) else {
             return false;
         };
-        let queued: Vec<u64> = ctx.queued.drain(..).collect();
+        let mut queued: Vec<u64> = pending;
+        queued.extend(ctx.queued.drain(..));
         for pa in queued {
             let Some(header) = read_header(state, pa) else {
                 continue;

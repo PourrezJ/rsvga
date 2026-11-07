@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use svga_core::cotable::{self, Object, QUERY_ACTIVE, QUERY_FINISHED, Query};
-use svga_core::dx::{DxCommand, ScissorRect, ShaderStage, SoTarget, VertexBuffer, Viewport};
+use svga_core::dx::{
+    DxCommand, ScissorRect, ShaderStage, SoTarget, VertexBuffer, Viewport, WHOLE_SIZE,
+};
 use svga_core::gb::{GbCommand, ImageId};
 use svga_core::layout::Box3;
 use svga_proto::{INVALID_ID, dx};
@@ -108,8 +110,9 @@ pub struct Bindings {
     pub input_layout: u32,
     /// Vertex buffers.
     pub vertex_buffers: [VertexBuffer; dx::MAX_VERTEXBUFFERS],
-    /// Index buffer: surface, format, byte offset.
-    pub index_buffer: (u32, u32, u32),
+    /// Index buffer: surface, format, byte offset, bytes readable from
+    /// there (`WHOLE_SIZE`: to the end).
+    pub index_buffer: (u32, u32, u32, u32),
     /// `SVGA3dPrimitiveType`.
     pub topology: u32,
     /// Render target views.
@@ -140,6 +143,7 @@ impl Default for Bindings {
             sid: INVALID_ID,
             stride: 0,
             offset: 0,
+            size: WHOLE_SIZE,
         };
         let no_so = SoTarget {
             sid: INVALID_ID,
@@ -150,7 +154,7 @@ impl Default for Bindings {
             stages: Default::default(),
             input_layout: INVALID_ID,
             vertex_buffers: [no_vb; dx::MAX_VERTEXBUFFERS],
-            index_buffer: (INVALID_ID, 0, 0),
+            index_buffer: (INVALID_ID, 0, 0, WHOLE_SIZE),
             topology: 0,
             render_targets: [INVALID_ID; dx::MAX_RENDER_TARGETS],
             depth_stencil_view: INVALID_ID,
@@ -565,11 +569,29 @@ impl DxContexts {
                 )?;
                 b.vertex_buffers[range].copy_from_slice(&buffers);
             }
+            C::SetVertexBuffersOffsetAndSize { start, ranges } => {
+                let b = self.bindings(cid()?)?;
+                let range = slots("vertex buffers", start, ranges.len(), dx::MAX_VERTEXBUFFERS)?;
+                for (vb, r) in b.vertex_buffers[range].iter_mut().zip(ranges) {
+                    vb.stride = r.stride;
+                    vb.offset = r.offset;
+                    vb.size = r.size;
+                }
+            }
             C::SetIndexBuffer {
                 sid,
                 format,
                 offset,
-            } => self.bindings(cid()?)?.index_buffer = (sid, format, offset),
+                size,
+            } => self.bindings(cid()?)?.index_buffer = (sid, format, offset, size),
+            C::SetIndexBufferOffsetAndSize {
+                format,
+                offset,
+                size,
+            } => {
+                let b = self.bindings(cid()?)?;
+                b.index_buffer = (b.index_buffer.0, format, offset, size);
+            }
             C::SetTopology { topology } => self.bindings(cid()?)?.topology = topology,
             C::SetRenderTargets {
                 depth_stencil,
@@ -1155,6 +1177,60 @@ mod tests {
             guest: &guest,
         };
         r.ok(None, DxCommand::DefineContext { cid: 0 });
+        // Vertex and index buffers, then new ranges: the surfaces stay.
+        r.ok(
+            Some(0),
+            DxCommand::SetVertexBuffers {
+                start: 3,
+                buffers: vec![VertexBuffer {
+                    sid: 40,
+                    stride: 16,
+                    offset: 0,
+                    size: WHOLE_SIZE,
+                }],
+            },
+        );
+        r.ok(
+            Some(0),
+            DxCommand::SetVertexBuffersOffsetAndSize {
+                start: 3,
+                ranges: vec![svga_core::dx::VertexBufferRange {
+                    stride: 20,
+                    offset: 64,
+                    size: 200,
+                }],
+            },
+        );
+        r.ok(
+            Some(0),
+            DxCommand::SetIndexBuffer {
+                sid: 41,
+                format: 89,
+                offset: 0,
+                size: WHOLE_SIZE,
+            },
+        );
+        r.ok(
+            Some(0),
+            DxCommand::SetIndexBufferOffsetAndSize {
+                format: 77,
+                offset: 8,
+                size: 400,
+            },
+        );
+        {
+            let b = &r.dx.context(0).unwrap().bindings;
+            assert_eq!(
+                b.vertex_buffers[3],
+                VertexBuffer {
+                    sid: 40,
+                    stride: 20,
+                    offset: 64,
+                    size: 200
+                }
+            );
+            assert_eq!(b.index_buffer, (41, 77, 8, 400));
+        }
         r.ok(
             Some(0),
             DxCommand::SetShaderResources {

@@ -27,7 +27,8 @@
 # display driver always starts from scratch (a resumed driver keeps the
 # choices it made against the previous device).
 #
-# --trace logs register accesses and FIFO commands (rsvga.log), and the
+# --trace logs register accesses and FIFO commands (rsvga.log; RSVGA_TRACE=0
+# in the environment keeps the server quiet, to measure), and the
 # VMware backdoor traffic, driver log messages included (qemu.log).
 # --diagnose also saves each guest cursor and a screen capture per second in
 # the overlay's folder (cursors/, screen.png).
@@ -124,7 +125,7 @@ if ((diagnose)); then
   export RSVGA_CURSOR_DUMP=$state/cursors
   extra=(--snapshot "$state/screen.png")
 fi
-RSVGA_TRACE=$trace "$rsvga" --socket "$sock" --rom "$rom" --window --qmp "$qmp" "${extra[@]}" \
+RSVGA_TRACE=${RSVGA_TRACE:-$trace} "$rsvga" --socket "$sock" --rom "$rom" --window --qmp "$qmp" "${extra[@]}" \
   2> "$state/rsvga.log" &
 rsvga_pid=$!
 trap 'kill $rsvga_pid 2>/dev/null; rm -f "$sock" "$qmp" "$hmp"' EXIT

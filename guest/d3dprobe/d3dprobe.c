@@ -4,7 +4,8 @@
  * traces with the rsvga vmport patch). It works even when the guest
  * shows nothing, which is the point: it explains why DWM cannot start.
  *
- * Every line also goes to stdout and to d3dprobe.log next to the program.
+ * Every line also goes to stdout and to d3dprobe.log next to the program
+ * (guest/common/hostlog.h).
  *
  * Build: scripts/build-guest-tools.sh (mingw-w64).
  */
@@ -14,102 +15,10 @@
 #include <d3d11.h>
 #include <d3d9.h>
 #include <dxgi1_6.h>
-#include <stdarg.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
+#include <psapi.h>
+#include <shlwapi.h>
 
-/* ---- VMware backdoor: GuestRPC (RPCI channel) ------------------------ */
-
-#define BDOOR_MAGIC 0x564D5868u
-#define BDOOR_PORT 0x5658u
-#define BDOOR_CMD_MESSAGE 30u
-#define RPCI_PROTOCOL 0x49435052u
-#define RPC_FLAG_COOKIE 0x80000000u
-#define RPC_SUCCESS 0x0001u
-#define RPC_DORECV 0x0002u
-
-enum { RPC_OPEN, RPC_SENDSIZE, RPC_SENDPAYLOAD, RPC_RECVSIZE,
-       RPC_RECVPAYLOAD, RPC_RECVSTATUS, RPC_CLOSE };
-
-struct regs { uint32_t ax, bx, cx, dx, si, di; };
-
-/* One backdoor call. Ring 3 is fine: the hypervisor traps the port. */
-static void bdoor(struct regs *r)
-{
-    __asm__ __volatile__("inl %%dx, %%eax"
-                         : "+a"(r->ax), "+b"(r->bx), "+c"(r->cx),
-                           "+d"(r->dx), "+S"(r->si), "+D"(r->di)
-                         :
-                         : "memory");
-}
-
-static int have_backdoor = 1;
-
-static void rpc_step(struct regs *r, uint32_t type, uint32_t channel,
-                     uint32_t bx, uint32_t hi, uint32_t lo)
-{
-    r->ax = BDOOR_MAGIC;
-    r->bx = bx;
-    r->cx = BDOOR_CMD_MESSAGE | type << 16;
-    r->dx = channel << 16 | BDOOR_PORT;
-    r->si = hi;
-    r->di = lo;
-    bdoor(r);
-}
-
-/* Sends `msg` and discards the reply. Returns 0 if the host is absent. */
-static int rpc_send(const char *msg)
-{
-    struct regs r = {0};
-    uint32_t len = (uint32_t)strlen(msg), channel, hi, lo, i;
-
-    if (!have_backdoor)
-        return 0;
-    rpc_step(&r, RPC_OPEN, 0, RPCI_PROTOCOL | RPC_FLAG_COOKIE, 0, 0);
-    if (!(r.cx >> 16 & RPC_SUCCESS))
-        return 0;
-    channel = r.dx >> 16;
-    hi = r.si;
-    lo = r.di;
-    rpc_step(&r, RPC_SENDSIZE, channel, len, hi, lo);
-    for (i = 0; i < len; i += 4) {
-        uint32_t word = 0;
-        memcpy(&word, msg + i, len - i < 4 ? len - i : 4);
-        rpc_step(&r, RPC_SENDPAYLOAD, channel, word, hi, lo);
-    }
-    rpc_step(&r, RPC_RECVSIZE, channel, 0, hi, lo);
-    if (r.cx >> 16 & RPC_DORECV) {
-        uint32_t size = r.bx;
-        for (i = 0; i < size; i += 4)
-            rpc_step(&r, RPC_RECVPAYLOAD, channel, RPC_SUCCESS, hi, lo);
-        rpc_step(&r, RPC_RECVSTATUS, channel, RPC_SUCCESS, hi, lo);
-    }
-    rpc_step(&r, RPC_CLOSE, channel, 0, hi, lo);
-    return 1;
-}
-
-/* ---- output ------------------------------------------------------------ */
-
-static FILE *logfile;
-
-static void say(const char *fmt, ...)
-{
-    char line[1024];
-    char msg[1100];
-    va_list ap;
-
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof line, fmt, ap);
-    va_end(ap);
-    printf("%s\n", line);
-    if (logfile) {
-        fprintf(logfile, "%s\n", line);
-        fflush(logfile);
-    }
-    snprintf(msg, sizeof msg, "log d3dprobe: %s", line);
-    rpc_send(msg);
-}
+#include "../common/hostlog.h"
 
 static const char *utf8(const WCHAR *w)
 {
@@ -336,51 +245,101 @@ static void probe_d3d11(void)
     }
 }
 
+/* The modules of this process whose name contains one of `parts`. */
+static void list_modules(const char *when)
+{
+    HMODULE modules[512];
+    DWORD bytes = 0;
+    UINT i;
+
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof modules, &bytes))
+        return;
+    for (i = 0; i < bytes / sizeof modules[0] && i < 512; i++) {
+        char name[MAX_PATH];
+        if (!GetModuleFileNameA(modules[i], name, sizeof name))
+            continue;
+        if (strstr(name, "vm3d") || StrStrIA(name, "d3d9") || StrStrIA(name, "d3d10") ||
+            StrStrIA(name, "d3d11") || StrStrIA(name, "dxgi"))
+            say("modules %s: %s", when, name);
+    }
+}
+
+static LRESULT CALLBACK plain_window(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
 static void probe_d3d9(void)
 {
     IDirect3D9 *d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    IDirect3D9Ex *d3d_ex = NULL;
+    IDirect3DDevice9 *device = NULL;
+    D3DADAPTER_IDENTIFIER9 id;
+    D3DPRESENT_PARAMETERS pp;
     D3DCAPS9 caps;
+    WNDCLASSA wc;
+    HWND hwnd;
     HRESULT hr;
 
     if (!d3d) {
         say("Direct3DCreate9 failed");
         return;
     }
+    say("D3D9 adapters: %u", IDirect3D9_GetAdapterCount(d3d));
+    memset(&id, 0, sizeof id);
+    hr = IDirect3D9_GetAdapterIdentifier(d3d, D3DADAPTER_DEFAULT, 0, &id);
+    say("D3D9 adapter: hr=0x%08lx driver \"%s\" \"%s\" version %u.%u.%u.%u vendor=%04lx device=%04lx",
+        (unsigned long)hr, id.Driver, id.Description, HIWORD(id.DriverVersion.HighPart),
+        LOWORD(id.DriverVersion.HighPart), HIWORD(id.DriverVersion.LowPart),
+        LOWORD(id.DriverVersion.LowPart), (unsigned long)id.VendorId,
+        (unsigned long)id.DeviceId);
+    memset(&caps, 0, sizeof caps);
     hr = IDirect3D9_GetDeviceCaps(d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, &caps);
     say("D3D9 HAL caps: hr=0x%08lx vs=0x%08lx ps=0x%08lx max texture %lux%lu",
         (unsigned long)hr, (unsigned long)caps.VertexShaderVersion,
         (unsigned long)caps.PixelShaderVersion, (unsigned long)caps.MaxTextureWidth,
         (unsigned long)caps.MaxTextureHeight);
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = plain_window;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "d3dprobe";
+    RegisterClassA(&wc);
+    hwnd = CreateWindowA("d3dprobe", "d3dprobe", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, NULL, NULL,
+                         wc.hInstance, NULL);
+    memset(&pp, 0, sizeof pp);
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferFormat = D3DFMT_UNKNOWN;
+    pp.hDeviceWindow = hwnd;
+    hr = IDirect3D9_CreateDevice(d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
+                                 D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device);
+    say("D3D9 CreateDevice (HAL, hardware vertices): hr=0x%08lx", (unsigned long)hr);
+    if (device)
+        IDirect3DDevice9_Release(device);
+    list_modules("after D3D9");
     IDirect3D9_Release(d3d);
-}
-
-static LONG WINAPI no_backdoor(EXCEPTION_POINTERS *e)
-{
-    /* A #GP on the backdoor port: not a VMware-compatible hypervisor. */
-    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION ||
-        e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        have_backdoor = 0;
-        e->ContextRecord->Rip += 1; /* skip the one-byte `in` */
-        return EXCEPTION_CONTINUE_EXECUTION;
+    hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &d3d_ex);
+    if (SUCCEEDED(hr)) {
+        memset(&caps, 0, sizeof caps);
+        hr = IDirect3D9Ex_GetDeviceCaps(d3d_ex, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, &caps);
+        say("D3D9Ex HAL caps: hr=0x%08lx vs=0x%08lx ps=0x%08lx", (unsigned long)hr,
+            (unsigned long)caps.VertexShaderVersion, (unsigned long)caps.PixelShaderVersion);
+        IDirect3D9Ex_Release(d3d_ex);
+    } else {
+        say("Direct3DCreate9Ex: hr=0x%08lx", (unsigned long)hr);
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    if (hwnd)
+        DestroyWindow(hwnd);
 }
 
 int main(void)
 {
-    char path[MAX_PATH];
-    char *slash;
     OSVERSIONINFOW os;
 
     memset(&os, 0, sizeof os);
     os.dwOSVersionInfoSize = sizeof os;
-    AddVectoredExceptionHandler(1, no_backdoor);
-    GetModuleFileNameA(NULL, path, sizeof path);
-    slash = strrchr(path, '\\');
-    if (slash) {
-        strcpy(slash + 1, "d3dprobe.log");
-        logfile = fopen(path, "a");
-    }
+    log_open("d3dprobe");
+    log_debug_output();
     GetVersionExW(&os);
     say("start: Windows %lu.%lu.%lu", (unsigned long)os.dwMajorVersion,
         (unsigned long)os.dwMinorVersion, (unsigned long)os.dwBuildNumber);
@@ -388,7 +347,6 @@ int main(void)
     probe_d3d11();
     probe_d3d9();
     say("done");
-    if (logfile)
-        fclose(logfile);
+    log_close();
     return 0;
 }
