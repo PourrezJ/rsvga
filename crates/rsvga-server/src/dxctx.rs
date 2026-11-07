@@ -11,7 +11,9 @@
 //! The bindings (shaders, views, buffers, states, viewports...) are the
 //! pipeline state a draw uses. A shader's code is copied out of its MOB
 //! when it is bound (`DX_BIND_SHADER`): later guest writes cannot change
-//! a shader in use.
+//! a shader in use. It is translated to SPIR-V at once ([`svga_shader`],
+//! default options); a shader the translator refuses is logged with the
+//! reason.
 //!
 //! Draws, clears and copies between surfaces need the renderer: they are
 //! accepted and reported as [`Outcome::Deferred`] for now. Fences and
@@ -182,6 +184,8 @@ pub struct Context {
     pub bindings: Bindings,
     /// Code of the bound shaders.
     code: HashMap<u32, Arc<[u8]>>,
+    /// Their translations (or why there is none).
+    spirv: HashMap<u32, Result<Arc<svga_shader::Shader>, String>>,
 }
 
 impl Context {
@@ -194,6 +198,12 @@ impl Context {
     #[allow(dead_code, reason = "read by the renderer, next step of M3")]
     pub fn shader_code(&self, id: u32) -> Option<&Arc<[u8]>> {
         self.code.get(&id)
+    }
+
+    /// The SPIR-V of shader `id`, once bound (an error: why there is none).
+    #[allow(dead_code, reason = "read by the renderer, next step of M3")]
+    pub fn shader_spirv(&self, id: u32) -> Option<&Result<Arc<svga_shader::Shader>, String>> {
+        self.spirv.get(&id)
     }
 
     fn query_mut(&mut self, id: u32) -> Result<&mut Query, String> {
@@ -212,6 +222,10 @@ pub struct DxContexts {
     limits: Limits,
     contexts: HashMap<u32, Context>,
     code_bytes: usize,
+    /// Shaders translated to SPIR-V, and refused, since the start.
+    pub translated: u64,
+    /// See `translated`.
+    pub refused: u64,
     epoch: Instant,
 }
 
@@ -242,6 +256,8 @@ impl DxContexts {
             limits,
             contexts: HashMap::new(),
             code_bytes: 0,
+            translated: 0,
+            refused: 0,
             epoch: Instant::now(),
         }
     }
@@ -264,10 +280,11 @@ impl DxContexts {
     }
 
     fn drop_code(&mut self, cid: u32, shader: u32) {
-        if let Some(context) = self.contexts.get_mut(&cid)
-            && let Some(code) = context.code.remove(&shader)
-        {
-            self.code_bytes = self.code_bytes.saturating_sub(code.len());
+        if let Some(context) = self.contexts.get_mut(&cid) {
+            context.spirv.remove(&shader);
+            if let Some(code) = context.code.remove(&shader) {
+                self.code_bytes = self.code_bytes.saturating_sub(code.len());
+            }
         }
     }
 
@@ -296,8 +313,25 @@ impl DxContexts {
         }
         let mut code = vec![0u8; size];
         gb.read_mob(guest, s.mob, u64::from(s.offset), &mut code)?;
+        dump_shader(s.stage, &code);
         self.code_bytes = self.code_bytes.saturating_add(size);
-        self.context_mut(cid)?.code.insert(shader, code.into());
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let spirv = svga_shader::translate_words(&words, &svga_shader::Options::default())
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+        match &spirv {
+            Ok(_) => self.translated = self.translated.saturating_add(1),
+            Err(e) => {
+                self.refused = self.refused.saturating_add(1);
+                crate::log!("shader {shader} ({:?}) not translated: {e}", s.stage);
+            }
+        }
+        let context = self.context_mut(cid)?;
+        context.code.insert(shader, code.into());
+        context.spirv.insert(shader, spirv);
         Ok(())
     }
 
@@ -812,6 +846,25 @@ impl DxContexts {
     }
 }
 
+/// Diagnostics: with `RSVGA_SHADER_DUMP=DIR`, each distinct shader bound is
+/// saved as `DIR/<stage>-<hash>.vgpu10` (code and signatures, as the guest
+/// gave them), to study and test the translator.
+fn dump_shader(stage: ShaderStage, code: &[u8]) {
+    let Some(dir) = std::env::var_os("RSVGA_SHADER_DUMP") else {
+        return;
+    };
+    // FNV-1a: a stable name, so identical shaders share a file.
+    let hash = code.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let path = std::path::Path::new(&dir).join(format!("{stage:?}-{hash:016x}.vgpu10"));
+    if !path.exists()
+        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, code))
+    {
+        crate::log!("shader dump {}: {e}", path.display());
+    }
+}
+
 fn image(sid: u32, face: u32, mipmap: u32) -> ImageId {
     ImageId { sid, face, mipmap }
 }
@@ -1028,6 +1081,12 @@ mod tests {
             r.dx.context(0).unwrap().shader_code(2).map(|c| c.to_vec()),
             Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
         );
+        // Not a shader: kept, but not translated.
+        assert!(matches!(
+            r.dx.context(0).unwrap().shader_spirv(2),
+            Some(Err(_))
+        ));
+        assert_eq!((r.dx.translated, r.dx.refused), (0, 1));
         // Code outside its MOB, or beyond the budget, is refused.
         assert!(r.err(None, bind(4092)).contains("beyond"));
         r.ok(
@@ -1050,6 +1109,39 @@ mod tests {
             )
             .contains("too large")
         );
+        // A real (empty) vertex shader: version, length, ret.
+        r.ok(
+            Some(0),
+            DxCommand::DefineShader {
+                id: 4,
+                stage: ShaderStage::Vertex,
+                size: 12,
+            },
+        );
+        let words: Vec<u8> = [0x0001_0040u32, 3, 0x0100_003e]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert!(ram.write(mob_offset(3) + 64, &words));
+        r.ok(
+            None,
+            DxCommand::BindShader {
+                cid: 0,
+                shader: 4,
+                mob: 3,
+                offset: 64,
+            },
+        );
+        let spirv =
+            r.dx.context(0)
+                .unwrap()
+                .shader_spirv(4)
+                .cloned()
+                .unwrap()
+                .unwrap();
+        assert_eq!(spirv.spirv[0], 0x0723_0203);
+        assert_eq!(r.dx.translated, 1);
+        r.ok(Some(0), DxCommand::DestroyShader { id: 4 });
         r.ok(Some(0), DxCommand::DestroyShader { id: 2 });
         assert!(r.dx.context(0).unwrap().shader_code(2).is_none());
         assert_eq!(r.dx.code_bytes, 0);

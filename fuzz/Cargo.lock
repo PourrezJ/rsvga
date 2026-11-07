@@ -82,6 +82,7 @@ dependencies = [
  "libfuzzer-sys",
  "svga-core",
  "svga-proto",
+ "svga-shader",
 ]
 
 [[package]]
@@ -99,4 +100,8 @@ dependencies = [
 
 [[package]]
 name = "svga-proto"
+version = "0.0.1"
+
+[[package]]
+name = "svga-shader"
 version = "0.0.1"

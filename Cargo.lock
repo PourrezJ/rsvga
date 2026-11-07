@@ -1130,6 +1130,7 @@ dependencies = [
  "svga-core",
  "svga-proto",
  "svga-render",
+ "svga-shader",
  "vfio-user",
  "winit",
 ]
@@ -1363,6 +1364,10 @@ dependencies = [
  "svga-core",
  "svga-proto",
 ]
+
+[[package]]
+name = "svga-shader"
+version = "0.0.1"
 
 [[package]]
 name = "syn"

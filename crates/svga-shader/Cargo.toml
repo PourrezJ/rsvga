@@ -1,0 +1,12 @@
+[package]
+name = "svga-shader"
+description = "Translates VGPU10 (Direct3D 10/11 shader model 4) shaders to SPIR-V"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

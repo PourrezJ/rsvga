@@ -16,6 +16,7 @@ softbuffer = { version = "0.4", optional = true }
 svga-core = { path = "../svga-core" }
 svga-proto = { path = "../svga-proto" }
 svga-render = { path = "../svga-render" }
+svga-shader = { path = "../svga-shader" }
 vfio-user = { path = "../vfio-user" }
 winit = { version = "0.30", optional = true }
 

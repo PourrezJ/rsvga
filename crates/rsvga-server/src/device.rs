@@ -401,7 +401,7 @@ impl Svga {
         let r = |i: u32| self.fifo.load_u32(reg_index(i));
         let state = self.lock();
         format!(
-            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} dx={} deferred={} refused={} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
+            "fifo min={:#x} max={:#x} next={:#x} stop={:#x} fence={:#x} busy={} caps={:#x} | cursor on={} x={} y={} count={} | commands={} dx={} deferred={} refused={} shaders={}/{} cb ok={} failed={} error={:?} | irq mask={:#x} pending={:#x} signals={} eventfd={}",
             r(fifo::MIN),
             r(fifo::MAX),
             r(fifo::NEXT_CMD),
@@ -417,6 +417,8 @@ impl Svga {
             state.stats.dx,
             state.stats.dx_deferred,
             state.stats.dx_refused,
+            state.dx.translated,
+            state.dx.translated.saturating_add(state.dx.refused),
             state.cb.completed,
             state.cb.failed,
             state.fifo_error,

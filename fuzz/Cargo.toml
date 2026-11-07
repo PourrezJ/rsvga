@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 svga-core = { path = "../crates/svga-core" }
 svga-proto = { path = "../crates/svga-proto" }
+svga-shader = { path = "../crates/svga-shader" }
 
 # Standalone: the root workspace excludes this directory.
 [workspace]
@@ -32,6 +33,13 @@ bench = false
 [[bin]]
 name = "dx"
 path = "fuzz_targets/dx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shader"
+path = "fuzz_targets/shader.rs"
 test = false
 doc = false
 bench = false
