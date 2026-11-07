@@ -11,7 +11,9 @@
 # driver's user-mode log), umd (umdcaps: the Direct3D 9 driver's answers),
 # dxg (enables the graphics kernel's event channels; with --admin), trace
 # (d3d9trace: what the Direct3D 9 runtime asks the driver), retrace (the
-# same, with the display mode formats rewritten).
+# same, with the display mode formats rewritten), modes (resolution
+# changes and back), reboot (restarts Windows: nothing to wait for),
+# videoprobe (video processor blits, to decode the driver's commands).
 #
 # The script waits for the desktop (unless --now), opens Win+R, types
 # D:\NAME.cmd through the QEMU monitor and waits up to SECONDS (default
@@ -52,6 +54,8 @@ case $name in
   umd) tool=umdcaps done='umdcaps: --- end' ;;
   trace | retrace) tool=d3d9trace done='d3d9trace: --- end' ;;
   ninetest) tool=d3d9test done='d3d9test: summary\|d3d9test: FAIL setup' ;;
+  modes) tool=modes done='modes: --- end' ;;
+  videoprobe) tool=videoprobe done='videoprobe: --- end' ;;
   nine) tool='\(d3dprobe\|hostcat\)' done='hostcat: --- end\|hostcat: cannot' ;;
   *) tool=$name done="$name: " ;;
 esac

@@ -38,6 +38,13 @@ fn pattern(len: usize) -> Vec<u8> {
 }
 
 #[test]
+fn a_missing_gpu_is_an_error_not_a_crash() {
+    // The loader must outlive the instance destroyed on this path.
+    assert!(Renderer::with_device(Some("no such gpu")).is_err());
+    assert!(Renderer::with_device(Some("no such gpu")).is_err());
+}
+
+#[test]
 fn copies_start_on_common_multiples() {
     assert_eq!(lcm(16, 12), 48, "RGB32 texels after 16-byte constants");
     assert_eq!(lcm(256, 4), 256);

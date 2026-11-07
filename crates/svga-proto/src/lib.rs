@@ -628,6 +628,10 @@ pub mod cmd3d {
     pub const DX_PRED_STAGING_CONVERT_REGION: u32 = 1289;
     pub const DX_PRED_STAGING_CONVERT: u32 = 1290;
     pub const DX_STAGING_BUFFER_COPY: u32 = 1291;
+    /// A video processor blit. Not in the public headers: decoded from
+    /// what VMware's Direct3D 11 driver sends for `VideoProcessorBlt` on a
+    /// device with `SVGA_CAP2_VIDEO_BLT` (see `svga_core::gb::VideoBlt`).
+    pub const VIDEO_BLT: u32 = 1295;
     /// One past the last 3D command known to this protocol version.
     pub const MAX: u32 = 1303;
     /// One past the last ID reserved for 3D-framed commands.

@@ -5,7 +5,7 @@
  * compares them with what Direct3D specifies: a colored triangle, constant
  * buffers and an indexed quad, a texture, depth, blending, instancing, an
  * integer target, scissors, SV_VertexID, multisample resolve, mipmap
- * generation, and last a window with a swap chain (left on screen a few
+ * generation, the video processor, and last a window with a swap chain (left on screen a few
  * seconds, to be seen). Results go to the host (guest/common/hostlog.h):
  * one "PASS name" or "FAIL name: why" line per test, then a summary.
  *
@@ -864,6 +864,95 @@ out:
     end();
 }
 
+/* ---- video processing ------------------------------------------------------ */
+
+/* B8G8R8A8 pixels read as little-endian words. */
+#define BGRA(r, g, b, a) RGBA(b, g, r, a)
+
+/*
+ * The video processor, which players and DWM use to scale and convert
+ * video: a 32x32 picture, left half red and right half blue, scaled into a
+ * 64x64 target. VMware's driver runs WDDM 2.0 only on a device that
+ * announces video blits; this shows what it sends for them. Skipped (not
+ * failed) when the driver offers no video device.
+ */
+static void test_video(void)
+{
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, {30, 1}, 32, 32, {30, 1}, 64, 64,
+        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL};
+    D3D11_TEXTURE2D_DESC d = {32, 32, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+                              D3D11_USAGE_DEFAULT,
+                              D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc = {0, D3D11_VPIV_DIMENSION_TEXTURE2D,
+                                                     .Texture2D = {0, 0}};
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC out_desc = {D3D11_VPOV_DIMENSION_TEXTURE2D,
+                                                       .Texture2D = {0}};
+    D3D11_VIDEO_PROCESSOR_STREAM stream;
+    ID3D11VideoDevice *vdev = NULL;
+    ID3D11VideoContext *vctx = NULL;
+    ID3D11VideoProcessorEnumerator *vpe = NULL;
+    ID3D11VideoProcessor *vp = NULL;
+    ID3D11VideoProcessorInputView *in_view = NULL;
+    ID3D11VideoProcessorOutputView *out_view = NULL;
+    ID3D11Texture2D *src = NULL;
+    uint32_t texels[32 * 32];
+    struct target t;
+    UINT support = 0;
+    HRESULT hr;
+    int i;
+
+    memset(&t, 0, sizeof t);
+    hr = ID3D11Device_QueryInterface(dev, &IID_ID3D11VideoDevice, (void **)&vdev);
+    if (FAILED(hr)) {
+        say("SKIP video: no video device (hr=0x%08lx)", (unsigned long)hr);
+        return;
+    }
+    begin("video");
+    for (i = 0; i < 32 * 32; i++)
+        texels[i] = i % 32 < 16 ? BGRA(255, 0, 0, 255) : BGRA(0, 0, 255, 255);
+    if (!ok("QueryInterface (video context)",
+            ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11VideoContext, (void **)&vctx)) ||
+        !ok("CreateVideoProcessorEnumerator",
+            ID3D11VideoDevice_CreateVideoProcessorEnumerator(vdev, &content, &vpe)))
+        goto out;
+    ID3D11VideoProcessorEnumerator_CheckVideoProcessorFormat(vpe, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                              &support);
+    say("video: B8G8R8A8 support 0x%x", support);
+    if (!ok("CreateVideoProcessor", ID3D11VideoDevice_CreateVideoProcessor(vdev, vpe, 0, &vp)) ||
+        !ok("CreateTexture2D (video)", ID3D11Device_CreateTexture2D(dev, &d, NULL, &src)) ||
+        !make_target(&t, DXGI_FORMAT_B8G8R8A8_UNORM, W, H))
+        goto out;
+    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)src, 0, NULL, texels, 32 * 4, 0);
+    if (!ok("CreateVideoProcessorInputView",
+            ID3D11VideoDevice_CreateVideoProcessorInputView(vdev, (ID3D11Resource *)src, vpe,
+                                                            &in_desc, &in_view)) ||
+        !ok("CreateVideoProcessorOutputView",
+            ID3D11VideoDevice_CreateVideoProcessorOutputView(vdev, (ID3D11Resource *)t.tex, vpe,
+                                                             &out_desc, &out_view)))
+        goto out;
+    clear(&t, 0, 0, 0, 1);
+    memset(&stream, 0, sizeof stream);
+    stream.Enable = TRUE;
+    stream.pInputSurface = in_view;
+    if (!ok("VideoProcessorBlt", ID3D11VideoContext_VideoProcessorBlt(vctx, vp, out_view, 0, 1,
+                                                                       &stream)) ||
+        !read_target(&t, pixels))
+        goto out;
+    expect("left half", AT(16, 32), BGRA(255, 0, 0, 255), 8);
+    expect("right half", AT(48, 32), BGRA(0, 0, 255, 255), 8);
+out:
+    RELEASE(out_view);
+    RELEASE(in_view);
+    RELEASE(src);
+    RELEASE(vp);
+    RELEASE(vpe);
+    RELEASE(vctx);
+    RELEASE(vdev);
+    free_target(&t);
+    end();
+}
+
 /* ---- the window ----------------------------------------------------------- */
 
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1038,6 +1127,7 @@ int main(int argc, char **argv)
     test_vertex_id();
     test_msaa();
     test_mips();
+    test_video();
     if (seconds > 0)
         test_window(seconds);
     say("device removed reason: 0x%08lx", (unsigned long)ID3D11Device_GetDeviceRemovedReason(dev));

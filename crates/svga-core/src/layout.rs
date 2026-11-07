@@ -6,6 +6,12 @@
 //! 4x4 for block-compressed ones). The device's host copy uses the very same
 //! layout, so a byte offset means the same thing on both sides.
 //!
+//! The planar YUV 4:2:0 formats are the exception: an image is its luma
+//! plane (one byte per pixel, rows of the even-rounded width), then its
+//! chroma at half resolution: interleaved U and V rows of the same pitch
+//! (NV12), or a V plane then a U plane of half the pitch (YV12). Their
+//! 2x2 "blocks" of 6 bytes give the image size only.
+//!
 //! All arithmetic is done in `u64` and checked: guest sizes cannot overflow.
 
 use svga_proto::format::{self, FormatDesc};
@@ -47,7 +53,7 @@ pub enum LayoutError {
     BadDimensions,
     /// The surface would exceed the device limit.
     TooLarge(u64),
-    /// Planar (YUV) formats are not supported.
+    /// Planar formats other than NV12 and YV12 are not supported.
     Planar(u32),
 }
 
@@ -83,7 +89,9 @@ impl SurfaceLayout {
         max_bytes: u64,
     ) -> Result<Self, LayoutError> {
         let desc = format::desc(format).ok_or(LayoutError::UnknownFormat(format))?;
-        if desc.bytes_per_block != desc.pitch_bytes_per_block {
+        if desc.bytes_per_block != desc.pitch_bytes_per_block
+            && !matches!(format, format::NV12 | format::YV12)
+        {
             return Err(LayoutError::Planar(format));
         }
         let dims_ok = size.width > 0 && size.height > 0 && size.depth > 0;
@@ -156,17 +164,29 @@ impl SurfaceLayout {
         }
     }
 
-    /// Bytes per row of blocks of mip level `mip`.
+    /// Whether the format is planar (NV12, YV12: see the module).
+    pub fn planar(&self) -> bool {
+        self.desc.bytes_per_block != self.desc.pitch_bytes_per_block
+    }
+
+    /// Bytes per row of blocks of mip level `mip` (planar formats: per
+    /// row of the luma plane).
     pub fn row_pitch(&self, mip: u32) -> u64 {
         let size = self.mip_size(mip);
         blocks(size.width, self.desc.block_width)
             .saturating_mul(u64::from(self.desc.pitch_bytes_per_block))
     }
 
-    /// Bytes per 2D slice of mip level `mip`.
+    /// Bytes per 2D slice of mip level `mip` (planar formats: all planes).
     pub fn slice_pitch(&self, mip: u32) -> u64 {
         let size = self.mip_size(mip);
-        blocks(size.height, self.desc.block_height).saturating_mul(self.row_pitch(mip))
+        let rows = blocks(size.height, self.desc.block_height);
+        if self.planar() {
+            return blocks(size.width, self.desc.block_width)
+                .saturating_mul(rows)
+                .saturating_mul(u64::from(self.desc.bytes_per_block));
+        }
+        rows.saturating_mul(self.row_pitch(mip))
     }
 
     /// Bytes of one image (one mip level of one layer).
@@ -228,6 +248,9 @@ impl SurfaceLayout {
             u64::from(z0.checked_div(d.block_depth).unwrap_or(0)),
             blocks(z1, d.block_depth),
         );
+        if self.planar() {
+            return self.planar_rows(base, mip, (x0, x1), (y0, y1));
+        }
         let bpb = u64::from(d.bytes_per_block);
         let (row, slice) = (self.row_pitch(mip), self.slice_pitch(mip));
         let length = bx1.checked_sub(bx0)?.checked_mul(bpb)?;
@@ -239,6 +262,50 @@ impl SurfaceLayout {
                     .checked_add(by.checked_mul(row)?)?
                     .checked_add(bx0.checked_mul(bpb)?)?;
                 rows.push((offset, length));
+            }
+        }
+        Some(rows)
+    }
+
+    /// [`Self::box_rows`] of a planar image at `base`: the luma rows of
+    /// pixels `x` by `y`, then the chroma rows that cover them.
+    fn planar_rows(
+        &self,
+        base: u64,
+        mip: u32,
+        (x0, x1): (u32, u32),
+        (y0, y1): (u32, u32),
+    ) -> Option<Vec<(u64, u64)>> {
+        let pitch = self.row_pitch(mip);
+        let luma_rows = blocks(self.mip_size(mip).height, 2).checked_mul(2)?;
+        let (x0, x1, y0, y1) = (u64::from(x0), u64::from(x1), u64::from(y0), u64::from(y1));
+        let mut rows = Vec::new();
+        for y in y0..y1 {
+            rows.push((
+                base.checked_add(y.checked_mul(pitch)?)?.checked_add(x0)?,
+                x1.checked_sub(x0)?,
+            ));
+        }
+        // Chroma: a sample per 2x2 pixels.
+        let (cx0, cx1, cy0, cy1) = (x0 / 2, x1.div_ceil(2), y0 / 2, y1.div_ceil(2));
+        let chroma = base.checked_add(luma_rows.checked_mul(pitch)?)?;
+        if self.format == format::YV12 {
+            // V, then U: half the pitch each.
+            let half = pitch / 2;
+            let plane = half.checked_mul(luma_rows / 2)?;
+            for start in [chroma, chroma.checked_add(plane)?] {
+                for y in cy0..cy1 {
+                    let row = start.checked_add(y.checked_mul(half)?)?.checked_add(cx0)?;
+                    rows.push((row, cx1.checked_sub(cx0)?));
+                }
+            }
+        } else {
+            // U and V interleaved.
+            for y in cy0..cy1 {
+                let row = chroma
+                    .checked_add(y.checked_mul(pitch)?)?
+                    .checked_add(cx0.checked_mul(2)?)?;
+                rows.push((row, (cx1.checked_sub(cx0)?).checked_mul(2)?));
             }
         }
         Some(rows)
@@ -258,6 +325,44 @@ mod tests {
             height,
             depth: 1,
         }
+    }
+
+    #[test]
+    fn planar_images_are_luma_then_chroma() {
+        // NV12 5x3: even-rounded 6x4 luma, then 2 rows of interleaved UV.
+        let l = SurfaceLayout::new(format::NV12, size(5, 3), 1, 2, 1, GIB).unwrap();
+        assert!(l.planar());
+        assert_eq!((l.row_pitch(0), l.image_bytes(0)), (6, 36));
+        assert_eq!(l.image_offset(1, 0), Some(36));
+        let area = Box3 {
+            x: 1,
+            y: 1,
+            z: 0,
+            w: 3,
+            h: 2,
+            d: 1,
+        };
+        assert_eq!(
+            l.box_rows(1, 0, area).unwrap(),
+            [
+                (36 + 6 + 1, 3),
+                (36 + 12 + 1, 3),
+                (36 + 24, 4),
+                (36 + 30, 4)
+            ],
+            "luma rows 1-2, chroma rows 0-1 for pixels 0-3"
+        );
+        // YV12 4x4: 16 luma bytes, then 2x2 V, then 2x2 U.
+        let l = SurfaceLayout::new(format::YV12, size(4, 4), 1, 1, 1, GIB).unwrap();
+        assert_eq!(l.image_bytes(0), 24);
+        let all = Box3 {
+            w: 4,
+            h: 4,
+            d: 1,
+            ..area
+        };
+        let rows = l.box_rows(0, 0, Box3 { x: 0, y: 0, ..all }).unwrap();
+        assert_eq!(rows[4..], [(16, 2), (18, 2), (20, 2), (22, 2)]);
     }
 
     #[test]
@@ -335,10 +440,7 @@ mod tests {
             SurfaceLayout::new(format::A8R8G8B8, size(1, 1), 99, 1, 1, GIB),
             Err(LayoutError::BadDimensions)
         );
-        assert!(matches!(
-            SurfaceLayout::new(format::NV12, size(4, 4), 1, 1, 1, GIB),
-            Err(LayoutError::Planar(_))
-        ));
+        assert!(SurfaceLayout::new(format::NV12, size(4, 4), 1, 1, 1, GIB).is_ok());
         // Boxes outside the image give nothing.
         let l = SurfaceLayout::new(format::A8R8G8B8, size(4, 4), 1, 1, 1, GIB).unwrap();
         let outside = Box3 {

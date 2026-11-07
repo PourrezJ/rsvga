@@ -12,8 +12,13 @@
 # Usage:
 #   scripts/run-windows.sh --disk WINDOWS.qcow2 --vars OVMF_VARS.fd \
 #       [--overlay FILE] [--mem 6144] [--cpus 4] [--trace] [--diagnose] \
-#       [--kvm-cpu] [--guest-tools] [--guestinfo 'KEY=VALUE;...'] \
+#       [--kvm-cpu] [--guest-tools] [--guestinfo 'KEY=VALUE;...'] [--no-3d] \
 #       [-- EXTRA QEMU ARGUMENTS...]
+#
+# 3D is on: Direct3D 9, 10 and 11 (feature level 10_1) run on the host GPU
+# through Vulkan, with VMware's driver in WDDM 2.0. --no-3d (or RSVGA_3D=0)
+# keeps the device 2D: the driver runs display-only and Windows renders 3D
+# in software. Without a Vulkan GPU, rsvga stays 2D by itself.
 #
 # The CPU shows VMware's hypervisor signature ("VMwareVMware", through the
 # Hyper-V vendor leaf; KVM's own leaves are hidden): the VMware Tools
@@ -52,6 +57,9 @@ rsvga=$root/target/release/rsvga
 rom=$root/target/firmware/rsvga-gop.efi
 ovmf_code=/usr/share/OVMF/OVMF_CODE_4M.fd
 
+# The comment block at the top of this file.
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0"; exit 2; }
+
 disk= vars= overlay=$root/target/vm/overlay.qcow2 mem=6144 cpus=4 trace=0 diagnose=0
 guest_tools=0 guestinfo=
 cpu=host,kvm=off,hv-relaxed,hv-vendor-id=VMwareVMware
@@ -67,11 +75,12 @@ while (($#)); do
     --diagnose) diagnose=1; trace=1; shift ;;
     --guest-tools) guest_tools=1; shift ;;
     --guestinfo) guestinfo=$2; shift 2 ;;
+    --no-3d) export RSVGA_3D=0; shift ;;
     --) shift; break ;;
-    *) sed -n '2,46p' "$0"; exit 2 ;;
+    *) usage ;;
   esac
 done
-[[ -n $disk && -n $vars ]] || { sed -n '2,46p' "$0"; exit 2; }
+[[ -n $disk && -n $vars ]] || usage
 for f in "$qemu" "$rsvga" "$rom" "$ovmf_code" "$disk" "$vars"; do
   [[ -e $f ]] || { echo "missing: $f" >&2; exit 1; }
 done

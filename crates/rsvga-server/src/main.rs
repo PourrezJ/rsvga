@@ -81,10 +81,12 @@ fn parse_args() -> Result<Args, String> {
         // RSVGA_SYNC_BUFFERS=1: command buffers inside the guest's
         // register write, as before the worker (diagnostics).
         asynchronous: std::env::var_os("RSVGA_SYNC_BUFFERS").is_none_or(|v| v == "0"),
+        // RSVGA_3D=0: 2D only, the VMware driver in display-only mode.
+        three_d: device::three_d_wanted(),
     };
     let mut args = std::env::args().skip(1);
     if std::env::args().nth(1).as_deref() == Some("--vmport-args") {
-        for arg in device::vmport_args() {
+        for arg in device::vmport_args(device::three_d_available()) {
             println!("{arg}");
         }
         process::exit(0);

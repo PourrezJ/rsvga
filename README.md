@@ -6,7 +6,7 @@ Carte graphique virtuelle VMware SVGA II, écrite en Rust, pour accélérer Dire
 - rsvga tourne **à côté** de QEMU, dans un processus sandboxé, et s'y branche par vfio-user.
 - Le rendu passe directement par Vulkan sur le GPU de l'hôte.
 
-Statut : **M2 atteint**. Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D) en cours** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu ; rsvga les décode, garde l'état des contextes, traduit ses shaders en SPIR-V et exécute dessins, effacements et copies sur le GPU de l'hôte (Vulkan) : **le bureau de Windows est composé par la RX 6950 XT**, les 13 vérifications de `d3dtest` (Direct3D 11) passent et `dxdiag` ne trouve aucun problème. **Direct3D 9 dessine aussi** : rsvga exécute le protocole 3D ancien du pilote D3D9 de VMware (états de rendu, shaders Direct3D 9 traduits en SPIR-V) et les 37 vérifications de `d3d9test` passent (pipeline fixe, shader models 1 à 3, sRGB, sprites, plans de découpe, instanciation, cartes d'ombres...) ; **Unigine Heaven 4.0 tourne en Direct3D 9** avec un rendu juste, à 35–38 images par seconde en 1280×720 (WDDM 2.0) après deux passes de travail sur les performances (`RSVGA_PROFILE=1` montre où va le temps, GPU compris). La 3D reste à activer à la main en attendant des essais avec de vrais programmes. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
+Statut : **M3 atteint** (la 3D de base, annoncée par défaut). Avec le QEMU patché, le firmware UEFI s'affiche sur rsvga grâce à son propre pilote UEFI, puis **Windows 11 tourne avec le pilote VMware SVGA officiel dans son mode moderne** : objets guest-backed (MOB, surfaces), command buffers, Screen Targets, curseur matériel, interruptions, bureau net en 1920×1080, et Windows suit la taille de la fenêtre (avec les VMware Tools). Le pilote écrit son journal à l'hôte, ce qui guide la suite. **M3 (3D)** : avec la 3D annoncée à titre d'essai, DWM crée son périphérique Direct3D 11 (niveau 10_1) sur la carte et lui envoie ses commandes de rendu ; rsvga les décode, garde l'état des contextes, traduit ses shaders en SPIR-V et exécute dessins, effacements et copies sur le GPU de l'hôte (Vulkan) : **le bureau de Windows est composé par la RX 6950 XT**, les 13 vérifications de `d3dtest` (Direct3D 11) passent et `dxdiag` ne trouve aucun problème. **Direct3D 9 dessine aussi** : rsvga exécute le protocole 3D ancien du pilote D3D9 de VMware (états de rendu, shaders Direct3D 9 traduits en SPIR-V) et les 37 vérifications de `d3d9test` passent (pipeline fixe, shader models 1 à 3, sRGB, sprites, plans de découpe, instanciation, cartes d'ombres...) ; **Unigine Heaven 4.0 tourne en Direct3D 9** avec un rendu juste, à 35–38 images par seconde en 1280×720 (WDDM 2.0) après deux passes de travail sur les performances (`RSVGA_PROFILE=1` montre où va le temps, GPU compris). La 3D est annoncée par défaut (WDDM 2.0) ; `RSVGA_3D=0` ou `run-windows.sh --no-3d` garde la 2D. Le détail est dans [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ![Console UEFI affichée par rsvga](docs/img/m1-ovmf-shell.png)
 
@@ -81,7 +81,7 @@ Programmes de test côté invité (mingw-w64), donnés à la VM par `run-windows
 scripts/build-guest-tools.sh
 ```
 
-Avec la VM de test lancée (`--diagnose --guest-tools`), `scripts/guest-run.sh` tape la commande dans Windows et affiche le résultat : `run` (d3dtest), `ninetest` (d3d9test), `heaven` puis `heavenrun` (Unigine Heaven en Direct3D 9, si son installateur est dans `target/unigine/download`), `diag` (dxdiag), `probe`, `info`, `events` (dernières erreurs), `umd` (umdcaps), `trace` (d3d9trace), `nine` (d3dprobe avec le journal du pilote D3D9 de débogage), `dxg` et `events` en `--admin` (canaux du noyau graphique) :
+Avec la VM de test lancée (`--diagnose --guest-tools`), `scripts/guest-run.sh` tape la commande dans Windows et affiche le résultat : `run` (d3dtest), `ninetest` (d3d9test), `heaven` puis `heavenrun` (Unigine Heaven en Direct3D 9, si son installateur est dans `target/unigine/download`), `diag` (dxdiag), `probe`, `info`, `events` (dernières erreurs), `umd` (umdcaps), `trace` (d3d9trace), `nine` (d3dprobe avec le journal du pilote D3D9 de débogage), `modes` (changements de résolution), `videoprobe` (blits du processeur vidéo), `reboot`, `dxg` et `events` en `--admin` (canaux du noyau graphique) :
 
 ```bash
 scripts/guest-run.sh run
@@ -114,7 +114,7 @@ cargo build --release -p rsvga-server --features window
 target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/rsvga-gop.efi --window --qmp $XDG_RUNTIME_DIR/qemu-qmp.sock
 ```
 
-`RSVGA_TRACE=1` journalise chaque accès aux registres SVGA (par nom), chaque commande FIFO et, toutes les 5 secondes, l'état de la FIFO ; `RSVGA_TRACE=2` ajoute les accès bruts (espace PCI...).
+`RSVGA_3D=0` garde l'appareil en 2D (la 3D est annoncée par défaut quand un GPU Vulkan est là). `RSVGA_TRACE=1` journalise chaque accès aux registres SVGA (par nom), chaque commande FIFO et, toutes les 5 secondes, l'état de la FIFO ; `RSVGA_TRACE=2` ajoute les accès bruts (espace PCI...).
 
 ## Ce qui existe
 
@@ -126,7 +126,7 @@ target/release/rsvga --socket $XDG_RUNTIME_DIR/rsvga.sock --rom target/firmware/
 - `rsvga-server` : la carte complète (config PCI, VRAM et FIFO en memfd scellés, ROM optionnelle, exécution de la FIFO, capture PNG, fenêtre optionnelle).
 - `firmware/gop` : pilote UEFI GOP en Rust `no_std` (7 Ko), livré dans la ROM de la carte.
 - `guest/` : programmes de test côté Windows (`d3dtest`, `d3dprobe`, `umdcaps`, `d3d9trace`, `hostcat`, `wininfo`).
-- 179 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; cinq cibles de fuzzing.
+- 186 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout ; cinq cibles de fuzzing.
 
 L'audit de qemu-vmvga qui a motivé ce projet est dans [docs/audit-qemu-vmvga.md](docs/audit-qemu-vmvga.md).
 

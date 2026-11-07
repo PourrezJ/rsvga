@@ -47,6 +47,7 @@ use crate::dxctx::Context;
 
 mod nine;
 mod screen;
+mod video;
 use crate::gb::Gb;
 use crate::guest::GuestMemory;
 
@@ -81,6 +82,8 @@ pub struct Gpu {
     ended9: Vec<(u32, u32, u32, u32, u64)>,
     /// Parts of the screen being read from the GPU, in order.
     screen_reads: Vec<screen::ScreenRead>,
+    /// Size of the work image of video blits, once made.
+    video_scratch: Option<(u32, u32)>,
 }
 
 fn gpu_err(e: svga_render::Error) -> String {
@@ -206,6 +209,7 @@ impl Gpu {
             query9: None,
             ended9: Vec::new(),
             screen_reads: Vec::new(),
+            video_scratch: None,
         })
     }
 
@@ -217,6 +221,7 @@ impl Gpu {
     /// Forgets every surface (device reset).
     pub fn reset(&mut self) {
         self.drop_screen_reads();
+        self.drop_video_work();
         for sid in self.newer.keys().copied().collect::<Vec<_>>() {
             self.drop_surface(sid);
         }
@@ -311,8 +316,9 @@ impl Gpu {
 
     /// Runs a guest-backed command on the GPU when that saves a round trip
     /// through the device copies; true if it did: `SURFACE_COPY` and
-    /// `DX_PRESENTBLT` of a source the GPU holds, and what screen targets
-    /// show (read from the GPU without waiting, see `screen`).
+    /// `DX_PRESENTBLT` of a source the GPU holds, what screen targets
+    /// show (read from the GPU without waiting, see `screen`), and video
+    /// blits (`video`).
     pub fn execute_gb(
         &mut self,
         command: &GbCommand,
@@ -333,6 +339,10 @@ impl Gpu {
             }
             GbCommand::UpdateScreenTarget { stid, rect } => {
                 self.show(gb, guest, stid, rect)?;
+                return Ok(true);
+            }
+            GbCommand::VideoBlt(ref blit) => {
+                self.video_blt(blit, gb, guest)?;
                 return Ok(true);
             }
             _ => {}
@@ -671,6 +681,18 @@ impl Gpu {
                     .generate_mips(sid, most_detailed_mip, mip_levels, first_slice, slices)
                     .map_err(gpu_err)?;
                 self.gpu_wrote(sid);
+            }
+            DxCommand::PredCopy { dest, src } if self.host_only(gb, src) => {
+                self.host_copy(gb, guest, dest, src, None)?;
+            }
+            DxCommand::PredCopyRegion {
+                dest,
+                dest_sub,
+                src,
+                src_sub,
+                copy,
+            } if self.host_only(gb, src) => {
+                self.host_copy(gb, guest, dest, src, Some((dest_sub, src_sub, copy)))?;
             }
             DxCommand::PredCopy { dest, src } => {
                 self.sync_gpu(gb, guest, src)?;
@@ -1114,6 +1136,66 @@ impl Gpu {
         Ok(())
     }
 
+    /// Whether surface `sid` stays in its device copy: its format has no
+    /// GPU image (planar YUV).
+    fn host_only(&self, gb: &Gb, sid: u32) -> bool {
+        gb.surface_shape(sid)
+            .is_some_and(|(l, _)| !self.renderer.format_supported(l.format()))
+    }
+
+    /// A DX copy between surfaces that stay in their device copies: of
+    /// subresources `(dest_sub, src_sub, box)`, or of every one.
+    fn host_copy(
+        &mut self,
+        gb: &mut Gb,
+        guest: &GuestMemory,
+        dest: u32,
+        src: u32,
+        region: Option<(u32, u32, svga_core::gb::CopyBox)>,
+    ) -> Result<(), String> {
+        let mut copies = Vec::new();
+        match region {
+            Some((dest_sub, src_sub, copy)) => {
+                let image = |sid, sub| gb.subresource(sid, sub);
+                copies.push((image(src, src_sub)?, image(dest, dest_sub)?, copy));
+            }
+            None => {
+                let (layout, _) = gb
+                    .surface_shape(src)
+                    .ok_or_else(|| format!("surface {src} is not defined"))?;
+                for face in 0..layout.layers() {
+                    for mipmap in 0..layout.mip_levels() {
+                        let size = layout.mip_size(mipmap);
+                        let image = |sid| svga_core::gb::ImageId { sid, face, mipmap };
+                        let all = svga_core::gb::CopyBox {
+                            dest: svga_core::layout::Box3 {
+                                x: 0,
+                                y: 0,
+                                z: 0,
+                                w: size.width,
+                                h: size.height,
+                                d: size.depth,
+                            },
+                            src: (0, 0, 0),
+                        };
+                        copies.push((image(src), image(dest), all));
+                    }
+                }
+            }
+        }
+        for (src, dest, copy) in copies {
+            let command = GbCommand::SurfaceCopy {
+                src,
+                dest,
+                boxes: vec![copy],
+            };
+            self.before_gb(&command, gb, guest)?;
+            gb.execute(command.clone(), guest)?;
+            self.after_gb(&command);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn copy_region(
         &mut self,
@@ -1437,6 +1519,85 @@ mod draw_tests {
             }));
             self.gb(GbCommand::BindSurface { sid, mob, pitch: 0 });
         }
+    }
+
+    /// Video blits: an RGB picture scaled on the GPU over a background,
+    /// then an NV12 one converted on the way (a 2x2 BT.601 red square).
+    #[test]
+    fn video_blits_scale_fill_and_convert() {
+        use svga_core::gb::{VideoBlt, VideoView};
+        let Some(mut r) = Rig::new() else { return };
+        // Source: 4x4 BGRA, left half red, right half blue.
+        let mut texels = Vec::new();
+        for i in 0..16 {
+            let px: [u8; 4] = if i % 4 < 2 {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            texels.extend_from_slice(&px);
+        }
+        r.ram.write(4096, &texels);
+        r.mob(1, 1);
+        r.surface(10, format::B8G8R8A8_UNORM, 4, 4, 1);
+        r.mob(2, 2);
+        r.surface(11, format::B8G8R8A8_UNORM, 8, 8, 2);
+        let view = |sid| VideoView {
+            sid,
+            dimension: 3,
+            mip: 0,
+            first_slice: 0,
+            slices: 1,
+        };
+        let mut blit = VideoBlt {
+            output: view(11),
+            background_ycbcr: false,
+            background: [0.0f32, 1.0, 0.0, 1.0].map(f32::to_bits),
+            target: [0, 0, 8, 8],
+            input: view(10),
+            source: [0, 0, 4, 4],
+            dest: [0, 0, 8, 6],
+            rotation: 0,
+            frame_format: 0,
+        };
+        let pixel = |r: &mut Rig, x: usize, y: usize| {
+            r.gb(GbCommand::ReadbackSurface { sid: 11 });
+            let mut px = [0u8; 4];
+            r.ram.read(2 * 4096 + (y * 8 + x) * 4, &mut px);
+            px
+        };
+        assert!(
+            r.gpu
+                .execute_gb(&GbCommand::VideoBlt(blit), &mut r.gb, &r.guest)
+                .unwrap()
+        );
+        assert_eq!(pixel(&mut r, 1, 1), [0, 0, 255, 255], "red, scaled");
+        assert_eq!(pixel(&mut r, 6, 4), [255, 0, 0, 255], "blue, scaled");
+        assert_eq!(pixel(&mut r, 3, 7), [0, 255, 0, 255], "background below");
+        // NV12 4x4: Y, then interleaved U and V (2 rows of 4 bytes).
+        let mut nv12 = vec![81u8; 16];
+        nv12.extend_from_slice(&[90, 240, 90, 240, 90, 240, 90, 240]);
+        r.ram.write(3 * 4096, &nv12);
+        r.mob(3, 3);
+        r.surface(12, format::NV12, 4, 4, 3);
+        blit.input = view(12);
+        blit.dest = [0, 0, 8, 8];
+        blit.rotation = 2;
+        assert!(
+            r.gpu
+                .execute_gb(&GbCommand::VideoBlt(blit), &mut r.gb, &r.guest)
+                .unwrap()
+        );
+        let [b, g, red, a] = pixel(&mut r, 4, 4);
+        assert!(red > 250 && g < 5 && b < 5 && a == 255, "{red} {g} {b} {a}");
+        // Formats the GPU cannot hold are copied in their device copies.
+        r.mob(4, 4);
+        r.surface(13, format::NV12, 4, 4, 4);
+        r.gpu.host_copy(&mut r.gb, &r.guest, 13, 12, None).unwrap();
+        r.gb(GbCommand::ReadbackSurface { sid: 13 });
+        let mut back = vec![0u8; 24];
+        r.ram.read(4 * 4096, &mut back);
+        assert_eq!(back, nv12);
     }
 
     fn operand(kind: u32, comps_select: u32, dims: u32) -> u32 {

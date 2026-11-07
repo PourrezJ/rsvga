@@ -254,8 +254,110 @@ pub enum GbCommand {
         /// `SVGADX_PRESENTBLT_*` flags.
         mode: u32,
     },
+    /// A video processor blit ([`VideoBlt`]).
+    VideoBlt(VideoBlt),
     /// Does nothing.
     Nop,
+}
+
+/// One side of a [`VideoBlt`]: a 2D image of a surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoView {
+    /// Surface ID.
+    pub sid: u32,
+    /// Resource dimension (3: 2D texture).
+    pub dimension: u32,
+    /// Mip level.
+    pub mip: u32,
+    /// First array slice.
+    pub first_slice: u32,
+    /// Array slices.
+    pub slices: u32,
+}
+
+/// A rectangle as Direct3D gives it: left, top, right, bottom.
+pub type VideoRect = [i32; 4];
+
+/// `VIDEO_BLT` (command 1295): what VMware's Direct3D 11 driver sends for
+/// a video processor blit (`VideoProcessorBlt`) of one stream. The command
+/// is not in the public headers; this layout was decoded by varying each
+/// parameter of the blit (`guest/videoprobe`). It is a byte-packed
+/// structure of 168 bytes: the output, from byte 0, then the stream, from
+/// byte 88. Stream alpha, color spaces and the alpha fill mode are not
+/// sent (the driver does not offer them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoBlt {
+    /// The output image (bytes 0 to 19).
+    pub output: VideoView,
+    /// The background is in YCbCr (byte 25).
+    pub background_ycbcr: bool,
+    /// Background color, as `f32` bits: RGBA, or Y, Cb, Cr, A (byte 26).
+    pub background: [u32; 4],
+    /// The area of the output written: background, then the stream
+    /// (byte 47).
+    pub target: VideoRect,
+    /// The stream's image (bytes 88 to 107).
+    pub input: VideoView,
+    /// The part of the input shown (byte 109).
+    pub source: VideoRect,
+    /// Where it goes in the output (byte 126).
+    pub dest: VideoRect,
+    /// `D3D11_VIDEO_PROCESSOR_ROTATION`: 0, 90, 180, 270 degrees as 0 to
+    /// 3 (byte 142).
+    pub rotation: u8,
+    /// `D3D11_VIDEO_FRAME_FORMAT` (byte 143); 0: progressive.
+    pub frame_format: u8,
+}
+
+impl VideoBlt {
+    /// Bytes of the command.
+    pub const BYTES: usize = 168;
+
+    /// The background color as floats.
+    pub fn background_color(&self) -> [f32; 4] {
+        self.background.map(f32::from_bits)
+    }
+
+    /// Decodes the payload (at least [`Self::BYTES`] bytes).
+    pub fn decode(words: &[u32]) -> Option<Self> {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let u32_at = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(
+                bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+            ))
+        };
+        let view = |at: usize| -> Option<VideoView> {
+            Some(VideoView {
+                sid: u32_at(at)?,
+                dimension: u32_at(at.checked_add(4)?)?,
+                mip: u32_at(at.checked_add(8)?)?,
+                first_slice: u32_at(at.checked_add(12)?)?,
+                slices: u32_at(at.checked_add(16)?)?,
+            })
+        };
+        let rect = |at: usize| -> Option<VideoRect> {
+            let mut r = [0i32; 4];
+            for (i, v) in r.iter_mut().enumerate() {
+                *v = u32_at(at.checked_add(i.checked_mul(4)?)?)?.cast_signed();
+            }
+            Some(r)
+        };
+        let mut background = [0u32; 4];
+        for (i, v) in background.iter_mut().enumerate() {
+            *v = u32_at(26usize.checked_add(i.checked_mul(4)?)?)?;
+        }
+        Some(Self {
+            output: view(0)?,
+            background_ycbcr: *bytes.get(25)? != 0,
+            background,
+            target: rect(47)?,
+            input: view(88)?,
+            source: rect(109)?,
+            dest: rect(126)?,
+            rotation: *bytes.get(142)?,
+            frame_format: *bytes.get(143)?,
+        })
+    }
 }
 
 /// A payload too short for its command.
@@ -329,6 +431,7 @@ fn fixed_words(id: u32) -> Option<usize> {
         cmd3d::DEFINE_GB_SURFACE_V3 => 13,
         cmd3d::DEFINE_GB_SURFACE_V4 => 14,
         cmd3d::DX_PRESENTBLT => 17,
+        cmd3d::VIDEO_BLT => VideoBlt::BYTES / 4,
         _ => return None,
     })
 }
@@ -501,6 +604,7 @@ pub fn parse(id: u32, payload: &[u32]) -> Option<Result<GbCommand, ShortPayload>
             mob: w[1],
             offset: w[2],
         },
+        cmd3d::VIDEO_BLT => GbCommand::VideoBlt(VideoBlt::decode(w)?),
         _ => return None,
     }))
 }
@@ -508,6 +612,72 @@ pub fn parse(id: u32, payload: &[u32]) -> Option<Result<GbCommand, ShortPayload>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Video blits as VMware's driver sent them (`guest/videoprobe`).
+    #[test]
+    fn video_blits_decode_as_the_driver_sends_them() {
+        // Source rect 4,6-20,30, dest rect 8,10-56,50, target rect 2,3-60,61.
+        let rects = [
+            0x16d, 0x3, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3f80, 0x2000000, 0x3000000,
+            0x3c000000, 0x3d000000, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x14f, 0x3, 0x0, 0x0, 0x1,
+            0x400, 0x600, 0x1400, 0x1e00, 0x80000, 0xa0000, 0x380000, 0x320000, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0,
+        ];
+        let Some(Ok(GbCommand::VideoBlt(v))) = parse(cmd3d::VIDEO_BLT, &rects) else {
+            panic!("not a video blit");
+        };
+        assert_eq!(
+            v.output,
+            VideoView {
+                sid: 0x16d,
+                dimension: 3,
+                mip: 0,
+                first_slice: 0,
+                slices: 1
+            }
+        );
+        assert_eq!(v.input.sid, 0x14f);
+        assert_eq!(
+            (v.target, v.source, v.dest),
+            ([2, 3, 60, 61], [4, 6, 20, 30], [8, 10, 56, 50])
+        );
+        assert_eq!(v.background_color(), [0.0, 0.0, 0.0, 1.0]);
+        assert!(!v.background_ycbcr);
+        assert_eq!((v.rotation, v.frame_format), (0, 0));
+        // Background 0.25, 0.5, 0.75, 1.
+        let background = [
+            0x16b, 0x3, 0x0, 0x0, 0x1, 0x0, 0x0, 0x3e80, 0x3f00, 0x3f40, 0x3f80, 0x0, 0x0,
+            0x40000000, 0x40000000, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x14f, 0x3, 0x0, 0x0, 0x1,
+            0x0, 0x0, 0x2000, 0x2000, 0x80000, 0xa0000, 0x380000, 0x320000, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0,
+        ];
+        let Some(Ok(GbCommand::VideoBlt(v))) = parse(cmd3d::VIDEO_BLT, &background) else {
+            panic!("not a video blit");
+        };
+        assert_eq!(v.background_color(), [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!((v.target, v.source), ([0, 0, 64, 64], [0, 0, 32, 32]));
+        // Rotation 90; source mip 1, slice 1; target slice 2.
+        let mut rotated = background;
+        rotated[35] = 0x10000;
+        let Some(Ok(GbCommand::VideoBlt(v))) = parse(cmd3d::VIDEO_BLT, &rotated) else {
+            panic!("not a video blit");
+        };
+        assert_eq!(v.rotation, 1);
+        let mut slices = background;
+        (slices[3], slices[24], slices[25]) = (2, 1, 1);
+        let Some(Ok(GbCommand::VideoBlt(v))) = parse(cmd3d::VIDEO_BLT, &slices) else {
+            panic!("not a video blit");
+        };
+        assert_eq!(
+            (v.output.first_slice, v.input.mip, v.input.first_slice),
+            (2, 1, 1)
+        );
+        // Short payloads are refused.
+        assert!(matches!(
+            parse(cmd3d::VIDEO_BLT, &rects[..41]),
+            Some(Err(_))
+        ));
+    }
 
     #[test]
     fn mobs_tables_and_surfaces() {

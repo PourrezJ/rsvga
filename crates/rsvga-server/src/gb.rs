@@ -45,6 +45,10 @@ pub struct Limits {
 /// Screen targets the device supports.
 pub const MAX_SCREEN_TARGETS: usize = 16;
 
+/// Surface IDs from here up belong to the device (its own work images on
+/// the GPU, see `gpu/video.rs`): the guest cannot define them.
+pub const RESERVED_SIDS: u32 = 0xFFFF_FF00;
+
 struct Mob {
     pages: Vec<u64>,
     size: u32,
@@ -391,6 +395,12 @@ impl Gb {
     fn define_surface(&mut self, def: SurfaceDef) -> Result<(), String> {
         if def.sid == INVALID_ID {
             return Err("surface with the invalid ID".into());
+        }
+        if def.sid >= RESERVED_SIDS {
+            return Err(format!(
+                "surface ID {:#x} is reserved by the device",
+                def.sid
+            ));
         }
         let layers = if def.array_size > 0 {
             def.array_size
@@ -1047,6 +1057,7 @@ impl Gb {
                 self.present(guest, stid, all)?;
             }
             GbCommand::UpdateScreenTarget { stid, rect } => self.present(guest, stid, rect)?,
+            GbCommand::VideoBlt(_) => return Err("video blits need the GPU".into()),
             GbCommand::MobFence { value, mob, offset } => {
                 self.write_mob(guest, mob, u64::from(offset), &value.to_le_bytes())?;
             }

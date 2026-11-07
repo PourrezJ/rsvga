@@ -289,11 +289,15 @@ impl Renderer {
                 None,
             )
         }?;
-        match Self::open(entry, instance, name) {
+        // A clone keeps the loader loaded until the instance is destroyed
+        // on failure (`open` drops the entry it was given).
+        match Self::open(entry.clone(), instance, name) {
             Ok(renderer) => Ok(renderer),
             Err((instance, error)) => {
-                // SAFETY: nothing was created from the instance.
+                // SAFETY: nothing was created from the instance, and the
+                // loader its functions come from is still loaded.
                 unsafe { instance.destroy_instance(None) };
+                drop(entry);
                 Err(error)
             }
         }
@@ -559,6 +563,12 @@ impl Renderer {
     /// The device's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether surfaces of `format` can live on the GPU (planar YUV
+    /// formats, for one, cannot).
+    pub fn format_supported(&self, format: u32) -> bool {
+        format::kind(format, self.d24s8, self.a8).is_some()
     }
 
     /// Whether surface `sid` is on the GPU.

@@ -26,10 +26,10 @@ use crate::pci::{CONFIG_SIZE, PciConfig};
 use crate::shm::SharedMem;
 use crate::twod::{Memory, TwoD};
 
-/// Device capabilities advertised in `SVGA_REG_CAPABILITIES`: 2D with GMR2
-/// and screen objects, commands in FIFO or command buffers, and
-/// guest-backed objects (MOBs, surfaces, screen targets). No 3D yet: the
-/// VMware WDDM driver then runs as a display-only driver on screen targets.
+/// Device capabilities advertised in `SVGA_REG_CAPABILITIES` without 3D:
+/// 2D with GMR2 and screen objects, commands in FIFO or command buffers,
+/// and guest-backed objects (MOBs, surfaces, screen targets). The VMware
+/// WDDM driver then runs as a display-only driver on screen targets.
 pub const CAPABILITIES: u32 = cap::RECT_COPY
     | cap::CURSOR
     | cap::ALPHA_CURSOR
@@ -47,6 +47,20 @@ pub const CAPABILITIES: u32 = cap::RECT_COPY
 /// state elsewhere), GB memory is given in `GBOBJECT_MEM_SIZE_KB`, object
 /// tables may use two-level page tables.
 pub const CAPABILITIES_2: u32 = cap2::GROW_OTABLE | cap2::GB_MEMSIZE_2 | cap2::OTABLE_PTDEPTH_2;
+
+/// Capabilities added with 3D (the default, see [`Options::three_d`]): 3D,
+/// DX contexts, and the high-priority command queue, without which
+/// Windows refuses the adapter in WDDM 2.0.
+pub const CAPABILITIES_3D: u32 = cap::THREE_D | cap::DX | cap::HP_CMD_QUEUE;
+
+/// `SVGA_REG_CAP2` bits added with 3D: DX2 and DX3 commands, and video
+/// blits. VMware's kernel driver goes beyond WDDM 1.1 only with `DX3` and
+/// `VIDEO_BLT`, and its Direct3D 9 driver needs WDDM 2.0. `DX3` alone does
+/// not open feature level 11_0 (that also takes shader model 5 devcaps).
+pub const CAPABILITIES_2_3D: u32 = cap2::DX2 | cap2::DX3 | cap2::VIDEO_BLT;
+
+/// 3D hardware version with 3D (`SVGA3D_HWVERSION_WS8_B1`).
+pub const HW_VERSION_3D: u32 = 0x2_0001;
 /// GMR limits advertised to the guest (64 regions, 1 GiB of pages).
 pub const GMR_MAX_IDS: u32 = 64;
 /// Total pages across all GMRs.
@@ -166,6 +180,9 @@ pub struct Options {
     /// Regular command buffers run on a worker thread rather than inside
     /// the guest's register write (see `cmdbuf.rs`).
     pub asynchronous: bool,
+    /// Advertise 3D and run it on the host GPU ([`three_d_wanted`]); the
+    /// device stays 2D if no Vulkan GPU opens.
+    pub three_d: bool,
 }
 
 /// Counters shown in the logs.
@@ -222,6 +239,8 @@ pub struct State {
     unmask_watch: Option<Arc<AtomicBool>>,
     /// Counters.
     pub stats: Stats,
+    /// Kinds of unsupported commands already logged.
+    unsupported_kinds: Vec<String>,
 }
 
 /// The device, shared between the vfio-user thread and the display loop.
@@ -261,16 +280,32 @@ impl FifoMemory for FifoView<'_> {
 
 /// Diagnostic override from the environment (hexadecimal), to study how a
 /// guest driver reacts to capabilities the device does not implement.
-fn probe_env(name: &str) -> Option<u32> {
+fn probe_value(name: &str) -> Option<u32> {
     let value = std::env::var(name).ok()?;
-    let value = u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()?;
+    u32::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+}
+
+/// [`probe_value`], logged.
+fn probe_env(name: &str) -> Option<u32> {
+    let value = probe_value(name)?;
     log!("PROBE {name} = {value:#x}: advertised, not implemented");
     Some(value)
 }
 
-/// The host GPU, when the device advertises 3D: rendering needs it.
+/// Whether 3D is wanted: yes, unless `RSVGA_3D=0`.
+pub fn three_d_wanted() -> bool {
+    std::env::var_os("RSVGA_3D").is_none_or(|v| v != "0")
+}
+
+/// Whether this run gets 3D: wanted and a Vulkan GPU opens.
+pub fn three_d_available() -> bool {
+    three_d_wanted() && crate::gpu::Gpu::new().is_ok()
+}
+
+/// The host GPU, when 3D is wanted (or probed): rendering needs it.
 fn open_gpu(three_d: bool) -> Option<crate::gpu::Gpu> {
-    if !three_d {
+    let probed = probe_value("RSVGA_PROBE_CAPS").is_some_and(|c| c & cap::THREE_D != 0);
+    if !three_d && !probed {
         return None;
     }
     match crate::gpu::Gpu::new() {
@@ -279,42 +314,54 @@ fn open_gpu(three_d: bool) -> Option<crate::gpu::Gpu> {
             Some(gpu)
         }
         Err(e) => {
-            log!("GPU unavailable, 3D commands will not run: {e}");
+            log!("GPU unavailable, the device stays 2D: {e}");
             None
         }
     }
 }
 
-/// Capabilities this run advertises: [`CAPABILITIES`], unless
-/// `RSVGA_PROBE_CAPS` overrides them for driver probing.
-pub fn capabilities() -> u32 {
-    probe_env("RSVGA_PROBE_CAPS").unwrap_or(CAPABILITIES)
+/// Capabilities this run advertises: [`CAPABILITIES`], with
+/// [`CAPABILITIES_3D`] if `three_d`, unless `RSVGA_PROBE_CAPS` overrides
+/// them for driver probing.
+pub fn capabilities(three_d: bool) -> u32 {
+    let own = if three_d {
+        CAPABILITIES | CAPABILITIES_3D
+    } else {
+        CAPABILITIES
+    };
+    probe_env("RSVGA_PROBE_CAPS").unwrap_or(own)
 }
 
-/// Value of `SVGA_REG_CAP2`: [`CAPABILITIES_2`], unless
-/// `RSVGA_PROBE_CAPS2` overrides it.
-pub fn caps2() -> u32 {
-    probe_env("RSVGA_PROBE_CAPS2").unwrap_or(CAPABILITIES_2)
+/// Value of `SVGA_REG_CAP2`: [`CAPABILITIES_2`], with
+/// [`CAPABILITIES_2_3D`] if `three_d`, unless `RSVGA_PROBE_CAPS2`
+/// overrides it.
+pub fn caps2(three_d: bool) -> u32 {
+    let own = if three_d {
+        CAPABILITIES_2 | CAPABILITIES_2_3D
+    } else {
+        CAPABILITIES_2
+    };
+    probe_env("RSVGA_PROBE_CAPS2").unwrap_or(own)
 }
 
-/// 3D hardware version written into the FIFO: 0 (no 3D), unless
-/// `RSVGA_PROBE_HW3D` overrides it for driver probing.
-pub fn hw_version_3d() -> u32 {
-    probe_env("RSVGA_PROBE_HW3D").unwrap_or(0)
+/// 3D hardware version written into the FIFO: [`HW_VERSION_3D`] if
+/// `three_d`, else 0, unless `RSVGA_PROBE_HW3D` overrides it.
+pub fn hw_version_3d(three_d: bool) -> u32 {
+    probe_env("RSVGA_PROBE_HW3D").unwrap_or(if three_d { HW_VERSION_3D } else { 0 })
 }
 
 /// QEMU arguments (one per element) for its VMware backdoor (`vmport`):
-/// answer `BDOOR_CMD_GET_SVGA_CAPABILITIES` exactly like this device, and
-/// open the GuestRPC channel the VMware drivers log through. Needs the
-/// rsvga QEMU patch `0002-vmport-...`.
-pub fn vmport_args() -> Vec<String> {
-    let caps = capabilities();
-    let caps2 = caps2();
+/// answer `BDOOR_CMD_GET_SVGA_CAPABILITIES` exactly like this device (with
+/// 3D if `three_d`), and open the GuestRPC channel the VMware drivers log
+/// through. Needs the rsvga QEMU patch `0002-vmport-...`.
+pub fn vmport_args(three_d: bool) -> Vec<String> {
+    let caps = capabilities(three_d);
+    let caps2 = caps2(three_d);
     [
         "vmport.svga-backdoor=on".to_string(),
         format!("vmport.svga-caps={caps:#x}"),
         format!("vmport.svga-fifo-caps={FIFO_CAPABILITIES:#x}"),
-        format!("vmport.svga-3d-hwversion={:#x}", hw_version_3d()),
+        format!("vmport.svga-3d-hwversion={:#x}", hw_version_3d(three_d)),
         format!("vmport.svga-caps2={caps2:#x}"),
         "vmport.guestrpc=on".to_string(),
     ]
@@ -338,23 +385,25 @@ impl Svga {
         };
         let vram = SharedMem::new("rsvga-vram", opts.vram_size as usize)?;
         let fifo = SharedMem::new("rsvga-fifo", opts.fifo_size as usize)?;
+        // 3D only with a GPU to run it.
+        let gpu = open_gpu(opts.three_d);
+        let with_3d = opts.three_d && gpu.is_some();
         let mut regs = Registers::new(Config {
             vram_size: opts.vram_size,
             fifo_size: opts.fifo_size,
             max_width: opts.max_width,
             max_height: opts.max_height,
-            capabilities: capabilities(),
+            capabilities: capabilities(with_3d),
             gmr_max_ids: GMR_MAX_IDS,
             gmr_max_pages: GMR_MAX_PAGES,
             memory_size: GMR_MEMORY_SIZE,
             gb_memory_kb: GB_MEMORY_KB,
             mob_max_size: MOB_MAX_SIZE,
-            caps2: caps2(),
+            caps2: caps2(with_3d),
         });
         regs.set_devcaps(crate::devcaps::table(
             regs.config().capabilities & cap::THREE_D != 0,
         ));
-        let three_d = regs.config().capabilities & cap::THREE_D != 0;
         let state = State {
             regs,
             pci: PciConfig::new(opts.vram_size, opts.fifo_size, rom_bar),
@@ -369,7 +418,7 @@ impl Svga {
                 max_width: opts.max_width,
                 max_height: opts.max_height,
             }),
-            gpu: open_gpu(three_d),
+            gpu,
             dx: crate::dxctx::DxContexts::new(crate::dxctx::Limits {
                 contexts: crate::devcaps::MAX_CONTEXT_IDS,
                 code_bytes: DX_CODE_BYTES,
@@ -383,6 +432,7 @@ impl Svga {
             cursor_serial: 0,
             unmask_watch: None,
             stats: Stats::default(),
+            unsupported_kinds: Vec::new(),
         };
         let svga = Arc::new(Self {
             vram,
@@ -506,13 +556,14 @@ impl Svga {
             Effect::ConfigDone(true) => {
                 state.fifo_error = None;
                 let mut view = FifoView(&self.fifo);
+                let three_d = state.regs.config().capabilities & cap::THREE_D != 0;
                 match Snapshot::capture(&view) {
                     Ok(snap) => {
                         for (index, value) in [
                             (fifo::CAPABILITIES, FIFO_CAPABILITIES),
                             (fifo::FLAGS, 0),
-                            (fifo::HWVERSION_3D, hw_version_3d()),
-                            (fifo::HWVERSION_3D_REVISED, hw_version_3d()),
+                            (fifo::HWVERSION_3D, hw_version_3d(three_d)),
+                            (fifo::HWVERSION_3D_REVISED, hw_version_3d(three_d)),
                         ] {
                             if snap.has_register(index) {
                                 view.store(reg_index(index), value);
@@ -766,13 +817,20 @@ impl Svga {
             Command::Nop => {}
             Command::NopError => self.fail(state, "the guest sent NOP_ERROR".into()),
             other => {
-                if trace_level() >= 1 {
+                let kind = match &other {
+                    Command::Command3d { id, .. } => format!("3D {id}"),
+                    _ => command_name(&other),
+                };
+                // Without tracing, each kind once (at most 64 kinds).
+                let first =
+                    !state.unsupported_kinds.contains(&kind) && state.unsupported_kinds.len() < 64;
+                if trace_level() >= 1 || first {
                     let text = match &other {
                         Command::Command3d { id, size, payload } => {
                             // The first words, to see what an unknown
                             // command carries.
                             let words: Vec<String> =
-                                payload.iter().take(40).map(|w| format!("{w:x}")).collect();
+                                payload.iter().take(128).map(|w| format!("{w:x}")).collect();
                             format!(
                                 "3D {} ({id}), {size} bytes: {}",
                                 svga_proto::cmd3d_names::name(*id).unwrap_or("?"),
@@ -785,12 +843,14 @@ impl Svga {
                             text
                         }
                     };
-                    trace(format!("FIFO unsupported: {text}"));
-                } else if state.stats.unsupported == 0 {
-                    log!(
-                        "ignoring unsupported command {} (further ones are counted silently)",
-                        command_name(&other)
-                    );
+                    if trace_level() >= 1 {
+                        trace(format!("FIFO unsupported: {text}"));
+                    } else {
+                        log!("ignoring unsupported command {text} (again: counted silently)");
+                    }
+                }
+                if first {
+                    state.unsupported_kinds.push(kind);
                 }
                 state.stats.unsupported = state.stats.unsupported.saturating_add(1);
             }
@@ -1191,6 +1251,7 @@ mod tests {
                     max_width: 2560,
                     max_height: 1600,
                     asynchronous: false,
+                    three_d: false,
                 },
                 Vec::new(),
             )
@@ -1310,6 +1371,7 @@ mod tests {
             max_width: 2560,
             max_height: 1600,
             asynchronous: false,
+            three_d: false,
         };
         let mut h = Handle(Svga::new(&opts, vec![0x55, 0xaa, 1]).unwrap());
         let info = h.region_info(pci_region::ROM).unwrap();
@@ -1561,16 +1623,53 @@ mod tests {
         if std::env::var_os("RSVGA_PROBE_CAPS").is_some() {
             return; // probing overrides the advertised capabilities
         }
-        let args = vmport_args();
-        assert!(args.chunks(2).all(|pair| pair[0] == "-global"));
-        let globals: Vec<&str> = args.iter().skip(1).step_by(2).map(String::as_str).collect();
-        assert!(globals.contains(&"vmport.svga-backdoor=on"));
-        assert!(globals.contains(&format!("vmport.svga-caps={CAPABILITIES:#x}").as_str()));
-        assert!(
-            globals.contains(&format!("vmport.svga-fifo-caps={FIFO_CAPABILITIES:#x}").as_str())
-        );
+        for (three_d, caps) in [
+            (false, CAPABILITIES),
+            (true, CAPABILITIES | CAPABILITIES_3D),
+        ] {
+            let args = vmport_args(three_d);
+            assert!(args.chunks(2).all(|pair| pair[0] == "-global"));
+            let globals: Vec<&str> = args.iter().skip(1).step_by(2).map(String::as_str).collect();
+            assert!(globals.contains(&"vmport.svga-backdoor=on"));
+            assert!(globals.contains(&format!("vmport.svga-caps={caps:#x}").as_str()));
+            assert!(
+                globals.contains(&format!("vmport.svga-fifo-caps={FIFO_CAPABILITIES:#x}").as_str())
+            );
+        }
         let mut h = device();
         assert_eq!(get(&mut h, svga_proto::reg::CAPABILITIES), CAPABILITIES);
+        assert_eq!(get(&mut h, svga_proto::reg::CAP2), CAPABILITIES_2);
+    }
+
+    /// 3D is advertised when a GPU runs it (WDDM 2.0's bits included), and
+    /// the device stays 2D without one.
+    #[test]
+    fn three_d_comes_with_a_gpu() {
+        if std::env::var_os("RSVGA_PROBE_CAPS").is_some() {
+            return;
+        }
+        let opts = Options {
+            vram_size: 16 << 20,
+            fifo_size: 64 << 10,
+            max_width: 2560,
+            max_height: 1600,
+            asynchronous: false,
+            three_d: true,
+        };
+        let mut h = Handle(Svga::new(&opts, Vec::new()).unwrap());
+        let gpu = h.0.lock().gpu.is_some();
+        let (caps, caps2) = (
+            get(&mut h, svga_proto::reg::CAPABILITIES),
+            get(&mut h, svga_proto::reg::CAP2),
+        );
+        if gpu {
+            assert_eq!(caps, CAPABILITIES | CAPABILITIES_3D);
+            assert_eq!(caps2, CAPABILITIES_2 | CAPABILITIES_2_3D);
+            assert_eq!(hw_version_3d(true), HW_VERSION_3D);
+        } else {
+            eprintln!("no GPU: checked that the device stays 2D");
+            assert_eq!((caps, caps2), (CAPABILITIES, CAPABILITIES_2));
+        }
     }
 
     #[test]
