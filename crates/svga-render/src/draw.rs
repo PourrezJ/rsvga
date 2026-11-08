@@ -11,7 +11,7 @@
 //! Direct3D reads zeros from unbound slots: such slots get "null"
 //! resources, a zeroed buffer and 1x1 zeroed images of each kind.
 
-use std::collections::HashMap;
+use svga_core::hash::FastMap;
 
 use ash::vk;
 use ash::vk::Handle;
@@ -216,13 +216,15 @@ struct XfbBindings {
 /// The attachments of an open rendering: a draw with the same ones (that
 /// reads none of them and counts no occlusion) continues it, without a
 /// barrier or a new rendering. Anything else recorded ends it first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Pass {
-    colors: Vec<vk::ImageView>,
+    /// Color attachments: the first `used` of eight.
+    colors: [vk::ImageView; 8],
+    used: usize,
     depth: vk::ImageView,
     extent: (u32, u32),
-    /// Surfaces of the attachments.
-    sids: Vec<u32>,
+    /// Surfaces of the attachments (`u32::MAX`: none).
+    sids: [u32; 9],
 }
 
 /// Everything a draw uses.
@@ -278,14 +280,36 @@ type LayoutBinding = (u32, i32, u32);
 /// Cached Vulkan objects of draws.
 #[derive(Default)]
 pub(crate) struct Caches {
-    modules: HashMap<u64, vk::ShaderModule>,
-    layouts: HashMap<Vec<LayoutBinding>, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    modules: FastMap<u64, vk::ShaderModule>,
+    layouts: FastMap<Vec<LayoutBinding>, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
     /// Graphics pipelines by their whole state; compute ones by
     /// [`crate::compute`]'s shorter key.
-    pub(crate) pipelines: HashMap<Vec<u8>, vk::Pipeline>,
-    samplers: HashMap<Vec<u8>, vk::Sampler>,
+    pub(crate) pipelines: FastMap<Vec<u8>, vk::Pipeline>,
+    samplers: FastMap<SamplerKey, vk::Sampler>,
+    /// Layouts of draws by their shaders' hashes (vertex, pixel, geometry,
+    /// hull, domain): the common case skips gathering their bindings.
+    draw_layouts: FastMap<[u64; 5], (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    /// The pipeline key being built (kept to avoid an allocation per draw).
+    key: Vec<u8>,
     /// Null resources: a zeroed buffer, zeroed images and their views.
     null: Option<Null>,
+}
+
+/// A sampler state as words: the sampler cache key.
+type SamplerKey = [u32; 10];
+
+/// State the last draw set in the open rendering: a draw continuing it
+/// sets only what differs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SetState {
+    pipeline: vk::Pipeline,
+    viewport: [u32; 6],
+    scissor: (i32, i32, u32, u32),
+    blend_constants: [u32; 4],
+    stencil_reference: u32,
+    /// Vertex buffer bindings 0..8: buffer, offset, size, stride.
+    vertex: [(vk::Buffer, u64, u64, u64); 8],
+    index: (vk::Buffer, u64, i32),
 }
 
 pub(crate) struct Null {
@@ -299,9 +323,9 @@ pub(crate) struct Null {
     memory: Vec<vk::DeviceMemory>,
     images: Vec<vk::Image>,
     /// By `VkImageViewType` raw value.
-    views: HashMap<i32, vk::ImageView>,
+    views: FastMap<i32, vk::ImageView>,
     /// Storage images for unbound typed UA views, by view type.
-    storage_views: HashMap<i32, vk::ImageView>,
+    storage_views: FastMap<i32, vk::ImageView>,
 }
 
 /// A shader's hash: the one computed at translation, else its code's.
@@ -482,6 +506,16 @@ impl Renderer {
         &mut self,
         draw: &Draw<'_>,
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), Error> {
+        let shaders = [
+            shader_hash(draw.vs),
+            draw.ps.map_or(0, shader_hash),
+            draw.gs.map_or(0, shader_hash),
+            draw.tessellation.map_or(0, |(hs, _)| shader_hash(hs)),
+            draw.tessellation.map_or(0, |(_, ds)| shader_hash(ds)),
+        ];
+        if let Some(l) = self.draw.draw_layouts.get(&shaders) {
+            return Ok(*l);
+        }
         let stages: Vec<(&Shader, vk::ShaderStageFlags)> =
             std::iter::once((draw.vs, vk::ShaderStageFlags::VERTEX))
                 .chain(draw.tessellation.into_iter().flat_map(|(hs, ds)| {
@@ -493,7 +527,9 @@ impl Renderer {
                 .chain(draw.gs.map(|gs| (gs, vk::ShaderStageFlags::GEOMETRY)))
                 .chain(draw.ps.map(|ps| (ps, vk::ShaderStageFlags::FRAGMENT)))
                 .collect();
-        self.layout_for(&stages)
+        let layout = self.layout_for(&stages)?;
+        self.draw.draw_layouts.insert(shaders, layout);
+        Ok(layout)
     }
 
     /// The descriptor set and pipeline layouts of shaders, by stage.
@@ -724,21 +760,19 @@ impl Renderer {
     }
 
     fn sampler(&mut self, s: &SamplerState) -> Result<vk::Sampler, Error> {
-        let mut key = Key::default();
-        key.u32(s.filter)
-            .u32(u32::from_le_bytes([
-                s.address[0],
-                s.address[1],
-                s.address[2],
-                s.comparison,
-            ]))
-            .u32(s.mip_lod_bias.to_bits())
-            .u32(u32::from(s.max_anisotropy));
-        for c in s.border_color {
-            key.u32(c.to_bits());
-        }
-        key.u32(s.min_lod.to_bits()).u32(s.max_lod.to_bits());
-        if let Some(v) = self.draw.samplers.get(&key.0) {
+        let key: SamplerKey = [
+            s.filter,
+            u32::from_le_bytes([s.address[0], s.address[1], s.address[2], s.comparison]),
+            s.mip_lod_bias.to_bits(),
+            u32::from(s.max_anisotropy),
+            s.border_color[0].to_bits(),
+            s.border_color[1].to_bits(),
+            s.border_color[2].to_bits(),
+            s.border_color[3].to_bits(),
+            s.min_lod.to_bits(),
+            s.max_lod.to_bits(),
+        ];
+        if let Some(v) = self.draw.samplers.get(&key) {
             return Ok(*v);
         }
         let filter = |bit: u32| {
@@ -788,7 +822,7 @@ impl Renderer {
             .border_color(border);
         // SAFETY: a valid create info on a live device.
         let sampler = unsafe { self.device.create_sampler(&info, None) }?;
-        self.draw.samplers.insert(key.0, sampler);
+        self.draw.samplers.insert(key, sampler);
         Ok(sampler)
     }
 
@@ -836,8 +870,8 @@ impl Renderer {
             sink_texel,
             memory: vec![memory, sink_memory],
             images: Vec::new(),
-            views: HashMap::new(),
-            storage_views: HashMap::new(),
+            views: FastMap::default(),
+            storage_views: FastMap::default(),
         };
         let cmd = self.cmd()?;
         // SAFETY: recording; the whole live buffer.
@@ -961,7 +995,11 @@ impl Renderer {
         };
         // Many draws go to the GPU in pieces, so that it works while the
         // rest is recorded (before anything of this draw is).
-        if self.draws >= super::DRAWS_PER_SUBMISSION {
+        if self.draws >= super::DRAWS_PER_SUBMISSION
+            || (self.draws >= super::DRAWS_WHEN_IDLE
+                && self.draws.is_multiple_of(super::DRAWS_WHEN_IDLE)
+                && self.gpu_idle())
+        {
             self.flush()?;
         }
         self.draws = self.draws.saturating_add(1);
@@ -1042,17 +1080,19 @@ impl Renderer {
         )?;
         let writes = self.descriptors(draw)?;
         // Record, continuing the open rendering when possible.
+        let mut sids = [u32::MAX; 9];
+        for (slot, t) in sids
+            .iter_mut()
+            .zip(draw.targets.iter().flatten().chain(draw.depth.iter()))
+        {
+            *slot = t.sid;
+        }
         let pass = Pass {
-            colors: color_views[..used_targets].to_vec(),
+            colors: color_views,
+            used: used_targets,
             depth: depth_view,
             extent,
-            sids: draw
-                .targets
-                .iter()
-                .flatten()
-                .chain(draw.depth.iter())
-                .map(|t| t.sid)
-                .collect(),
+            sids,
         };
         let reads_attachment = draw.resources.iter().any(|b| match b.resource {
             Resource::Texture { sid, .. } | Resource::TexelBuffer { sid, .. } => {
@@ -1076,6 +1116,9 @@ impl Renderer {
             && xfb.is_none()
             && auto.is_none();
         let cmd = if continues { self.cmd } else { self.barrier()? };
+        // What the previous draw of this rendering set (all of it is set
+        // again in a new rendering).
+        let mut set = self.set;
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = color_views[..used_targets]
             .iter()
             .map(|v| {
@@ -1172,20 +1215,48 @@ impl Renderer {
                 self.device.cmd_begin_rendering(cmd, &rendering);
             }
             // Open from here: whatever happens next ends it properly.
-            self.pass = Some(pass.clone());
+            self.pass = Some(pass);
             if let Some((pool, slot)) = occlusion {
                 self.device.cmd_begin_query(cmd, pool, slot, precise);
             }
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            self.device.cmd_set_viewport_with_count(cmd, &viewports);
-            self.device.cmd_set_scissor_with_count(cmd, &scissors);
-            self.device.cmd_set_blend_constants(cmd, &draw.blend.1);
-            self.device.cmd_set_stencil_reference(
-                cmd,
-                vk::StencilFaceFlags::FRONT_AND_BACK,
-                draw.depth_stencil.1 & 0xff,
-            );
+            if !continues || set.pipeline != pipeline {
+                self.device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                set.pipeline = pipeline;
+            }
+            let vp = &viewports[0];
+            let viewport = [
+                vp.x.to_bits(),
+                vp.y.to_bits(),
+                vp.width.to_bits(),
+                vp.height.to_bits(),
+                vp.min_depth.to_bits(),
+                vp.max_depth.to_bits(),
+            ];
+            if !continues || set.viewport != viewport {
+                self.device.cmd_set_viewport_with_count(cmd, &viewports);
+                set.viewport = viewport;
+            }
+            let sc = &scissors[0];
+            let scissor = (sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height);
+            if !continues || set.scissor != scissor {
+                self.device.cmd_set_scissor_with_count(cmd, &scissors);
+                set.scissor = scissor;
+            }
+            let constants = draw.blend.1.map(f32::to_bits);
+            if !continues || set.blend_constants != constants {
+                self.device.cmd_set_blend_constants(cmd, &draw.blend.1);
+                set.blend_constants = constants;
+            }
+            let reference = draw.depth_stencil.1 & 0xff;
+            if !continues || set.stencil_reference != reference {
+                self.device.cmd_set_stencil_reference(
+                    cmd,
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    reference,
+                );
+                set.stencil_reference = reference;
+            }
             if !writes.is_empty() {
                 push.cmd_push_descriptor_set(
                     cmd,
@@ -1206,14 +1277,25 @@ impl Renderer {
                         vk::WHOLE_SIZE,
                     ),
                 };
-                self.device.cmd_bind_vertex_buffers2(
-                    cmd,
-                    vb.binding,
-                    &[buffer],
-                    &[offset],
-                    Some(&[size]),
-                    Some(&[u64::from(vb.stride)]),
-                );
+                let stride = u64::from(vb.stride);
+                let same = continues
+                    && set
+                        .vertex
+                        .get(vb.binding as usize)
+                        .is_some_and(|&b| b == (buffer, offset, size, stride));
+                if !same {
+                    self.device.cmd_bind_vertex_buffers2(
+                        cmd,
+                        vb.binding,
+                        &[buffer],
+                        &[offset],
+                        Some(&[size]),
+                        Some(&[stride]),
+                    );
+                    if let Some(b) = set.vertex.get_mut(vb.binding as usize) {
+                        *b = (buffer, offset, size, stride);
+                    }
+                }
             }
             let xfb_device = self.xfb.as_ref();
             if let (Some(x), Some(dev)) = (&xfb, xfb_device) {
@@ -1271,7 +1353,10 @@ impl Renderer {
                     } else {
                         vk::IndexType::UINT32
                     };
-                    self.device.cmd_bind_index_buffer(cmd, buffer, offset, ty);
+                    if !continues || set.index != (buffer, offset, ty.as_raw()) {
+                        self.device.cmd_bind_index_buffer(cmd, buffer, offset, ty);
+                        set.index = (buffer, offset, ty.as_raw());
+                    }
                     match draw.call {
                         Call::Indexed {
                             indices,
@@ -1315,6 +1400,7 @@ impl Renderer {
                 self.pass = None;
             }
         }
+        self.set = set;
         Ok(())
     }
 
@@ -1639,18 +1725,12 @@ impl Renderer {
         depth_aspect: vk::ImageAspectFlags,
         samples: u32,
     ) -> Result<vk::Pipeline, Error> {
-        let vs = self.module(draw.vs)?;
-        let ps = draw.ps.map(|ps| self.module(ps)).transpose()?;
-        let gs = draw.gs.map(|gs| self.module(gs)).transpose()?;
-        let tessellation = match draw.tessellation {
-            Some((hs, ds)) => Some((self.module(hs)?, self.module(ds)?)),
-            None => None,
-        };
         let r = &draw.rasterizer;
         let (ds, _) = &draw.depth_stencil;
         let (blend, _, sample_mask) = &draw.blend;
-        // The key: everything fixed in the pipeline.
-        let mut key = Key::default();
+        // The key: everything fixed in the pipeline (in a kept buffer).
+        let mut key = Key(std::mem::take(&mut self.draw.key));
+        key.0.clear();
         key.u64(shader_hash(draw.vs))
             .u64(draw.ps.map_or(0, shader_hash))
             .u64(draw.gs.map_or(0, shader_hash))
@@ -1721,9 +1801,17 @@ impl Renderer {
         }
         key.u32(u32::try_from(depth_format.as_raw()).unwrap_or(0))
             .u32(samples);
-        if let Some(p) = self.draw.pipelines.get(&key.0) {
-            return Ok(*p);
+        if let Some(&p) = self.draw.pipelines.get(&key.0) {
+            self.draw.key = key.0;
+            return Ok(p);
         }
+        let vs = self.module(draw.vs)?;
+        let ps = draw.ps.map(|ps| self.module(ps)).transpose()?;
+        let gs = draw.gs.map(|gs| self.module(gs)).transpose()?;
+        let tessellation = match draw.tessellation {
+            Some((hs, ds)) => Some((self.module(hs)?, self.module(ds)?)),
+            None => None,
+        };
         // Vertex input.
         let attributes: Vec<vk::VertexInputAttributeDescription> = draw
             .attributes

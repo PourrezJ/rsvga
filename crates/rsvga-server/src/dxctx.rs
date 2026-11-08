@@ -20,7 +20,6 @@
 //! hands them to the GPU ([`crate::gpu`]) when there is one. Fences and
 //! queries complete at once.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,6 +29,7 @@ use svga_core::dx::{
     Viewport, WHOLE_SIZE,
 };
 use svga_core::gb::{GbCommand, ImageId};
+use svga_core::hash::FastMap;
 use svga_core::layout::Box3;
 use svga_proto::{INVALID_ID, dx};
 
@@ -186,7 +186,7 @@ struct Table {
     mob: Option<u32>,
     /// Entries the MOB holds: object IDs are below.
     capacity: u32,
-    objects: BTreeMap<u32, Object>,
+    objects: FastMap<u32, Object>,
 }
 
 /// A DX context.
@@ -198,9 +198,9 @@ pub struct Context {
     /// Pipeline state.
     pub bindings: Bindings,
     /// Code of the bound shaders.
-    code: HashMap<u32, Arc<[u8]>>,
+    code: FastMap<u32, Arc<[u8]>>,
     /// Their translations (or why there is none).
-    spirv: HashMap<u32, Result<Arc<svga_shader::Shader>, String>>,
+    spirv: FastMap<u32, Result<Arc<svga_shader::Shader>, String>>,
     /// MOB and byte offset of its shaders' class-linkage data.
     pub iface: Option<(u32, u32)>,
 }
@@ -255,7 +255,7 @@ impl Context {
 /// The DX contexts of the device.
 pub struct DxContexts {
     limits: Limits,
-    contexts: HashMap<u32, Context>,
+    contexts: FastMap<u32, Context>,
     code_bytes: usize,
     /// Shaders translated to SPIR-V, and refused, since the start.
     pub translated: u64,
@@ -289,7 +289,7 @@ impl DxContexts {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
-            contexts: HashMap::new(),
+            contexts: FastMap::default(),
             code_bytes: 0,
             translated: 0,
             refused: 0,
@@ -301,6 +301,13 @@ impl DxContexts {
     pub fn reset(&mut self) {
         self.contexts.clear();
         self.code_bytes = 0;
+    }
+
+    /// The ids of the defined contexts, in order.
+    pub fn context_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.contexts.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Context `cid`.
@@ -370,11 +377,15 @@ impl DxContexts {
         Ok(())
     }
 
-    /// Writes the result of a finished query to its MOB slot
-    /// (`SVGA3dQueryResult`: size, state, result). Until the renderer
-    /// measures them, results say "visible, nothing counted": occlusion
-    /// queries and predicates report a sample, timestamps come from the
-    /// host clock, statistics are zero.
+    /// Writes the result of a finished query to its MOB slot: the state,
+    /// then the result (`SVGADXQueryResultUnion` member of its type), as
+    /// Mesa's svga driver reads them. Not the legacy `SVGA3dQueryResult`
+    /// (size, state, result): the Windows driver packs its slots at 4
+    /// bytes plus the largest result (92), so that layout leaves the state
+    /// it reads pending, and its query ring then waits forever for a free
+    /// slot. Until the renderer measures them, results say "visible,
+    /// nothing counted": occlusion queries and predicates report a sample,
+    /// timestamps come from the host clock, statistics are zero.
     fn write_query(&self, query: &Query, gb: &Gb, guest: &GuestMemory) -> Result<(), String> {
         if query.state != QUERY_FINISHED || query.mob == INVALID_ID {
             return Ok(());
@@ -399,13 +410,8 @@ impl DxContexts {
         };
         const SUCCEEDED: u32 = 1;
         let base = u64::from(query.offset);
-        gb.write_mob(guest, query.mob, base.saturating_add(8), &result)?;
-        gb.write_mob(
-            guest,
-            query.mob,
-            base.saturating_add(4),
-            &SUCCEEDED.to_le_bytes(),
-        )
+        gb.write_mob(guest, query.mob, base.saturating_add(4), &result)?;
+        gb.write_mob(guest, query.mob, base, &SUCCEEDED.to_le_bytes())
     }
 
     /// Executes a DX command; `current` is the DX context of its command
@@ -1386,12 +1392,28 @@ mod tests {
         r.ok(Some(0), DxCommand::SetQueryOffset { id: 1, offset: 32 });
         r.ok(Some(0), DxCommand::BeginQuery { id: 1 });
         r.ok(Some(0), DxCommand::EndQuery { id: 1 });
-        let mut slot = [0u8; 12];
+        let mut slot = [0u8; 8];
         assert!(ram.read(mob_offset(3) + 32, &mut slot));
-        assert_eq!(
-            &slot[4..12],
-            &[1, 0, 0, 0, 1, 0, 0, 0],
-            "succeeded, 1 sample"
+        assert_eq!(slot, [1, 0, 0, 0, 1, 0, 0, 0], "succeeded, 1 sample");
+        // Pipeline statistics fill a slot of the Windows driver (4 + 88
+        // bytes) and leave the next one alone.
+        assert!(ram.write(mob_offset(3) + 32 + 92, &[3, 0, 0, 0]));
+        r.ok(
+            Some(0),
+            DxCommand::DefineQuery {
+                id: 2,
+                kind: dx::query::PIPELINESTATS,
+                flags: 0,
+            },
         );
+        r.ok(Some(0), DxCommand::BindQuery { id: 2, mob: 3 });
+        r.ok(Some(0), DxCommand::SetQueryOffset { id: 2, offset: 32 });
+        r.ok(Some(0), DxCommand::BeginQuery { id: 2 });
+        r.ok(Some(0), DxCommand::EndQuery { id: 2 });
+        let mut slots = [0xffu8; 96];
+        assert!(ram.read(mob_offset(3) + 32, &mut slots));
+        assert_eq!(slots[..4], [1, 0, 0, 0], "succeeded");
+        assert!(slots[4..92].iter().all(|&b| b == 0), "nothing counted");
+        assert_eq!(slots[92..], [3, 0, 0, 0], "the next slot's state");
     }
 }

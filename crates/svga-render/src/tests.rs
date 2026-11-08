@@ -1009,3 +1009,125 @@ fn blend_factors_follow_svga3d_blendop() {
     assert_eq!(blend_factor(0), B::ONE, "invalid");
     assert!(dual_source(14) && dual_source(17) && !dual_source(12) && !dual_source(18));
 }
+
+/// The CPU cost of recording a draw, like a game's: the same pipeline,
+/// textures and index ranges changing from draw to draw. Run with
+/// `cargo test --release -p svga-render draw_recording_speed -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore = "a benchmark"]
+fn draw_recording_speed() {
+    let Some(mut r) = renderer() else { return };
+    let (vs, ps) = texture_shaders();
+    let bgra = format::B8G8R8A8_UNORM;
+    r.create(1, &layout(bgra, 256, 256, 1, 1), 0).unwrap();
+    for (sid, texel) in [(2, 255), (3, 128)] {
+        r.create(sid, &layout(bgra, 2, 2, 1, 1), 0).unwrap();
+        r.upload(sid, &[texel; 16]).unwrap();
+    }
+    r.create(4, &layout(format::BUFFER, 4096, 1, 1, 1), 0)
+        .unwrap();
+    r.upload(4, &[0; 4096]).unwrap();
+    r.create(5, &layout(format::BUFFER, 4096, 1, 1, 1), 0)
+        .unwrap();
+    r.upload(5, &[0; 4096]).unwrap();
+    let float4 = format::R32G32B32A32_FLOAT;
+    let mut targets = [None; 8];
+    targets[0] = Some(Target {
+        sid: 1,
+        format: bgra,
+        mip: 0,
+        first_layer: 0,
+    });
+    let sampler = svga_core::dx::SamplerState {
+        filter: 0x15,
+        address: [1; 3],
+        mip_lod_bias: 0.0,
+        max_anisotropy: 1,
+        comparison: 1,
+        border_color: [0.0; 4],
+        min_lod: 0.0,
+        max_lod: f32::MAX,
+    };
+    let mut draw = Draw {
+        vs: &vs,
+        ps: Some(&ps),
+        gs: None,
+        tessellation: None,
+        stream_output: None,
+        attributes: (0..2)
+            .map(|location| VertexAttribute {
+                location,
+                binding: 0,
+                format: float4,
+                offset: 16 * location,
+            })
+            .collect(),
+        buffers: vec![VertexBuffer {
+            binding: 0,
+            sid: Some(4),
+            offset: 0,
+            size: u64::MAX,
+            stride: 32,
+            per_instance: false,
+        }],
+        index: Some((5, format::R16_UINT, 0)),
+        topology: 4,
+        rasterizer: default_rasterizer(),
+        depth_stencil: (default_depth_stencil(), 0),
+        blend: (default_blend(), [0.0; 4], u32::MAX),
+        targets,
+        depth: None,
+        viewports: vec![svga_core::dx::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 256.0,
+            height: 256.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }],
+        scissors: Vec::new(),
+        resources: Vec::new(),
+        data: Vec::new(),
+        occlusion: None,
+        call: Call::Indexed {
+            indices: 0,
+            instances: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        },
+    };
+    let draws = 200_000u32;
+    let start = std::time::Instant::now();
+    for i in 0..draws {
+        draw.resources = vec![
+            Bound {
+                binding: 256 + 16,
+                resource: Resource::Sampler(sampler),
+            },
+            Bound {
+                binding: 256 + 32,
+                resource: Resource::Texture {
+                    sid: 2 + i % 2,
+                    format: bgra,
+                    first_mip: 0,
+                    mips: u32::MAX,
+                    first_layer: 0,
+                    layers: 1,
+                },
+            },
+        ];
+        draw.call = Call::Indexed {
+            indices: 0,
+            instances: 1,
+            first_index: i % 64,
+            base_vertex: 0,
+            first_instance: 0,
+        };
+        r.draw(&draw).unwrap();
+    }
+    r.wait_idle().unwrap();
+    let each = start.elapsed().as_secs_f64() * 1e6 / f64::from(draws);
+    eprintln!("{}: {each:.2} us per draw", r.name());
+}

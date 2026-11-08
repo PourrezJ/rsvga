@@ -241,6 +241,8 @@ pub struct State {
     pub stats: Stats,
     /// Kinds of unsupported commands already logged.
     unsupported_kinds: Vec<String>,
+    /// Recent commands by DX context, when profiling.
+    pub watch: crate::watch::Watch,
 }
 
 /// The device, shared between the vfio-user thread and the display loop.
@@ -433,6 +435,7 @@ impl Svga {
             unmask_watch: None,
             stats: Stats::default(),
             unsupported_kinds: Vec::new(),
+            watch: crate::watch::Watch::default(),
         };
         let svga = Arc::new(Self {
             vram,
@@ -509,6 +512,38 @@ impl Svga {
             state.irq.signals(),
             state.irq.connected()
         )
+    }
+
+    /// Logs DX contexts that stopped after much work ([`crate::watch`]),
+    /// with what the device still holds for the guest.
+    pub fn watch(&self, state: &mut State) {
+        if !crate::prof::enabled() {
+            return;
+        }
+        let stalled = state.watch.stalled();
+        if stalled.is_empty() {
+            return;
+        }
+        let r = |i: u32| self.fifo.load_u32(reg_index(i));
+        for (cid, recent) in stalled {
+            log!(
+                "watch: DX context {cid} quiet after: {}",
+                crate::watch::names(&recent)
+            );
+        }
+        log!(
+            "watch: fifo next={:#x} stop={:#x} fence={:#x} goal={:#x} busy={} | {} | irq mask={:#x} pending={:#x} signals={} | dx contexts {:?}",
+            r(fifo::NEXT_CMD),
+            r(fifo::STOP),
+            r(fifo::FENCE),
+            r(fifo::FENCE_GOAL),
+            r(fifo::BUSY),
+            state.cb.summary(),
+            state.regs.irq_mask(),
+            state.irq.pending(),
+            state.irq.signals(),
+            state.dx.context_ids(),
+        );
     }
 
     /// The VRAM, for display.
@@ -626,6 +661,11 @@ impl Svga {
     /// buffer, if any.
     pub(crate) fn execute(&self, state: &mut State, command: Command, dx_context: Option<u32>) {
         state.stats.commands = state.stats.commands.saturating_add(1);
+        if let (Command::Command3d { id, .. }, Some(cid)) = (&command, dx_context)
+            && crate::prof::enabled()
+        {
+            state.watch.command(cid, *id);
+        }
         if trace_level() >= 1 {
             match &command {
                 Command::Fence(value) => trace(format!("FIFO Fence({value:#x})")),
@@ -641,6 +681,7 @@ impl Svga {
             && let Some(parsed) = svga_core::gb::parse(*id, payload)
         {
             let _span = crate::prof::span(crate::prof::Cat::Gb);
+            let started = crate::prof::enabled().then(std::time::Instant::now);
             let State { gb, guest, gpu, .. } = state;
             let result = parsed
                 .map_err(|short| short.to_string())
@@ -666,12 +707,17 @@ impl Svga {
             if let Err(error) = result {
                 trace(format!("GB command {id} failed: {error}"));
             }
+            if let Some(started) = started {
+                let name = svga_proto::cmd3d_names::name(*id).unwrap_or("?");
+                crate::prof::command(name, started.elapsed());
+            }
             return;
         }
         if let Command::Command3d { id, size, payload } = &command
             && let Some(parsed) = svga_core::dx::parse(*id, *size, payload)
         {
             let _span = crate::prof::span(crate::prof::Cat::Dx);
+            let started = crate::prof::enabled().then(std::time::Instant::now);
             let State {
                 dx,
                 gb,
@@ -690,6 +736,9 @@ impl Svga {
                 let Some(gpu) = gpu.as_mut() else {
                     return dx.execute(dx_command, dx_context, gb, guest);
                 };
+                if gpu.update_on_gpu(&dx_command, gb, guest)? {
+                    return Ok(crate::dxctx::Outcome::Done);
+                }
                 gpu.before_dx(&dx_command, gb, guest)?;
                 let command = dx_command.clone();
                 let outcome = dx.execute(dx_command, dx_context, gb, guest)?;
@@ -713,6 +762,10 @@ impl Svga {
                     let name = svga_proto::cmd3d_names::name(*id).unwrap_or("?");
                     trace(format!("DX {name} refused: {error}"));
                 }
+            }
+            if let Some(started) = started {
+                let name = svga_proto::cmd3d_names::name(*id).unwrap_or("?");
+                crate::prof::command(name, started.elapsed());
             }
             return;
         }

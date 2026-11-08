@@ -20,7 +20,13 @@ Ce qui sert à travailler sur rsvga : tests, fuzzing, lancement à la main, outi
 cargo test --workspace
 ```
 
-196 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout. Sans GPU Vulkan, les tests du moteur se sautent eux-mêmes.
+201 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout. Sans GPU Vulkan, les tests du moteur se sautent eux-mêmes.
+
+Le coût d'un dessin dans le moteur (sans VM) se mesure à part :
+
+```bash
+cargo test --release -p svga-render draw_recording_speed -- --ignored --nocapture
+```
 
 Fuzzing avec libFuzzer, sur la toolchain stable (ni cargo-fuzz ni nightly). Cibles : `fifo`, `decode`, `dx`, `shader`, `nine`.
 
@@ -77,7 +83,7 @@ Côté QEMU, la RAM de l'invité doit être partagée (memfd), et la carte s'ajo
 | `RSVGA_3D=0` | Garde la carte en 2D (la 3D est annoncée par défaut quand un GPU Vulkan est là). |
 | `RSVGA_GPU=<partie du nom>` | Choisit le GPU (par défaut le plus gros GPU dédié). |
 | `RSVGA_TRACE=1` | Journalise chaque accès aux registres, chaque commande et l'état de la FIFO toutes les 5 secondes ; `2` ajoute les accès bruts ; `0` rend le serveur silencieux. |
-| `RSVGA_PROFILE=1` | Journalise où va le temps, GPU compris. |
+| `RSVGA_PROFILE=1` | Journalise toutes les 5 secondes où va le temps, GPU compris, et le temps de chaque commande ; signale un contexte DX qui se tait après beaucoup de travail, avec ses dernières commandes et l'état des files et des interruptions (un programme bloqué). |
 | `RSVGA_SYNC_BUFFERS=1` | Exécute chaque command buffer pendant l'écriture de registre de l'invité, sans fil de travail (diagnostic). |
 | `RSVGA_PROBE_DEVCAPS="258=0"` | Retire le shader model 5 : Windows reste au niveau 10_1 (les variables `RSVGA_PROBE_*` servent à sonder le pilote). |
 | `RSVGA_SHADER_DUMP=DIR` | Enregistre chaque shader lié, tel que l'invité l'envoie (`DIR/<étage>-<hachage>.vgpu10`) ; les tests du traducteur valident tout `target/shaders/*`. |

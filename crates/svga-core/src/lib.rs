@@ -12,6 +12,7 @@ pub mod dx;
 pub mod fifo;
 pub mod gb;
 pub mod gmr;
+pub mod hash;
 pub mod layout;
 pub mod legacy;
 pub mod mob;

@@ -12,7 +12,7 @@ Projet expérimental. Testé avec Windows 11 et le pilote `vm3d` 9.17.11 (VMware
 
 - bureau composé par le GPU, résolution qui suit la fenêtre, curseur matériel ;
 - Direct3D 11 au niveau 11_0 (WDDM 2.0) : shader model 5, compute shaders, tessellation, geometry shaders, stream output, UA views ; Direct3D 9 (shader model 3) ;
-- Unigine Heaven 4.0 en Direct3D 9 (35 à 38 images par seconde en 1280×720 sur une RX 6950 XT) et en Direct3D 11 avec la tessellation (rendu juste, 7 à 13 images par seconde : pas encore optimisé).
+- Unigine Heaven 4.0 en 1280×720 sur une RX 6950 XT : en Direct3D 9, 35 à 38 images par seconde ; en Direct3D 11 avec la tessellation, 40 en moyenne (31 à 55 selon les scènes).
 
 Pas encore : les compteurs des tampons append/consume, `switch` et les sous-routines des shaders, les doubles, le niveau 11_1. Le pilote de VMware ne fait ni Direct3D 12 ni Vulkan.
 

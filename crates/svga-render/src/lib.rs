@@ -35,8 +35,8 @@ pub use draw::{
     default_depth_stencil, default_rasterizer, dual_source,
 };
 
-use std::collections::HashMap;
 use std::ffi::c_void;
+use svga_core::hash::FastMap;
 
 use ash::vk;
 use svga_core::layout::SurfaceLayout;
@@ -108,9 +108,9 @@ struct Surface {
     /// single guest level (`AUTOGENMIPMAPS`).
     mips: u32,
     /// Image views made for draws, destroyed with the surface.
-    views: HashMap<ViewKey, vk::ImageView>,
+    views: FastMap<ViewKey, vk::ImageView>,
     /// Buffer views (format, offset, bytes), likewise.
-    buffer_views: HashMap<(i32, u64, u64), vk::BufferView>,
+    buffer_views: FastMap<(i32, u64, u64), vk::BufferView>,
     /// Bytes stream output wrote to the buffer, kept by the GPU (for
     /// appends and `DrawAuto`), once used.
     counter: Option<(vk::Buffer, vk::DeviceMemory)>,
@@ -119,7 +119,16 @@ struct Surface {
 struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    /// Bytes, extra usage, and the mapping (kept for the buffer's life).
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    ptr: usize,
 }
+
+/// Bytes of retired staging buffers kept for later copies: allocating
+/// and first touching host memory for every frame read back (3.7 MB at
+/// 1280x720) cost more than the copy.
+const STAGING_KEPT_BYTES: u64 = 64 << 20;
 
 /// Submissions in flight at most: the device goes on recording while the
 /// GPU runs the previous ones, and waits only to read results back.
@@ -128,6 +137,11 @@ const FRAMES: usize = 4;
 /// Draws recorded before they are submitted, even in the middle of a
 /// command buffer of the guest.
 const DRAWS_PER_SUBMISSION: u32 = 512;
+
+/// Draws after which the recording is submitted early if the GPU has
+/// nothing left to run: it works while the rest is recorded, and what is
+/// read back at the end of a frame waits less for it.
+const DRAWS_WHEN_IDLE: u32 = 64;
 
 /// A submission: its command buffer and fence, and what must live until
 /// the GPU is done with it.
@@ -193,7 +207,9 @@ pub struct Renderer {
     d24s8: bool,
     recording: bool,
     staging: Vec<Staging>,
-    surfaces: HashMap<u32, Surface>,
+    /// Retired staging buffers, oldest first ([`STAGING_KEPT_BYTES`]).
+    staging_free: Vec<Staging>,
+    surfaces: FastMap<u32, Surface>,
     a8: bool,
     features: Features,
     push: Option<ash::khr::push_descriptor::Device>,
@@ -205,6 +221,8 @@ pub struct Renderer {
     /// The rendering left open by the last draw, for the next draw with
     /// the same attachments (see `draw.rs`).
     pass: Option<draw::Pass>,
+    /// State the last draw of the open rendering set.
+    set: draw::SetState,
     /// Constants given with draws.
     uniforms: Uniforms,
     /// `minUniformBufferOffsetAlignment`.
@@ -581,6 +599,7 @@ impl Renderer {
             draw: draw::Caches::default(),
             occlusion: None,
             pass: None,
+            set: draw::SetState::default(),
             uniforms: Uniforms::default(),
             uniform_align,
             timing,
@@ -592,7 +611,8 @@ impl Renderer {
             read_buffers: Vec::new(),
             recording: false,
             staging: Vec::new(),
-            surfaces: HashMap::new(),
+            staging_free: Vec::new(),
+            surfaces: FastMap::default(),
         })
     }
 
@@ -678,6 +698,13 @@ impl Renderer {
             }
         }
         Ok(self.cmd)
+    }
+
+    /// Whether the GPU has run every submission (the last one is done).
+    fn gpu_idle(&self) -> bool {
+        let last = &self.frames[self.current.wrapping_add(FRAMES - 1) % FRAMES];
+        // SAFETY: the fence belongs to this device.
+        !last.busy || unsafe { self.device.get_fence_status(last.fence) }.unwrap_or(false)
     }
 
     /// Ends the rendering a draw left open.
@@ -1046,8 +1073,15 @@ impl Renderer {
     /// Frees the staging buffers of submission `i`; its constant chunks
     /// are free again.
     fn free_frame(&mut self, i: usize) {
-        for s in std::mem::take(&mut self.frames[i].staging) {
-            // SAFETY: the GPU is done with them (retired or never used).
+        // The GPU is done with them (retired or never used): kept for
+        // later copies, the oldest freed past the budget.
+        let staging = std::mem::take(&mut self.frames[i].staging);
+        self.staging_free.extend(staging);
+        let mut kept: u64 = self.staging_free.iter().map(|s| s.size).sum();
+        while kept > STAGING_KEPT_BYTES && !self.staging_free.is_empty() {
+            let s = self.staging_free.remove(0);
+            kept = kept.saturating_sub(s.size);
+            // SAFETY: as above; no longer listed anywhere.
             unsafe {
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
@@ -1095,7 +1129,21 @@ impl Renderer {
     /// [`Self::uniform_slice`] at a multiple of `align`, for constants and
     /// small uploads alike.
     fn chunk_slice(&mut self, bytes: &[u8], align: u64) -> Result<(vk::Buffer, u64), Error> {
-        let size = bytes.len() as u64;
+        let (buffer, offset, ptr) = self.chunk_reserve(bytes.len() as u64, align)?;
+        // SAFETY: `ptr` points to `bytes.len()` reserved bytes of a mapped
+        // chunk that the GPU does not use yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        Ok((buffer, offset))
+    }
+
+    /// Reserves `size` bytes of a chunk at a multiple of `align`: the
+    /// buffer, the offset in it, and the mapped address, valid until the
+    /// next submission completes.
+    fn chunk_reserve(
+        &mut self,
+        size: u64,
+        align: u64,
+    ) -> Result<(vk::Buffer, u64, *mut u8), Error> {
         if size > UNIFORM_CHUNK {
             return err(format!("{size} bytes in a {UNIFORM_CHUNK}-byte chunk"));
         }
@@ -1105,19 +1153,13 @@ impl Renderer {
             if let Some(&(buffer, _, address)) = u.active.last()
                 && offset.saturating_add(size) <= UNIFORM_CHUNK
             {
-                // SAFETY: the chunk is mapped for its life at `address`,
-                // holds UNIFORM_CHUNK bytes, and this range is not in use
-                // by the GPU (chunks of a submission are reused only once
-                // it is retired).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (address as *mut u8).add(usize::try_from(offset).unwrap_or(0)),
-                        bytes.len(),
-                    );
-                }
+                // SAFETY: the chunk is mapped for its life at `address` and
+                // holds UNIFORM_CHUNK bytes; this range is not in use by
+                // the GPU (chunks of a submission are reused only once it
+                // is retired).
+                let ptr = unsafe { (address as *mut u8).add(usize::try_from(offset).unwrap_or(0)) };
                 u.used = offset.saturating_add(size);
-                return Ok((buffer, offset));
+                return Ok((buffer, offset, ptr));
             }
             u.used = 0;
             if let Some(chunk) = u.free.pop() {
@@ -1142,6 +1184,17 @@ impl Renderer {
         size: u64,
         usage: vk::BufferUsageFlags,
     ) -> Result<(vk::Buffer, *mut c_void), Error> {
+        // A retired buffer of the same use, not much larger, if any.
+        if let Some(pos) = self
+            .staging_free
+            .iter()
+            .position(|s| s.usage == usage && s.size >= size && s.size / 2 <= size)
+        {
+            let s = self.staging_free.remove(pos);
+            let found = (s.buffer, s.ptr as *mut c_void);
+            self.staging.push(s);
+            return Ok(found);
+        }
         let info = vk::BufferCreateInfo::default()
             .size(size.max(1))
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | usage);
@@ -1165,13 +1218,33 @@ impl Renderer {
                 return Err(e);
             }
         };
-        self.staging.push(Staging { buffer, memory });
         // SAFETY: fresh memory for this buffer; mapped once, for its life.
-        let ptr = unsafe {
-            self.device.bind_buffer_memory(buffer, memory, 0)?;
+        let mapped = unsafe {
             self.device
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                .bind_buffer_memory(buffer, memory, 0)
+                .and_then(|()| {
+                    self.device
+                        .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                })
         };
+        let ptr = match mapped {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                // SAFETY: unused buffer and memory.
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(e.into());
+            }
+        };
+        self.staging.push(Staging {
+            buffer,
+            memory,
+            size: size.max(1),
+            usage,
+            ptr: ptr as usize,
+        });
         Ok((buffer, ptr))
     }
 
@@ -1207,8 +1280,8 @@ impl Renderer {
                 },
                 resource,
                 layout: layout.clone(),
-                views: HashMap::new(),
-                buffer_views: HashMap::new(),
+                views: FastMap::default(),
+                buffer_views: FastMap::default(),
                 counter: None,
             },
         );
@@ -1547,6 +1620,48 @@ impl Renderer {
         Ok(())
     }
 
+    /// Writes `len` bytes at `offset` of buffer surface `sid`, after what
+    /// was recorded before; `fill` writes them straight into upload memory
+    /// (false: it could not, and nothing is written). For partial updates
+    /// of buffers the GPU holds: no copy of the whole buffer on the way.
+    pub fn write_buffer(
+        &mut self,
+        sid: u32,
+        offset: u64,
+        len: u64,
+        fill: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<(), Error> {
+        let (buffer, total) = self.buffer(sid)?;
+        if offset.checked_add(len).is_none_or(|end| end > total) {
+            return err(format!("buffer {sid}: {len} bytes at {offset} of {total}"));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let size = usize::try_from(len).map_err(|e| Error(e.to_string()))?;
+        let (staging, base, ptr) = if len <= UNIFORM_CHUNK {
+            self.chunk_reserve(len, 4)?
+        } else {
+            let (staging, ptr) = self.staging(len)?;
+            (staging, 0, ptr.cast::<u8>())
+        };
+        // SAFETY: `ptr` points to `len` bytes of mapped upload memory the
+        // GPU does not use until the copy below is submitted.
+        let dest = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+        if !fill(dest) {
+            return err(format!("buffer {sid}: no data to write"));
+        }
+        let cmd = self.barrier()?;
+        let region = vk::BufferCopy::default()
+            .src_offset(base)
+            .dst_offset(offset)
+            .size(len);
+        // SAFETY: recording; both buffers are live and the ranges lie
+        // within them (checked above).
+        unsafe { self.device.cmd_copy_buffer(cmd, staging, buffer, &[region]) };
+        Ok(())
+    }
+
     /// Reads the whole contents of surface `sid` into `out`, in its guest
     /// layout. Waits for the GPU.
     pub fn download(&mut self, sid: u32, out: &mut [u8]) -> Result<(), Error> {
@@ -1638,6 +1753,13 @@ impl Renderer {
             } => Ok((image, format, aspect, three_d)),
             Storage::Buffer { .. } => err(format!("surface {sid} is a buffer")),
         }
+    }
+
+    /// Whether surface `sid` is on the GPU as a buffer.
+    pub fn holds_buffer(&self, sid: u32) -> bool {
+        self.surfaces
+            .get(&sid)
+            .is_some_and(|s| matches!(s.resource, Storage::Buffer { .. }))
     }
 
     fn buffer(&self, sid: u32) -> Result<(vk::Buffer, u64), Error> {
@@ -2339,6 +2461,10 @@ impl Drop for Renderer {
             for (buffer, memory, ..) in reads.chain(std::mem::take(&mut self.read_buffers)) {
                 self.device.destroy_buffer(buffer, None);
                 self.device.free_memory(memory, None);
+            }
+            for s in std::mem::take(&mut self.staging_free) {
+                self.device.destroy_buffer(s.buffer, None);
+                self.device.free_memory(s.memory, None);
             }
             let uniforms = std::mem::take(&mut self.uniforms);
             for (buffer, memory, _) in uniforms.active.into_iter().chain(uniforms.free) {

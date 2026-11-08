@@ -1981,6 +1981,139 @@ out:
     end();
 }
 
+/* ---- queries --------------------------------------------------------------- */
+
+/* Waits up to two seconds for a query's data (GetData flushes). */
+static int query_data(const char *what, ID3D11Asynchronous *q, void *data, UINT size)
+{
+    DWORD start = GetTickCount();
+    HRESULT hr;
+
+    do {
+        hr = ID3D11DeviceContext_GetData(ctx, q, data, size, 0);
+        if (hr == S_OK)
+            return 1;
+        if (FAILED(hr)) {
+            fail("%s: GetData hr=0x%08lx", what, (unsigned long)hr);
+            return 0;
+        }
+        Sleep(1);
+    } while (GetTickCount() - start < 2000);
+    fail("%s: no data after 2 s", what);
+    return 0;
+}
+
+static ID3D11Query *make_query(D3D11_QUERY type)
+{
+    D3D11_QUERY_DESC desc = {type, 0};
+    ID3D11Query *q = NULL;
+
+    if (!ok("CreateQuery", ID3D11Device_CreateQuery(dev, &desc, &q)))
+        return NULL;
+    return q;
+}
+
+/* Occlusion, predicate, timestamps, pipeline statistics and events around
+ * a triangle all deliver their data; then more pipeline statistics
+ * queries than the driver's result ring holds (Unigine Heaven makes one
+ * per frame: the ring stalled once the device wrote results where the
+ * driver does not read them). */
+static void test_queries(void)
+{
+    static const float vertices[] = {
+        0.0f, 0.9f, 1, 0, 0, 1, 0.9f, -0.9f, 0, 1, 0, 1, -0.9f, -0.9f, 0, 0, 1, 1,
+    };
+    struct target t;
+    ID3D11InputLayout *layout = NULL;
+    ID3D11VertexShader *vs = NULL;
+    ID3D11PixelShader *ps = NULL;
+    ID3D11Buffer *vb = NULL;
+    ID3D11Query *occlusion = NULL, *predicate = NULL, *disjoint = NULL, *before = NULL,
+                *after = NULL, *stats = NULL, *event = NULL;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS ps_stats;
+    UINT64 samples = 0, t0 = 0, t1 = 0;
+    BOOL visible = FALSE, done = FALSE;
+    int i;
+
+    begin("queries");
+    if (!make_target(&t, DXGI_FORMAT_R8G8B8A8_UNORM, W, H))
+        goto out;
+    vs = make_vs(color_hlsl, color_layout, 2, &layout);
+    ps = make_ps(color_hlsl);
+    vb = make_buffer(D3D11_BIND_VERTEX_BUFFER, vertices, sizeof vertices);
+    occlusion = make_query(D3D11_QUERY_OCCLUSION);
+    predicate = make_query(D3D11_QUERY_OCCLUSION_PREDICATE);
+    disjoint = make_query(D3D11_QUERY_TIMESTAMP_DISJOINT);
+    before = make_query(D3D11_QUERY_TIMESTAMP);
+    after = make_query(D3D11_QUERY_TIMESTAMP);
+    stats = make_query(D3D11_QUERY_PIPELINE_STATISTICS);
+    event = make_query(D3D11_QUERY_EVENT);
+    if (!vs || !ps || !vb || !layout || !occlusion || !predicate || !disjoint || !before ||
+        !after || !stats || !event)
+        goto out;
+    bind_target(&t, NULL);
+    clear(&t, 0, 0, 0, 1);
+    ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    set_vertices(vb, 24);
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)disjoint);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)before);
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)occlusion);
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)predicate);
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)stats);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)stats);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)predicate);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)occlusion);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)after);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)disjoint);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)event);
+    if (query_data("occlusion", (ID3D11Asynchronous *)occlusion, &samples, sizeof samples) &&
+        samples == 0)
+        fail("occlusion: no sample of a visible triangle");
+    if (query_data("predicate", (ID3D11Asynchronous *)predicate, &visible, sizeof visible) &&
+        !visible)
+        fail("predicate: the triangle is not visible");
+    if (query_data("disjoint", (ID3D11Asynchronous *)disjoint, &dj, sizeof dj) &&
+        dj.Frequency == 0)
+        fail("disjoint: frequency 0");
+    if (query_data("timestamp before", (ID3D11Asynchronous *)before, &t0, sizeof t0) &&
+        query_data("timestamp after", (ID3D11Asynchronous *)after, &t1, sizeof t1) && t1 < t0)
+        fail("timestamps go back: %llu then %llu", (unsigned long long)t0,
+             (unsigned long long)t1);
+    query_data("pipeline statistics", (ID3D11Asynchronous *)stats, &ps_stats, sizeof ps_stats);
+    query_data("event", (ID3D11Asynchronous *)event, &done, sizeof done);
+    /* Heaven's pattern: a new query each frame, read back, then released. */
+    for (i = 0; i < 1200 && test_failures == 0; i++) {
+        ID3D11Query *q = make_query(D3D11_QUERY_PIPELINE_STATISTICS);
+        if (!q)
+            break;
+        ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)q);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)q);
+        if (!query_data("statistics ring", (ID3D11Asynchronous *)q, &ps_stats, sizeof ps_stats))
+            say("  (query %d of the ring)", i);
+        ID3D11Query_Release(q);
+    }
+out:
+    RELEASE(event);
+    RELEASE(stats);
+    RELEASE(after);
+    RELEASE(before);
+    RELEASE(disjoint);
+    RELEASE(predicate);
+    RELEASE(occlusion);
+    RELEASE(vb);
+    RELEASE(ps);
+    RELEASE(vs);
+    RELEASE(layout);
+    free_target(&t);
+    end();
+}
+
 /* ---- main ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
@@ -2036,6 +2169,7 @@ int main(int argc, char **argv)
     test_pixel_uav();
     test_tessellation();
     test_indirect();
+    test_queries();
     if (seconds > 0)
         test_window(seconds);
     say("device removed reason: 0x%08lx", (unsigned long)ID3D11Device_GetDeviceRemovedReason(dev));

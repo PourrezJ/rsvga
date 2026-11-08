@@ -22,7 +22,7 @@ pub enum Cat {
     D3d9State,
     /// Legacy commands on the GPU.
     D3d9Gpu,
-    /// Direct3D 9 shader translations and their cache.
+    /// Shader translations and their caches (Direct3D 9 and DX).
     Translate,
     /// Recording a draw (pipeline, descriptors, commands).
     Record,
@@ -70,8 +70,29 @@ pub fn count(name: &'static str) {
 }
 static COUNT: [AtomicU64; CATS] = [const { AtomicU64::new(0) }; CATS];
 static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+/// Time and count by command name.
+static COMMANDS: Mutex<Vec<(&'static str, u64, u64)>> = Mutex::new(Vec::new());
 
-fn enabled() -> bool {
+/// Adds `time` taken by one command `name`, if profiling.
+pub fn command(name: &'static str, time: Duration) {
+    if !enabled() {
+        return;
+    }
+    let Ok(mut commands) = COMMANDS.lock() else {
+        return;
+    };
+    let nanos = u64::try_from(time.as_nanos()).unwrap_or(u64::MAX);
+    match commands.iter_mut().find(|(n, ..)| *n == name) {
+        Some((_, t, c)) => {
+            *t = t.saturating_add(nanos);
+            *c = c.saturating_add(1);
+        }
+        None => commands.push((name, nanos, 1)),
+    }
+}
+
+/// Whether profiling is on (`RSVGA_PROFILE`).
+pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RSVGA_PROFILE").is_some_and(|v| v != "0"))
 }
@@ -138,5 +159,17 @@ pub fn report() {
         let list: Vec<String> = events.iter().map(|(n, c)| format!("{n} {c}")).collect();
         crate::log!("profile events: {}", list.join(", "));
         events.clear();
+    }
+    if let Ok(mut commands) = COMMANDS.lock()
+        && !commands.is_empty()
+    {
+        commands.sort_by_key(|c| std::cmp::Reverse(c.1));
+        let list: Vec<String> = commands
+            .iter()
+            .take(12)
+            .map(|(n, t, c)| format!("{n} {:.2} s ({c})", *t as f64 / 1e9))
+            .collect();
+        crate::log!("profile commands: {}", list.join(", "));
+        commands.clear();
     }
 }

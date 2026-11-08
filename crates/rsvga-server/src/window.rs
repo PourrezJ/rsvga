@@ -201,6 +201,7 @@ impl App {
         {
             let mut state = self.svga.lock();
             self.svga.process_fifo(&mut state);
+            self.svga.watch(&mut state);
         }
         let shown = self.svga.capture(&mut self.frame);
         let changed = shown.is_some_and(|s| s.changed);

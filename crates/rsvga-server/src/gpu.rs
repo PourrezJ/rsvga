@@ -33,8 +33,8 @@
 //! AMD, multisampled images) live on the GPU only: their device copies
 //! are neither uploaded nor read back.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use svga_core::hash::FastMap;
 
 use svga_core::cotable::Object;
 use svga_core::dx::{DxCommand, InputElement, RtvRange, SrvRange};
@@ -66,14 +66,14 @@ enum Newer {
 /// The renderer and the coherence of its surfaces.
 pub struct Gpu {
     renderer: Renderer,
-    newer: HashMap<u32, Newer>,
+    newer: FastMap<u32, Newer>,
     /// Shaders translated with other than the default options.
-    shaders: HashMap<(Arc<[u8]>, Options), Translation>,
+    shaders: FastMap<(Code<u8>, Options), Translation>,
     /// Direct3D 9 shaders, by code and options.
-    shaders9: HashMap<(nine::Code, svga_shader::d3d9::Options), nine::Translation9>,
+    shaders9: FastMap<(Code<u32>, svga_shader::d3d9::Options), nine::Translation9>,
     /// The device's own Direct3D 9 programs (pretransformed vertices by
     /// vertex inputs, the default pixel shader), made once.
-    programs9: HashMap<Vec<(u32, u32)>, Arc<[u32]>>,
+    programs9: FastMap<Vec<(u32, u32)>, Arc<[u32]>>,
     /// The legacy occlusion query being counted: context, its first
     /// occlusion slot, and the samples of its slots already read.
     query9: Option<(u32, u32, u64)>,
@@ -95,6 +95,27 @@ fn gpu_err(e: svga_render::Error) -> String {
 
 /// A translated shader, or why there is none.
 type Translation = Result<Arc<Shader>, String>;
+
+/// Shader code as a cache key: by address, not contents (hashing whole
+/// programs at every draw cost more than the rest of the lookup). The key
+/// holds the code, so the address cannot be reused while it is cached.
+#[derive(Clone, Debug)]
+struct Code<T>(Arc<[T]>);
+
+impl<T> PartialEq for Code<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Eq for Code<T> {}
+
+impl<T> std::hash::Hash for Code<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0).cast::<T>() as usize).hash(state);
+        self.0.len().hash(state);
+    }
+}
 
 /// Most translations kept in [`Gpu::shaders`].
 const MAX_SHADER_VARIANTS: usize = 1024;
@@ -264,10 +285,10 @@ impl Gpu {
         let renderer = Renderer::new().map_err(|e| e.to_string())?;
         Ok(Self {
             renderer,
-            newer: HashMap::new(),
-            shaders: HashMap::new(),
-            shaders9: HashMap::new(),
-            programs9: HashMap::new(),
+            newer: FastMap::default(),
+            shaders: FastMap::default(),
+            shaders9: FastMap::default(),
+            programs9: FastMap::default(),
             query9: None,
             ended9: Vec::new(),
             screen_reads: Vec::new(),
@@ -551,6 +572,46 @@ impl Gpu {
     /// After a guest-backed command: device copies it wrote are newer.
     pub fn after_gb(&mut self, command: &GbCommand) {
         self.apply_after(&gb_effects(command));
+    }
+
+    /// A `DX_BUFFER_UPDATE` of a buffer whose newest copy is the GPU's:
+    /// the range goes from its MOB straight to the GPU (true), rather than
+    /// into a device copy, then the whole buffer to the GPU at the next
+    /// draw. Games update parts of their dynamic buffers every frame. A
+    /// device copy equal to the GPU's is dropped: the GPU's becomes the
+    /// only one, as after any GPU write.
+    pub fn update_on_gpu(
+        &mut self,
+        command: &DxCommand,
+        gb: &mut Gb,
+        guest: &GuestMemory,
+    ) -> Result<bool, String> {
+        let DxCommand::BufferUpdate { sid, x, width } = *command else {
+            return Ok(false);
+        };
+        if !self.renderer.holds_buffer(sid) {
+            return Ok(false);
+        }
+        match self.newer.get(&sid) {
+            Some(Newer::Gpu) => {}
+            Some(Newer::Same) => gb.drop_host_copy(sid),
+            _ => return Ok(false),
+        }
+        let _span = crate::prof::span(crate::prof::Cat::Upload);
+        let mut error = None;
+        self.renderer
+            .write_buffer(sid, u64::from(x), u64::from(width), |dest| {
+                gb.read_from_mob(guest, sid, u64::from(x), dest)
+                    .map_err(|e| error = Some(e))
+                    .is_ok()
+            })
+            .map_err(|e| {
+                error
+                    .take()
+                    .unwrap_or_else(|| format!("GPU: updating buffer {sid}: {e}"))
+            })?;
+        self.newer.insert(sid, Newer::Gpu);
+        Ok(true)
     }
 
     /// Before a DX command that the context model executes on device
@@ -886,7 +947,7 @@ impl Gpu {
         let code = context
             .shader_code(id)
             .ok_or_else(|| format!("shader {id} has no code"))?;
-        let key = (Arc::clone(code), options.clone());
+        let key = (Code(Arc::clone(code)), options.clone());
         if let Some(result) = self.shaders.get(&key) {
             return result.clone();
         }
@@ -993,15 +1054,15 @@ impl Gpu {
             return Ok(());
         }
         // Input layout, and the types of the vertex shader's inputs.
-        let elements: Vec<InputElement> = match b.input_layout {
-            INVALID_ID => Vec::new(),
+        let elements: &[InputElement] = match b.input_layout {
+            INVALID_ID => &[],
             id => match context.object(dx::cotable::ELEMENTLAYOUT, id) {
-                Some(Object::ElementLayout(e)) => e.clone(),
+                Some(Object::ElementLayout(e)) => e,
                 _ => return Err(format!("input layout {id} is not defined")),
             },
         };
         let mut vs_options = Options::default();
-        for e in &elements {
+        for e in elements {
             if let Some(input) = vs_options.inputs.get_mut(e.register as usize) {
                 *input = svga_render::format::scalar(e.format);
             }
@@ -1094,6 +1155,7 @@ impl Gpu {
                 })
             }
         };
+        let translate = crate::prof::span(crate::prof::Cat::Translate);
         let vs = self.shader(context, vs_id, &vs_options)?;
         let ps = match b.stages[1].shader {
             INVALID_ID => None,
@@ -1114,10 +1176,11 @@ impl Gpu {
                 Some(self.shader(context, d, &ds_options)?),
             ),
         };
+        drop(translate);
         // Vertex attributes the shader reads, and their buffer slots.
         let mut attributes: Vec<VertexAttribute> = Vec::new();
         let mut slots: Vec<(u32, bool)> = Vec::new();
-        for e in &elements {
+        for e in elements {
             if !vs.inputs.contains(&e.register)
                 || attributes.iter().any(|a| a.location == e.register)
             {
@@ -1250,7 +1313,10 @@ impl Gpu {
             occlusion: None,
             call,
         };
-        self.renderer.draw(&draw).map_err(|e| e.to_string())?;
+        {
+            let _record = crate::prof::span(crate::prof::Cat::Record);
+            self.renderer.draw(&draw).map_err(|e| e.to_string())?;
+        }
         if self.dump_recording() && matches!(call, Call::Draw { vertices, .. } if vertices <= 6) {
             let ps_hash = context
                 .shader_code(b.stages[1].shader)
@@ -1936,6 +2002,13 @@ mod draw_tests {
                     | DxCommand::BindShader { .. }
             ))
             .then_some(0);
+            if self
+                .gpu
+                .update_on_gpu(&c, &mut self.gb, &self.guest)
+                .unwrap()
+            {
+                return;
+            }
             self.gpu.before_dx(&c, &mut self.gb, &self.guest).unwrap();
             let outcome = self
                 .dx
@@ -1977,6 +2050,36 @@ mod draw_tests {
             }));
             self.gb(GbCommand::BindSurface { sid, mob, pitch: 0 });
         }
+    }
+
+    /// A partial update of a buffer the GPU holds goes from the MOB to the
+    /// GPU alone: the rest of the GPU copy stays, even where the MOB
+    /// changed outside the range.
+    #[test]
+    fn buffer_updates_go_straight_to_the_gpu() {
+        let Some(mut r) = Rig::new() else { return };
+        r.ram.write(4096, &[1; 256]);
+        r.mob(1, 1);
+        r.surface(20, format::BUFFER, 256, 1, 1);
+        // Equal copies, as after a first update: the device's goes.
+        r.gb.host_copy(&r.guest, 20).unwrap();
+        r.gpu.sync_gpu(&mut r.gb, &r.guest, 20).unwrap();
+        assert!(r.gb.has_host_copy(20));
+        r.dx(DxCommand::DefineContext { cid: 0 });
+        r.ram.write(4096, &[3; 64]);
+        r.ram.write(4096 + 64, &[2; 64]);
+        r.dx(DxCommand::BufferUpdate {
+            sid: 20,
+            x: 64,
+            width: 64,
+        });
+        assert!(!r.gb.has_host_copy(20), "no device copy on the way");
+        r.gb(GbCommand::ReadbackSurface { sid: 20 });
+        let mut back = [0u8; 256];
+        assert!(r.ram.read(4096, &mut back));
+        assert_eq!(back[..64], [1; 64], "outside the range: the GPU's bytes");
+        assert_eq!(back[64..128], [2; 64], "the range");
+        assert_eq!(back[128..], [1; 128]);
     }
 
     /// Video blits: an RGB picture scaled on the GPU over a background,

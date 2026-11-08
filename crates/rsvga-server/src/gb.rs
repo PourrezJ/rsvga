@@ -15,7 +15,7 @@
 //! Object tables are only recorded: rsvga keeps its object state in its
 //! own memory, which the guest never reads back.
 
-use std::collections::HashMap;
+use svga_core::hash::FastMap;
 
 use svga_core::command::Rect;
 use svga_core::gb::{CopyBox, GbCommand, ImageId, SurfaceDef};
@@ -88,11 +88,11 @@ struct Screen {
 pub struct Gb {
     limits: Limits,
     otables: [Option<(u64, u32)>; otable::MAX as usize],
-    mobs: HashMap<u32, Mob>,
+    mobs: FastMap<u32, Mob>,
     mob_pages: u64,
-    surfaces: HashMap<u32, Surface>,
+    surfaces: FastMap<u32, Surface>,
     host_bytes: u64,
-    targets: HashMap<u32, Target>,
+    targets: FastMap<u32, Target>,
     gart: Option<u32>,
     screen: Option<Screen>,
 }
@@ -188,11 +188,11 @@ impl Gb {
         Self {
             limits,
             otables: [None; otable::MAX as usize],
-            mobs: HashMap::new(),
+            mobs: FastMap::default(),
             mob_pages: 0,
-            surfaces: HashMap::new(),
+            surfaces: FastMap::default(),
             host_bytes: 0,
-            targets: HashMap::new(),
+            targets: FastMap::default(),
             gart: None,
             screen: None,
         }
@@ -445,6 +445,34 @@ impl Gb {
         self.surfaces
             .get(&sid)
             .ok_or_else(|| format!("surface {sid} is not defined"))
+    }
+
+    /// Reads bytes `offset..offset + out.len()` of surface `sid` from its
+    /// MOB (not from its device copy).
+    pub(crate) fn read_from_mob(
+        &self,
+        guest: &GuestMemory,
+        sid: u32,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        let surface = self.surface(sid)?;
+        let mob = self.bound_mob(sid)?;
+        let total = surface.layout.total_bytes();
+        let len = out.len() as u64;
+        if offset.checked_add(len).is_none_or(|end| end > total) {
+            return Err(format!(
+                "surface {sid}: range {offset:#x}+{len:#x} is outside"
+            ));
+        }
+        for (at, mob_offset, piece) in
+            to_mob(&surface.layout, surface.mob_pitch, vec![(offset, len)])?
+        {
+            let r = range(at.saturating_sub(offset), piece, out.len())
+                .ok_or_else(|| format!("surface {sid}: piece {at:#x}+{piece:#x} is outside"))?;
+            self.read_mob(guest, mob, mob_offset, &mut out[r])?;
+        }
+        Ok(())
     }
 
     fn bound_mob(&self, sid: u32) -> Result<u32, String> {

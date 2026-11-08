@@ -27,6 +27,7 @@ mod rom;
 mod scale;
 mod shm;
 mod twod;
+mod watch;
 #[cfg(feature = "window")]
 mod window;
 
@@ -227,6 +228,7 @@ fn display_loop(svga: &Svga, snapshot: Option<&std::path::Path>) {
         {
             let mut state = svga.lock();
             svga.process_fifo(&mut state);
+            svga.watch(&mut state);
         }
         let mode = svga.capture(&mut frame);
         if let (Some(path), Some(_)) = (snapshot, mode) {

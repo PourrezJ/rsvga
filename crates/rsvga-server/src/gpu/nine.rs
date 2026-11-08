@@ -20,34 +20,13 @@ use svga_render::{At, Bound, Call, Draw, Resource, Target, VertexAttribute, Vert
 use svga_shader::BindingKind;
 use svga_shader::d3d9::{self, Fog, Translated, constants};
 
-use super::{Gpu, gpu_err};
+use super::{Code, Gpu, gpu_err};
 use crate::ctx9::{Context9, INVALID_ID, Legacy, rs, ts};
 use crate::gb::Gb;
 use crate::guest::GuestMemory;
 
 /// A translated Direct3D 9 shader, or why there is none.
 pub(super) type Translation9 = Result<Arc<Translated>, String>;
-
-/// Shader code as a cache key: by address, not contents (hashing whole
-/// programs at every draw cost more than the rest of the lookup). The key
-/// holds the code, so the address cannot be reused while it is cached.
-#[derive(Clone, Debug)]
-pub(super) struct Code(pub(super) Arc<[u32]>);
-
-impl PartialEq for Code {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for Code {}
-
-impl std::hash::Hash for Code {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (Arc::as_ptr(&self.0).cast::<u32>() as usize).hash(state);
-        self.0.len().hash(state);
-    }
-}
 
 /// Vertex texture samplers start at this texture stage.
 const VERTEX_SAMPLER_STAGE: usize = 16;

@@ -76,6 +76,32 @@ impl CommandBuffers {
     fn context(&mut self, id: u32) -> Option<&mut Context> {
         self.contexts.get_mut(usize::try_from(id).ok()?)
     }
+
+    /// One line for diagnostics: the worker's queue, contexts stopped or
+    /// holding buffers, and the counters.
+    pub fn summary(&self) -> String {
+        let contexts: Vec<String> = self
+            .contexts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.running || !c.queued.is_empty())
+            .map(|(i, c)| {
+                format!(
+                    "{i}:{} queued {}",
+                    if c.running { "running" } else { "stopped" },
+                    c.queued.len()
+                )
+            })
+            .collect();
+        format!(
+            "cb pending {} running {} completed {} failed {} contexts [{}]",
+            self.pending.len(),
+            self.running,
+            self.completed,
+            self.failed,
+            contexts.join(", ")
+        )
+    }
 }
 
 fn read_header(state: &State, pa: u64) -> Option<Header> {
