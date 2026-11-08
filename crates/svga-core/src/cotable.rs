@@ -62,15 +62,20 @@ pub struct Shader {
     pub mob: u32,
 }
 
-/// A stream-output object (without the VMware "with MOB" extension).
+/// A stream-output object. With VMware's "with MOB" extension, its
+/// declarations come from a MOB, when it is bound.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamOutput {
     /// Declarations.
     pub decls: Vec<StreamOutputDecl>,
+    /// Declarations announced (those of the MOB, once bound).
+    pub declared: u32,
     /// Bytes per vertex of each target.
     pub strides: [u32; dx::MAX_SOTARGETS],
     /// Stream sent to the rasterizer.
     pub rasterized_stream: u32,
+    /// MOB and byte offset of the declarations.
+    pub mob: Option<(u32, u32)>,
 }
 
 /// An unordered-access view (`SVGACOTableDXUAViewEntry`).
@@ -158,8 +163,25 @@ impl Object {
                 *id,
                 Self::StreamOutput(StreamOutput {
                     decls: decls.clone(),
+                    declared: u32::try_from(decls.len()).unwrap_or(u32::MAX),
                     strides: *strides,
                     rasterized_stream: *rasterized_stream,
+                    mob: None,
+                }),
+            ),
+            C::DefineStreamOutputMob {
+                id,
+                declared,
+                strides,
+                rasterized_stream,
+            } => (
+                *id,
+                Self::StreamOutput(StreamOutput {
+                    decls: Vec::new(),
+                    declared: *declared,
+                    strides: *strides,
+                    rasterized_stream: *rasterized_stream,
+                    mob: None,
                 }),
             ),
             C::DefineQuery { id, kind, flags } => (
@@ -358,7 +380,7 @@ pub fn encode(id: u32, object: &Object) -> Vec<u8> {
             o.f32(s.min_lod).f32(s.max_lod);
         }
         Object::StreamOutput(so) => {
-            o.u32(u32::try_from(so.decls.len()).unwrap_or(u32::MAX));
+            o.u32(so.declared);
             for i in 0..dx::MAX_STREAMOUT_DECLS {
                 let d = so.decls.get(i).copied().unwrap_or(StreamOutputDecl {
                     slot: 0,
@@ -377,6 +399,12 @@ pub fn encode(id: u32, object: &Object) -> Vec<u8> {
                 o.u32(s);
             }
             o.u32(so.rasterized_stream);
+            let strides = so.strides.iter().filter(|&&s| s != 0).count();
+            let (mob, offset) = so.mob.unwrap_or((svga_proto::INVALID_ID, 0));
+            o.u32(u32::try_from(strides).unwrap_or(0))
+                .u32(mob)
+                .u32(offset)
+                .bool(so.mob.is_some());
         }
         Object::Query(q) => {
             o.u8(u8::try_from(q.kind).unwrap_or(u8::MAX))
@@ -513,7 +541,15 @@ pub fn decode(table: u32, bytes: &[u8]) -> Result<Object, DxError> {
             Ok(object)
         }
         dx::cotable::SAMPLER => define(cmd3d::DX_DEFINE_SAMPLER_STATE, 40),
-        dx::cotable::STREAMOUTPUT => define(cmd3d::DX_DEFINE_STREAMOUTPUT, 1048),
+        dx::cotable::STREAMOUTPUT => {
+            let mut object = define(cmd3d::DX_DEFINE_STREAMOUTPUT, 1048)?;
+            if let Object::StreamOutput(so) = &mut object
+                && entry.get(1060).copied().unwrap_or(0) != 0
+            {
+                so.mob = Some((word(entry, 1052), word(entry, 1056)));
+            }
+            Ok(object)
+        }
         dx::cotable::DXQUERY => {
             let kind = u32::from(entry.first().copied().unwrap_or(0));
             if kind >= dx::query::MAX {
@@ -708,8 +744,10 @@ mod tests {
                     mask: 0xf,
                     stream: 0,
                 }],
+                declared: 1,
                 strides: [16, 0, 0, 0],
                 rasterized_stream: 0,
+                mob: Some((7, 64)),
             }),
             Object::Query(Query {
                 kind: dx::query::OCCLUSION64,

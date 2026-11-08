@@ -75,8 +75,8 @@ impl Tx<'_> {
             [DECORATION_LOCATION, register]
         };
         let var = self.input_var(array, &[&decoration]);
-        let p = self.ptr(STORAGE_FUNCTION, array);
-        let local = self.m.local(p);
+        let p = self.ptr(self.reg_class, array);
+        let local = self.reg_var(p);
         self.vertex_inputs.insert(register, local);
         self.input_sources
             .push((local, InputSource::Array(var, array)));
@@ -111,7 +111,7 @@ impl Tx<'_> {
             .get(register)
             .ok_or_else(|| TranslateError(format!("input v[][{register}] is not declared")))?;
         let vertex = self.index(vertex)?;
-        let p = self.ptr(STORAGE_FUNCTION, self.f4);
+        let p = self.ptr(self.reg_class, self.f4);
         Ok(self.m.emit(op::ACCESS_CHAIN, p, &[local, vertex]))
     }
 

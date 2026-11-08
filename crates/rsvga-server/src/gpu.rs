@@ -45,6 +45,7 @@ use svga_shader::{BindingKind, Options, Scalar, Shader};
 
 use crate::dxctx::Context;
 
+mod dump;
 mod nine;
 mod screen;
 mod video;
@@ -84,6 +85,8 @@ pub struct Gpu {
     screen_reads: Vec<screen::ScreenRead>,
     /// Size of the work image of video blits, once made.
     video_scratch: Option<(u32, u32)>,
+    /// Render target dumps (`RSVGA_DUMP_TARGETS`).
+    dump: Option<dump::Dump>,
 }
 
 fn gpu_err(e: svga_render::Error) -> String {
@@ -184,6 +187,7 @@ pub fn runs_on_gpu(command: &DxCommand) -> bool {
             | DxCommand::Dispatch { .. }
             | DxCommand::DispatchIndirect { .. }
             | DxCommand::DrawIndirect { .. }
+            | DxCommand::DrawAuto
             | DxCommand::ClearUaViewUint { .. }
             | DxCommand::ClearUaViewFloat { .. }
     )
@@ -219,6 +223,28 @@ fn word_range(gb: &Gb, sid: u32, format: u32, first: u32, count: u32) -> (u64, u
     )
 }
 
+/// What stream-output declarations capture: stream 0's registers, packed
+/// in their buffers in declaration order (registers past 31 are gaps).
+fn captures(decls: &[svga_core::dx::StreamOutputDecl]) -> Vec<svga_shader::Capture> {
+    let mut offsets = [0u32; 4];
+    let mut out = Vec::new();
+    for d in decls.iter().filter(|d| d.stream == 0) {
+        let Some(offset) = offsets.get_mut(d.slot as usize) else {
+            continue;
+        };
+        if d.register < 32 {
+            out.push(svga_shader::Capture {
+                buffer: d.slot,
+                register: d.register,
+                mask: d.mask,
+                offset: *offset,
+            });
+        }
+        *offset = offset.saturating_add(d.mask.count_ones().saturating_mul(4));
+    }
+    out
+}
+
 /// The target of depth-stencil view `view` of `context`.
 fn depth_target(context: &Context, view: u32) -> Result<svga_render::Target, String> {
     match context.object(dx::cotable::DSVIEW, view) {
@@ -246,6 +272,7 @@ impl Gpu {
             ended9: Vec::new(),
             screen_reads: Vec::new(),
             video_scratch: None,
+            dump: dump::Dump::from_env(),
         })
     }
 
@@ -564,6 +591,19 @@ impl Gpu {
         gb: &mut Gb,
         guest: &GuestMemory,
     ) -> Result<(), String> {
+        if self.dump_recording()
+            && !matches!(
+                command,
+                DxCommand::Draw { .. }
+                    | DxCommand::DrawIndexed { .. }
+                    | DxCommand::DrawInstanced { .. }
+                    | DxCommand::DrawIndexedInstanced { .. }
+            )
+        {
+            let mut text = format!("{command:?}");
+            text.truncate(200);
+            crate::log!("dump command: {text}");
+        }
         match *command {
             DxCommand::ClearRenderTargetView { view, color } => {
                 let Some(Object::RenderTargetView(target, range)) =
@@ -607,7 +647,8 @@ impl Gpu {
             | DxCommand::DrawIndexed { .. }
             | DxCommand::DrawInstanced { .. }
             | DxCommand::DrawIndexedInstanced { .. }
-            | DxCommand::DrawIndirect { .. } => self.draw(command, context, gb, guest)?,
+            | DxCommand::DrawIndirect { .. }
+            | DxCommand::DrawAuto => self.draw(command, context, gb, guest)?,
             DxCommand::Dispatch { .. } | DxCommand::DispatchIndirect { .. } => {
                 self.dispatch(command, context, gb, guest)?;
             }
@@ -930,17 +971,20 @@ impl Gpu {
                     indexed,
                 }
             }
+            DxCommand::DrawAuto => {
+                // What stream output last wrote to the buffer of slot 0.
+                let vb = b.vertex_buffers[0];
+                if vb.sid == INVALID_ID {
+                    return Ok(());
+                }
+                self.sync_gpu(gb, guest, vb.sid)?;
+                Call::Auto {
+                    sid: vb.sid,
+                    stride: vb.stride,
+                }
+            }
             _ => return Err("not a draw".into()),
         };
-        // What is not drawn yet.
-        for (stage, name) in [(3, "hull"), (4, "domain")] {
-            if b.stages[stage].shader != INVALID_ID {
-                return Err(format!("{name} shaders are not supported yet"));
-            }
-        }
-        if b.so_targets.iter().any(|t| t.sid != INVALID_ID) {
-            return Err("stream output is not supported yet".into());
-        }
         let vs_id = b.stages[0].shader;
         if vs_id == INVALID_ID {
             return Err("draw without a vertex shader".into());
@@ -997,6 +1041,59 @@ impl Gpu {
             INVALID_ID => None,
             view => Some(depth_target(context, view)?),
         };
+        // Dual-source blending: the pixel shader's o1 feeds target 0's
+        // blend.
+        if let Some(Object::BlendState(state)) = context.object(dx::cotable::BLENDSTATE, b.blend.0)
+        {
+            let t = state.targets[0];
+            ps_options.dual_source = t.enable
+                && [t.src, t.dest, t.src_alpha, t.dest_alpha]
+                    .into_iter()
+                    .any(svga_render::dual_source);
+        }
+        // Stream output: captured by the last stage before the rasterizer.
+        let mut gs_options = Options::default();
+        let mut ds_options = Options::default();
+        let stream_output = match b.stream_output {
+            INVALID_ID => None,
+            id => {
+                let Some(Object::StreamOutput(object)) =
+                    context.object(dx::cotable::STREAMOUTPUT, id)
+                else {
+                    return Err(format!("stream output {id} is not defined"));
+                };
+                let (strides, rasterized) = (object.strides, object.rasterized_stream);
+                let decls = context.stream_output_decls(id, gb, guest)?;
+                let options = if b.stages[2].shader != INVALID_ID {
+                    &mut gs_options
+                } else if b.stages[4].shader != INVALID_ID {
+                    &mut ds_options
+                } else {
+                    &mut vs_options
+                };
+                options.stream_output = captures(&decls);
+                options.so_strides = strides;
+                let mut targets = [None; 4];
+                for (slot, t) in b.so_targets.iter().enumerate().take(4) {
+                    if t.sid == INVALID_ID {
+                        continue;
+                    }
+                    self.sync_gpu(gb, guest, t.sid)?;
+                    // An offset of ~0 appends to what was written before.
+                    let offset = (t.offset != u32::MAX).then_some(u64::from(t.offset));
+                    let size = if t.size == 0 {
+                        u64::MAX
+                    } else {
+                        u64::from(t.size)
+                    };
+                    targets[slot] = Some((t.sid, offset, size));
+                }
+                Some(svga_render::StreamOut {
+                    targets,
+                    rasterize: rasterized == 0,
+                })
+            }
+        };
         let vs = self.shader(context, vs_id, &vs_options)?;
         let ps = match b.stages[1].shader {
             INVALID_ID => None,
@@ -1004,7 +1101,18 @@ impl Gpu {
         };
         let gs = match b.stages[2].shader {
             INVALID_ID => None,
-            id => Some(self.shader(context, id, &Options::default())?),
+            id => Some(self.shader(context, id, &gs_options)?),
+        };
+        // Tessellation: hull and domain shaders go together.
+        let (hs, ds) = match (b.stages[3].shader, b.stages[4].shader) {
+            (INVALID_ID, INVALID_ID) => (None, None),
+            (INVALID_ID, _) | (_, INVALID_ID) => {
+                return Err("a hull shader without a domain shader, or the reverse".into());
+            }
+            (h, d) => (
+                Some(self.shader(context, h, &Options::default())?),
+                Some(self.shader(context, d, &ds_options)?),
+            ),
         };
         // Vertex attributes the shader reads, and their buffer slots.
         let mut attributes: Vec<VertexAttribute> = Vec::new();
@@ -1088,12 +1196,12 @@ impl Gpu {
                 self.sync_gpu(gb, guest, sid)?;
                 Some((sid, format, u64::from(offset)))
             }
-            Call::Draw { .. } | Call::Indirect { indexed: false, .. } => None,
+            Call::Draw { .. } | Call::Indirect { indexed: false, .. } | Call::Auto { .. } => None,
         };
         // Descriptors the shaders use; UA views they may write.
         let mut written = Vec::new();
         let mut resources = self.stage_bindings(context, &vs, 0, gb, guest, &mut written)?;
-        for (shader, stage) in [(&ps, 1), (&gs, 2)] {
+        for (shader, stage) in [(&ps, 1), (&gs, 2), (&hs, 3), (&ds, 4)] {
             if let Some(shader) = shader {
                 resources.extend(self.stage_bindings(
                     context,
@@ -1124,6 +1232,8 @@ impl Gpu {
             vs: &vs,
             ps: ps.as_deref(),
             gs: gs.as_deref(),
+            tessellation: hs.as_deref().zip(ds.as_deref()),
+            stream_output,
             attributes,
             buffers,
             index,
@@ -1141,10 +1251,51 @@ impl Gpu {
             call,
         };
         self.renderer.draw(&draw).map_err(|e| e.to_string())?;
+        if self.dump_recording() && matches!(call, Call::Draw { vertices, .. } if vertices <= 6) {
+            let ps_hash = context
+                .shader_code(b.stages[1].shader)
+                .map_or(0, |c| dump::code_hash(c));
+            let textures: Vec<String> = b.stages[1]
+                .resources
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(slot, &id)| match context.object(dx::cotable::SRVIEW, id) {
+                        Some(Object::ShaderResourceView(t, range)) => {
+                            Some(format!("t{slot}=s{}/f{}/{range:?}", t.sid, t.format))
+                        }
+                        _ => None,
+                    },
+                )
+                .collect();
+            let constants: Vec<String> = b.stages[1]
+                .constant_buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, cb)| cb.sid != INVALID_ID)
+                .map(|(slot, cb)| format!("cb{slot}=s{}+{}:{}", cb.sid, cb.offset, cb.size))
+                .collect();
+            crate::log!(
+                "dump draw: targets {:?} depth {:?} ps {ps_hash:016x} {} {} blend {:?}",
+                targets
+                    .iter()
+                    .flatten()
+                    .map(|t| (t.sid, t.format))
+                    .collect::<Vec<_>>(),
+                depth.map(|t| t.sid),
+                textures.join(" "),
+                constants.join(" "),
+                blend.targets[0],
+            );
+        }
+        self.dump_draw(targets.iter().flatten().map(|t| (t.sid, t.format)));
         for sid in targets.iter().flatten().chain(depth.iter()).map(|t| t.sid) {
             self.gpu_wrote(sid);
         }
         for sid in written {
+            self.gpu_wrote(sid);
+        }
+        for (sid, ..) in stream_output.iter().flat_map(|s| s.targets).flatten() {
             self.gpu_wrote(sid);
         }
         Ok(())

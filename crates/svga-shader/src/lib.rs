@@ -14,7 +14,9 @@ pub mod translate;
 
 pub use decode::{DecodeError, Program, Stage, decode};
 pub use spirv::Scalar;
-pub use translate::{Binding, BindingKind, Options, Shader, TranslateError, binding, translate};
+pub use translate::{
+    Binding, BindingKind, Capture, Options, Shader, TranslateError, binding, translate,
+};
 
 /// Decodes then translates a shader's words (its code; anything after the
 /// program's length, such as the VMware signature block, is ignored).

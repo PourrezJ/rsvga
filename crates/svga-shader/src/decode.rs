@@ -152,6 +152,65 @@ pub struct Program {
     pub minor: u8,
     /// Declarations and instructions, in order.
     pub instructions: Vec<Instruction>,
+    /// The signatures VMware's driver appends after the program, if any.
+    pub signatures: Signatures,
+}
+
+/// An element of a signature (`SVGA3dDXSignatureEntry`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignatureEntry {
+    /// Register.
+    pub register: u32,
+    /// System value (`D3D10_SB_NAME`; 0: none).
+    pub name: u32,
+    /// Components (bit 0: x).
+    pub mask: u32,
+}
+
+/// The input, output and patch constant signatures of a program.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Signatures {
+    /// Inputs.
+    pub inputs: Vec<SignatureEntry>,
+    /// Outputs.
+    pub outputs: Vec<SignatureEntry>,
+    /// Patch constants (hull and domain shaders).
+    pub patch: Vec<SignatureEntry>,
+}
+
+/// `SVGADX_SIGNATURE_HEADER_VERSION_0`.
+const SIGNATURE_HEADER: u32 = 0x08a9_2d12;
+/// Most entries of one signature (Direct3D: 32 registers, plus system
+/// values).
+const MAX_SIGNATURE_ENTRIES: u32 = 64;
+
+/// The signature block at the start of `words`, if it is one and whole.
+fn signatures(words: &[u32]) -> Signatures {
+    let [header, inputs, outputs, patch, rest @ ..] = words else {
+        return Signatures::default();
+    };
+    if *header != SIGNATURE_HEADER
+        || [*inputs, *outputs, *patch]
+            .iter()
+            .any(|&n| n > MAX_SIGNATURE_ENTRIES)
+    {
+        return Signatures::default();
+    }
+    let mut entries = rest.chunks_exact(5).map(|e| SignatureEntry {
+        register: e[0],
+        name: e[1],
+        mask: e[2],
+    });
+    let mut take =
+        |n: u32| -> Option<Vec<SignatureEntry>> { (0..n).map(|_| entries.next()).collect() };
+    match (take(*inputs), take(*outputs), take(*patch)) {
+        (Some(inputs), Some(outputs), Some(patch)) => Signatures {
+            inputs,
+            outputs,
+            patch,
+        },
+        _ => Signatures::default(),
+    }
 }
 
 /// Why a program cannot be decoded.
@@ -399,6 +458,7 @@ pub fn decode(words: &[u32]) -> Result<Program, DecodeError> {
         major,
         minor,
         instructions,
+        signatures: signatures(words.get(length..).unwrap_or_default()),
     })
 }
 

@@ -13,7 +13,9 @@
 # (d3d9trace: what the Direct3D 9 runtime asks the driver), retrace (the
 # same, with the display mode formats rewritten), modes (resolution
 # changes and back), reboot (restarts Windows: nothing to wait for),
-# videoprobe (video processor blits, to decode the driver's commands).
+# videoprobe (video processor blits, to decode the driver's commands),
+# heaven (installs Unigine Heaven), heavenrun and heaveneleven (two minutes
+# of Heaven in Direct3D 9, or in Direct3D 11 with tessellation).
 #
 # The script waits for the desktop (unless --now), opens Win+R, types
 # D:\NAME.cmd through the QEMU monitor and waits up to SECONDS (default
@@ -50,7 +52,7 @@ case $name in
   run) tool=d3dtest done='d3dtest: summary\|d3dtest: FAIL setup' ;;
   probe) tool=d3dprobe done='d3dprobe: done' ;;
   info) tool=wininfo done='wininfo: --- end' ;;
-  diag | events | dxg | heaven | heavenrun) tool=hostcat done='hostcat: --- end\|hostcat: cannot' ;;
+  diag | events | dxg | heaven | heavenrun | heaveneleven) tool=hostcat done='hostcat: --- end\|hostcat: cannot' ;;
   umd) tool=umdcaps done='umdcaps: --- end' ;;
   trace | retrace) tool=d3d9trace done='d3d9trace: --- end' ;;
   ninetest) tool=d3d9test done='d3d9test: summary\|d3d9test: FAIL setup' ;;

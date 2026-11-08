@@ -20,7 +20,7 @@ Ce qui sert à travailler sur rsvga : tests, fuzzing, lancement à la main, outi
 cargo test --workspace
 ```
 
-189 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout. Sans GPU Vulkan, les tests du moteur se sautent eux-mêmes.
+196 tests, dont un test de stress sur 20 000 FIFO aléatoires et une session vfio-user de bout en bout. Sans GPU Vulkan, les tests du moteur se sautent eux-mêmes.
 
 Fuzzing avec libFuzzer, sur la toolchain stable (ni cargo-fuzz ni nightly). Cibles : `fifo`, `decode`, `dx`, `shader`, `nine`.
 
@@ -79,6 +79,9 @@ Côté QEMU, la RAM de l'invité doit être partagée (memfd), et la carte s'ajo
 | `RSVGA_TRACE=1` | Journalise chaque accès aux registres, chaque commande et l'état de la FIFO toutes les 5 secondes ; `2` ajoute les accès bruts ; `0` rend le serveur silencieux. |
 | `RSVGA_PROFILE=1` | Journalise où va le temps, GPU compris. |
 | `RSVGA_SYNC_BUFFERS=1` | Exécute chaque command buffer pendant l'écriture de registre de l'invité, sans fil de travail (diagnostic). |
+| `RSVGA_PROBE_DEVCAPS="258=0"` | Retire le shader model 5 : Windows reste au niveau 10_1 (les variables `RSVGA_PROBE_*` servent à sonder le pilote). |
+| `RSVGA_SHADER_DUMP=DIR` | Enregistre chaque shader lié, tel que l'invité l'envoie (`DIR/<étage>-<hachage>.vgpu10`) ; les tests du traducteur valident tout `target/shaders/*`. |
+| `RSVGA_DUMP_TARGETS=DIR` | Dès que le fichier `DIR/go` existe, enregistre en PNG chaque cible de rendu dessinée pendant une seconde et demie (les NaN en magenta), et journalise les passes plein écran : de quoi voir quelle passe d'un rendu se trompe. |
 
 ## Outils de test dans Windows
 
@@ -102,4 +105,4 @@ Avec la VM lancée (`--diagnose --guest-tools`), `scripts/guest-run.sh` tape la 
 scripts/guest-run.sh run
 ```
 
-Commandes : `run` (d3dtest), `ninetest` (d3d9test), `diag` (dxdiag), `probe`, `info`, `events` (dernières erreurs), `umd`, `trace`, `nine` (d3dprobe avec le journal du pilote D3D9 de débogage), `modes`, `videoprobe`, `reboot`, `heaven` puis `heavenrun` (Unigine Heaven en Direct3D 9, si son installateur est dans `target/unigine/download`), et en `--admin`, `dxg` et `events` (canaux du noyau graphique).
+Commandes : `run` (d3dtest), `ninetest` (d3d9test), `diag` (dxdiag), `probe`, `info`, `events` (dernières erreurs), `umd`, `trace`, `nine` (d3dprobe avec le journal du pilote D3D9 de débogage), `modes`, `videoprobe`, `reboot`, `heaven` puis `heavenrun` ou `heaveneleven` (Unigine Heaven en Direct3D 9, ou en Direct3D 11 avec la tessellation, si son installateur est dans `target/unigine/download`), et en `--admin`, `dxg` et `events` (canaux du noyau graphique).

@@ -174,6 +174,14 @@ pub enum Call {
         /// First instance.
         first_instance: u32,
     },
+    /// As many vertices as stream output last wrote to buffer surface
+    /// `sid` (`DrawAuto`), of `stride` bytes.
+    Auto {
+        /// Buffer surface.
+        sid: u32,
+        /// Bytes per vertex.
+        stride: u32,
+    },
     /// Arguments read from a buffer surface at a byte offset: those of
     /// `Draw`, or of `Indexed` if `indexed` (Direct3D's indirect argument
     /// layouts are Vulkan's).
@@ -185,6 +193,24 @@ pub enum Call {
         /// Indexed draw.
         indexed: bool,
     },
+}
+
+/// Stream output of a draw (transform feedback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamOut {
+    /// Buffers of slots 0 to 3: surface, byte offset to start at (`None`:
+    /// after what the last capture to it wrote), bytes.
+    pub targets: [Option<(u32, Option<u64>, u64)>; 4],
+    /// Stream 0 goes to the rasterizer too.
+    pub rasterize: bool,
+}
+
+/// What a stream-output draw binds: buffers by slot, and the counters
+/// its capture starts from (null: from the bound offset) and ends in.
+struct XfbBindings {
+    buffers: Vec<(u32, vk::Buffer, u64, u64)>,
+    begin: Vec<vk::Buffer>,
+    end: Vec<vk::Buffer>,
 }
 
 /// The attachments of an open rendering: a draw with the same ones (that
@@ -208,6 +234,10 @@ pub struct Draw<'a> {
     pub ps: Option<&'a Shader>,
     /// Geometry shader.
     pub gs: Option<&'a Shader>,
+    /// Hull and domain shaders (tessellation), together.
+    pub tessellation: Option<(&'a Shader, &'a Shader)>,
+    /// Stream output.
+    pub stream_output: Option<StreamOut>,
     /// Input layout.
     pub attributes: Vec<VertexAttribute>,
     /// Vertex buffers of the slots the attributes use.
@@ -304,31 +334,37 @@ impl Key {
     }
 }
 
-fn blend_factor(f: u8) -> vk::BlendFactor {
+pub(crate) fn blend_factor(f: u8) -> vk::BlendFactor {
     use vk::BlendFactor as B;
-    // `D3D10_BLEND` (= `SVGA3dBlendOp`); color factors read alpha in alpha
-    // blending, as in Vulkan.
+    // `SVGA3dBlendOp` (from 12 on, not `D3D10_BLEND`'s numbers); color
+    // factors read alpha in alpha blending, as in Vulkan.
     match f {
         1 => B::ZERO,
         3 => B::SRC_COLOR,
         4 => B::ONE_MINUS_SRC_COLOR,
-        5 | 12 => B::SRC_ALPHA,
-        6 | 13 => B::ONE_MINUS_SRC_ALPHA,
+        5 => B::SRC_ALPHA,
+        6 => B::ONE_MINUS_SRC_ALPHA,
         7 => B::DST_ALPHA,
         8 => B::ONE_MINUS_DST_ALPHA,
         9 => B::DST_COLOR,
         10 => B::ONE_MINUS_DST_COLOR,
         11 => B::SRC_ALPHA_SATURATE,
-        14 => B::CONSTANT_COLOR,
-        15 => B::ONE_MINUS_CONSTANT_COLOR,
-        16 => B::SRC1_COLOR,
-        17 => B::ONE_MINUS_SRC1_COLOR,
-        18 => B::SRC1_ALPHA,
-        19 => B::ONE_MINUS_SRC1_ALPHA,
-        20 => B::CONSTANT_ALPHA,
-        21 => B::ONE_MINUS_CONSTANT_ALPHA,
+        12 => B::CONSTANT_COLOR,
+        13 => B::ONE_MINUS_CONSTANT_COLOR,
+        14 => B::SRC1_COLOR,
+        15 => B::ONE_MINUS_SRC1_COLOR,
+        16 => B::SRC1_ALPHA,
+        17 => B::ONE_MINUS_SRC1_ALPHA,
+        18 => B::CONSTANT_ALPHA,
+        19 => B::ONE_MINUS_CONSTANT_ALPHA,
         _ => B::ONE,
     }
+}
+
+/// Whether a blend factor (`SVGA3dBlendOp`) reads the second color of a
+/// pixel shader (dual-source blending).
+pub fn dual_source(f: u8) -> bool {
+    (14..=17).contains(&f)
 }
 
 /// `SVGA3D_BLENDEQ_*`, `SVGA3D_COMPARISON_*`, `SVGA3D_STENCILOP_*`,
@@ -356,6 +392,8 @@ fn topology(t: u32) -> Option<(vk::PrimitiveTopology, bool)> {
         8 => (P::LINE_STRIP_WITH_ADJACENCY, true),
         9 => (P::TRIANGLE_LIST_WITH_ADJACENCY, false),
         10 => (P::TRIANGLE_STRIP_WITH_ADJACENCY, true),
+        // 1 to 32 control point patches.
+        11..=42 => (P::PATCH_LIST, false),
         _ => return None,
     })
 }
@@ -446,6 +484,12 @@ impl Renderer {
     ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), Error> {
         let stages: Vec<(&Shader, vk::ShaderStageFlags)> =
             std::iter::once((draw.vs, vk::ShaderStageFlags::VERTEX))
+                .chain(draw.tessellation.into_iter().flat_map(|(hs, ds)| {
+                    [
+                        (hs, vk::ShaderStageFlags::TESSELLATION_CONTROL),
+                        (ds, vk::ShaderStageFlags::TESSELLATION_EVALUATION),
+                    ]
+                }))
                 .chain(draw.gs.map(|gs| (gs, vk::ShaderStageFlags::GEOMETRY)))
                 .chain(draw.ps.map(|ps| (ps, vk::ShaderStageFlags::FRAGMENT)))
                 .collect();
@@ -496,6 +540,18 @@ impl Renderer {
     }
 
     fn view_format(&self, format: u32) -> Result<(vk::Format, vk::ImageAspectFlags), Error> {
+        // Views of a depth-stencil image that read its stencil, or its
+        // depth: they take the image's stored format (see `image_view`).
+        use svga_proto::format as sf;
+        match format {
+            sf::X24_G8_UINT | sf::X32_G8X24_UINT => {
+                return Ok((vk::Format::S8_UINT, vk::ImageAspectFlags::STENCIL));
+            }
+            sf::R24_UNORM_X8 | sf::R32_FLOAT_X8X24 => {
+                return Ok((vk::Format::R32_SFLOAT, vk::ImageAspectFlags::COLOR));
+            }
+            _ => {}
+        }
         match format::kind(format, self.d24s8, self.a8) {
             Some(Kind::Color(f)) => Ok((f, vk::ImageAspectFlags::COLOR)),
             Some(Kind::Depth(f) | Kind::DepthConverted(f)) => {
@@ -541,6 +597,12 @@ impl Renderer {
             && aspect == vk::ImageAspectFlags::COLOR
         {
             (stored, vk::ImageAspectFlags::DEPTH)
+        } else if aspect == vk::ImageAspectFlags::STENCIL {
+            // A stencil view (`X24_G8_UINT`) of a depth-stencil image.
+            if !stored_aspect.contains(vk::ImageAspectFlags::STENCIL) {
+                return err(format!("surface {sid} has no stencil"));
+            }
+            (stored, vk::ImageAspectFlags::STENCIL)
         } else {
             (format, aspect)
         };
@@ -953,7 +1015,19 @@ impl Renderer {
             )?;
         }
         if extent.0 == u32::MAX {
-            return err("draw without targets");
+            // No attachment (stream output, UA views only): the viewports'
+            // area.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let edge = |x: f32| {
+                if x.is_finite() && x > 1.0 {
+                    x.min(16_384.0).ceil() as u32
+                } else {
+                    1
+                }
+            };
+            extent = draw.viewports.iter().fold((1, 1), |(w, h), v| {
+                (w.max(edge(v.x + v.width)), h.max(edge(v.y + v.height)))
+            });
         }
         let (_, pipeline_layout) = self.layout(draw)?;
         let pipeline = self.pipeline(
@@ -986,10 +1060,21 @@ impl Renderer {
             }
             _ => false,
         });
+        // Stream output's counters exist before the rendering begins.
+        let xfb = match draw.stream_output {
+            Some(so) => Some(self.xfb_bindings(&so)?),
+            None => None,
+        };
+        let auto = match draw.call {
+            Call::Auto { sid, .. } => Some(self.so_counter(sid)?),
+            _ => None,
+        };
         let continues = self.pass.as_ref() == Some(&pass)
             && self.recording
             && !reads_attachment
-            && draw.occlusion.is_none();
+            && draw.occlusion.is_none()
+            && xfb.is_none()
+            && auto.is_none();
         let cmd = if continues { self.cmd } else { self.barrier()? };
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = color_views[..used_targets]
             .iter()
@@ -1130,6 +1215,23 @@ impl Renderer {
                     Some(&[u64::from(vb.stride)]),
                 );
             }
+            let xfb_device = self.xfb.as_ref();
+            if let (Some(x), Some(dev)) = (&xfb, xfb_device) {
+                let fp = dev.fp();
+                for &(slot, buffer, offset, size) in &x.buffers {
+                    (fp.cmd_bind_transform_feedback_buffers_ext)(
+                        cmd, slot, 1, &buffer, &offset, &size,
+                    );
+                }
+                let offsets = vec![0u64; x.begin.len()];
+                (fp.cmd_begin_transform_feedback_ext)(
+                    cmd,
+                    0,
+                    u32::try_from(x.begin.len()).unwrap_or(0),
+                    x.begin.as_ptr(),
+                    offsets.as_ptr(),
+                );
+            }
             match draw.call {
                 Call::Draw {
                     vertices,
@@ -1139,6 +1241,13 @@ impl Renderer {
                 } => self
                     .device
                     .cmd_draw(cmd, vertices, instances, first_vertex, first_instance),
+                Call::Auto { stride, .. } => {
+                    if let (Some(counter), Some(dev)) = (auto, xfb_device) {
+                        (dev.fp().cmd_draw_indirect_byte_count_ext)(
+                            cmd, 1, 0, counter, 0, 0, stride,
+                        );
+                    }
+                }
                 Call::Indirect {
                     sid,
                     offset,
@@ -1183,13 +1292,25 @@ impl Renderer {
                             self.device
                                 .cmd_draw_indexed_indirect(cmd, args, offset, 1, 0);
                         }
-                        Call::Draw { .. } => {}
+                        Call::Draw { .. } | Call::Auto { .. } => {}
                     }
                 }
             }
+            if let (Some(x), Some(dev)) = (&xfb, xfb_device) {
+                let offsets = vec![0u64; x.end.len()];
+                (dev.fp().cmd_end_transform_feedback_ext)(
+                    cmd,
+                    0,
+                    u32::try_from(x.end.len()).unwrap_or(0),
+                    x.end.as_ptr(),
+                    offsets.as_ptr(),
+                );
+            }
             if let Some((pool, slot)) = occlusion {
                 self.device.cmd_end_query(cmd, pool, slot);
-                // A query's draw stands alone.
+            }
+            // A query's draw, a capture and an automatic draw stand alone.
+            if occlusion.is_some() || xfb.is_some() || auto.is_some() {
                 self.device.cmd_end_rendering(cmd);
                 self.pass = None;
             }
@@ -1197,9 +1318,82 @@ impl Renderer {
         Ok(())
     }
 
+    /// The stream-output counter of buffer surface `sid`, made (at 0)
+    /// when first needed.
+    fn so_counter(&mut self, sid: u32) -> Result<vk::Buffer, Error> {
+        if let Some((buffer, _)) = self.surfaces.get(&sid).and_then(|s| s.counter) {
+            return Ok(buffer);
+        }
+        self.buffer(sid)?;
+        use vk::BufferUsageFlags as U;
+        let info = vk::BufferCreateInfo::default()
+            .size(4)
+            .usage(U::TRANSFORM_FEEDBACK_COUNTER_BUFFER_EXT | U::INDIRECT_BUFFER | U::TRANSFER_DST);
+        // SAFETY: a valid create info on a live device.
+        let buffer = unsafe { self.device.create_buffer(&info, None) }?;
+        // SAFETY: a buffer of this device.
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let memory = match self.allocate(requirements, &[vk::MemoryPropertyFlags::DEVICE_LOCAL]) {
+            Ok(m) => m,
+            Err(e) => {
+                // SAFETY: unused buffer.
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        };
+        // SAFETY: fresh memory sized for the buffer.
+        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
+        if let Some(s) = self.surfaces.get_mut(&sid) {
+            s.counter = Some((buffer, memory));
+        }
+        let cmd = self.cmd()?;
+        // SAFETY: recording outside any rendering; the whole live buffer.
+        unsafe { self.device.cmd_fill_buffer(cmd, buffer, 0, 4, 0) };
+        Ok(buffer)
+    }
+
+    /// The buffers and counters of a stream-output draw.
+    fn xfb_bindings(&mut self, so: &StreamOut) -> Result<XfbBindings, Error> {
+        if self.xfb.is_none() {
+            return err(format!("{} has no transform feedback", self.name));
+        }
+        let slots = so
+            .targets
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |i| i.saturating_add(1));
+        let mut bindings = XfbBindings {
+            buffers: Vec::new(),
+            begin: vec![vk::Buffer::null(); slots],
+            end: vec![vk::Buffer::null(); slots],
+        };
+        for (slot, target) in so.targets.iter().enumerate().take(slots) {
+            let Some((sid, offset, size)) = *target else {
+                continue;
+            };
+            let Ok((buffer, total)) = self.buffer(sid) else {
+                continue;
+            };
+            let counter = self.so_counter(sid)?;
+            let start = offset.unwrap_or(0).min(total) & !3;
+            let size = size.min(total.saturating_sub(start)) & !3;
+            if size == 0 {
+                continue;
+            }
+            let slot32 = u32::try_from(slot).unwrap_or(0);
+            bindings.buffers.push((slot32, buffer, start, size));
+            if offset.is_none() {
+                bindings.begin[slot] = counter;
+            }
+            bindings.end[slot] = counter;
+        }
+        Ok(bindings)
+    }
+
     /// Descriptor writes of a draw, with null resources for empty slots.
     fn descriptors(&mut self, draw: &Draw<'_>) -> Result<Vec<Write>, Error> {
         let shaders: Vec<&Shader> = std::iter::once(draw.vs)
+            .chain(draw.tessellation.into_iter().flat_map(|(hs, ds)| [hs, ds]))
             .chain(draw.gs)
             .chain(draw.ps)
             .collect();
@@ -1448,6 +1642,10 @@ impl Renderer {
         let vs = self.module(draw.vs)?;
         let ps = draw.ps.map(|ps| self.module(ps)).transpose()?;
         let gs = draw.gs.map(|gs| self.module(gs)).transpose()?;
+        let tessellation = match draw.tessellation {
+            Some((hs, ds)) => Some((self.module(hs)?, self.module(ds)?)),
+            None => None,
+        };
         let r = &draw.rasterizer;
         let (ds, _) = &draw.depth_stencil;
         let (blend, _, sample_mask) = &draw.blend;
@@ -1456,6 +1654,10 @@ impl Renderer {
         key.u64(shader_hash(draw.vs))
             .u64(draw.ps.map_or(0, shader_hash))
             .u64(draw.gs.map_or(0, shader_hash))
+            .u64(draw.tessellation.map_or(0, |(hs, _)| shader_hash(hs)))
+            .u64(draw.tessellation.map_or(0, |(_, ds)| shader_hash(ds)))
+            .u32(draw.topology)
+            .u32(u32::from(draw.stream_output.is_some_and(|s| !s.rasterize)))
             .u64(layout.as_raw())
             .u32(u32::try_from(topology.as_raw()).unwrap_or(0))
             .u32(u32::from(restart));
@@ -1560,6 +1762,7 @@ impl Renderer {
         let viewport = vk::PipelineViewportStateCreateInfo::default();
         let depth_bias = r.depth_bias != 0 || r.slope_scaled_depth_bias != 0.0;
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .rasterizer_discard_enable(draw.stream_output.is_some_and(|s| !s.rasterize))
             .depth_clamp_enable(!r.depth_clip && self.features.depth_clamp)
             .polygon_mode(match r.fill_mode {
                 1 => vk::PolygonMode::POINT,
@@ -1652,6 +1855,19 @@ impl Renderer {
                 .module(vs)
                 .name(c"main"),
         ];
+        if let Some((hs, ds)) = tessellation {
+            for (stage, module) in [
+                (vk::ShaderStageFlags::TESSELLATION_CONTROL, hs),
+                (vk::ShaderStageFlags::TESSELLATION_EVALUATION, ds),
+            ] {
+                stages.push(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(stage)
+                        .module(module)
+                        .name(c"main"),
+                );
+            }
+        }
         if let Some(gs) = gs {
             stages.push(
                 vk::PipelineShaderStageCreateInfo::default()
@@ -1660,6 +1876,12 @@ impl Renderer {
                     .name(c"main"),
             );
         }
+        // Patches of the topology's control points (11: 1, ..., 42: 32).
+        let mut domain_origin = vk::PipelineTessellationDomainOriginStateCreateInfo::default()
+            .domain_origin(vk::TessellationDomainOrigin::UPPER_LEFT);
+        let tessellation_state = vk::PipelineTessellationStateCreateInfo::default()
+            .patch_control_points(draw.topology.saturating_sub(10).max(1))
+            .push_next(&mut domain_origin);
         if let Some(ps) = ps {
             stages.push(
                 vk::PipelineShaderStageCreateInfo::default()
@@ -1680,6 +1902,11 @@ impl Renderer {
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic)
             .layout(layout);
+        let info = if tessellation.is_some() {
+            info.tessellation_state(&tessellation_state)
+        } else {
+            info
+        };
         // SAFETY: a complete create info with live modules and layout.
         let pipeline = unsafe {
             self.device
@@ -1935,6 +2162,16 @@ fn default_sampler() -> SamplerState {
 /// textures read their depth in every component.
 fn swizzle(format: u32) -> vk::ComponentMapping {
     use svga_proto::format as f;
+    if matches!(format, f::X24_G8_UINT | f::X32_G8X24_UINT) {
+        // Direct3D reads the stencil in y; Vulkan gives it in x.
+        let r = vk::ComponentSwizzle::R;
+        return vk::ComponentMapping {
+            r,
+            g: r,
+            b: vk::ComponentSwizzle::ZERO,
+            a: vk::ComponentSwizzle::ONE,
+        };
+    }
     if matches!(
         format,
         f::Z_D16 | f::Z_D24S8 | f::Z_D24X8 | f::Z_DF16 | f::Z_DF24 | f::Z_D24S8_INT

@@ -33,6 +33,7 @@ pub mod op {
     pub const CONSTANT_COMPOSITE: u16 = 44;
     pub const FUNCTION: u16 = 54;
     pub const FUNCTION_END: u16 = 56;
+    pub const FUNCTION_CALL: u16 = 57;
     pub const VARIABLE: u16 = 59;
     pub const LOAD: u16 = 61;
     pub const STORE: u16 = 62;
@@ -44,6 +45,7 @@ pub mod op {
     pub const VECTOR_SHUFFLE: u16 = 79;
     pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const COMPOSITE_INSERT: u16 = 82;
     pub const SAMPLED_IMAGE: u16 = 86;
     pub const IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
@@ -197,6 +199,11 @@ pub struct Module {
     pub code: Vec<u32>,
     /// Variables of the function, emitted in its first block.
     pub locals: Vec<u32>,
+    /// Other functions, finished (`void()`, called by the entry point).
+    functions: Vec<u32>,
+    /// The bodies and variables of the functions being built under the
+    /// current one.
+    outer: Vec<(Vec<u32>, Vec<u32>, u32)>,
     types: HashMap<TypeKey, u32>,
     constants: HashMap<(u32, Vec<u32>), u32>,
     glsl: u32,
@@ -475,6 +482,47 @@ impl Module {
         self.emit(op::EXT_INST, ty, &all)
     }
 
+    /// Starts another `void()` function: the body and variables emitted
+    /// from here are its own until [`Self::end_function`]. Returns its ID,
+    /// for `OpFunctionCall`.
+    pub fn start_function(&mut self) -> u32 {
+        let function = self.id();
+        let code = std::mem::take(&mut self.code);
+        let locals = std::mem::take(&mut self.locals);
+        self.outer.push((code, locals, function));
+        let label = self.id();
+        self.emit_void(op::LABEL, &[label]);
+        function
+    }
+
+    /// Ends the function [`Self::start_function`] started (its body must
+    /// end with a terminator), back to the enclosing one.
+    pub fn end_function(&mut self) {
+        let Some((code, locals, function)) = self.outer.pop() else {
+            return;
+        };
+        let void = self.void();
+        let fn_ty = self.function_type();
+        let body = std::mem::replace(&mut self.code, code);
+        let variables = std::mem::replace(&mut self.locals, locals);
+        push(
+            &mut self.functions,
+            op::FUNCTION,
+            &[void, function, 0, fn_ty],
+        );
+        let (label, rest) = body.split_at(2.min(body.len()));
+        self.functions.extend(label);
+        self.functions.extend(&variables);
+        self.functions.extend(rest);
+        push(&mut self.functions, op::FUNCTION_END, &[]);
+    }
+
+    /// Calls a function of [`Self::start_function`].
+    pub fn call(&mut self, function: u32) {
+        let void = self.void();
+        self.emit(op::FUNCTION_CALL, void, &[function]);
+    }
+
     /// The finished module (`function`: the entry point's ID; `body`:
     /// starts with its first label).
     pub fn finish(mut self, function: u32) -> Vec<u32> {
@@ -496,6 +544,7 @@ impl Module {
         words.extend(&self.locals);
         words.extend(rest);
         push(&mut words, op::FUNCTION_END, &[]);
+        words.extend(&self.functions);
         words[3] = self.next;
         words
     }

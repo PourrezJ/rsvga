@@ -318,6 +318,8 @@ fn a_triangle_is_drawn_upright_with_its_constants() {
         vs: &vs,
         ps: Some(&ps),
         gs: None,
+        tessellation: None,
+        stream_output: None,
         attributes: vec![
             VertexAttribute {
                 location: 0,
@@ -506,6 +508,8 @@ fn an_indexed_textured_quad_behind_and_in_front_of_depth() {
         vs: &vs,
         ps: Some(&ps),
         gs: None,
+        tessellation: None,
+        stream_output: None,
         attributes: vec![
             VertexAttribute {
                 location: 0,
@@ -655,6 +659,8 @@ fn a_pixel_shader_reads_a_buffer_view() {
         vs: &vs,
         ps: Some(&ps),
         gs: None,
+        tessellation: None,
+        stream_output: None,
         attributes: vec![attribute(0, 0), attribute(1, 16)],
         buffers: vec![VertexBuffer {
             binding: 0,
@@ -863,4 +869,143 @@ fn a_compute_shader_writes_a_buffer_directly_and_indirectly() {
     let mut want: Vec<u32> = (0..12).collect();
     want.extend([u32::MAX; 4]);
     assert_eq!(words, want, "12 threads on {}", r.name());
+}
+
+#[test]
+fn stream_output_captures_without_targets_then_appends() {
+    use svga_shader::opcode as op;
+    use tokens::*;
+    let Some(mut r) = renderer() else { return };
+    // vs: o0 (position) = v0, o1 = v1; o1.xy captured to buffer 0.
+    let o = operand(2, ALL, 1);
+    let words = program(
+        1,
+        &[
+            instr(op::DCL_INPUT, &[operand(1, ALL, 1), 0]),
+            instr(op::DCL_INPUT, &[operand(1, ALL, 1), 1]),
+            instr(op::DCL_OUTPUT_SIV, &[o, 0, 1]),
+            instr(op::DCL_OUTPUT, &[o, 1]),
+            instr(op::MOV, &[o, 0, operand(1, SWZ, 1), 0]),
+            instr(op::MOV, &[o, 1, operand(1, SWZ, 1), 1]),
+            instr(op::RET, &[]),
+        ],
+    );
+    let options = svga_shader::Options {
+        stream_output: vec![svga_shader::Capture {
+            buffer: 0,
+            register: 1,
+            mask: 0x3,
+            offset: 0,
+        }],
+        so_strides: [8, 0, 0, 0],
+        ..svga_shader::Options::default()
+    };
+    let vs = svga_shader::translate_words(&words, &options).unwrap();
+    let mut vertices = Vec::new();
+    for v in [1.0f32, 2.0, 3.0] {
+        vertices.extend(floats(&[0.0, 0.0, 0.0, 1.0, v, -v, 0.0, 0.0]));
+    }
+    r.create(1, &layout(format::BUFFER, 96, 1, 1, 1), 0)
+        .unwrap();
+    r.upload(1, &vertices).unwrap();
+    r.create(2, &layout(format::BUFFER, 64, 1, 1, 1), 0)
+        .unwrap();
+    r.upload(2, &[0xff; 64]).unwrap();
+    let float4 = format::R32G32B32A32_FLOAT;
+    let mut draw = Draw {
+        vs: &vs,
+        ps: None,
+        gs: None,
+        tessellation: None,
+        stream_output: Some(StreamOut {
+            targets: [Some((2, Some(0), 64)), None, None, None],
+            rasterize: false,
+        }),
+        attributes: vec![
+            VertexAttribute {
+                location: 0,
+                binding: 0,
+                format: float4,
+                offset: 0,
+            },
+            VertexAttribute {
+                location: 1,
+                binding: 0,
+                format: float4,
+                offset: 16,
+            },
+        ],
+        buffers: vec![VertexBuffer {
+            binding: 0,
+            sid: Some(1),
+            offset: 0,
+            size: u64::MAX,
+            stride: 32,
+            per_instance: false,
+        }],
+        index: None,
+        topology: 2,
+        rasterizer: default_rasterizer(),
+        depth_stencil: (default_depth_stencil(), 0),
+        blend: (default_blend(), [0.0; 4], u32::MAX),
+        targets: [None; 8],
+        depth: None,
+        viewports: Vec::new(),
+        scissors: Vec::new(),
+        resources: Vec::new(),
+        data: Vec::new(),
+        occlusion: None,
+        call: Call::Draw {
+            vertices: 3,
+            instances: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        },
+    };
+    if let Err(e) = r.draw(&draw) {
+        eprintln!("{} cannot capture: {e}", r.name());
+        return;
+    }
+    // Two more vertices, appended after the first three.
+    draw.stream_output = Some(StreamOut {
+        targets: [Some((2, None, 64)), None, None, None],
+        rasterize: false,
+    });
+    draw.call = Call::Draw {
+        vertices: 2,
+        instances: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    r.draw(&draw).unwrap();
+    let mut back = vec![0u8; 64];
+    r.download(2, &mut back).unwrap();
+    let got: Vec<f32> = back
+        .chunks(4)
+        .take(10)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(
+        got,
+        [1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 1.0, -1.0, 2.0, -2.0],
+        "captures on {}",
+        r.name()
+    );
+    // Untouched past them.
+    assert_eq!(&back[40..44], &[0xff; 4]);
+}
+
+#[test]
+fn blend_factors_follow_svga3d_blendop() {
+    // From 12 on, SVGA3dBlendOp differs from D3D10_BLEND's numbers.
+    use crate::draw::blend_factor;
+    use ash::vk::BlendFactor as B;
+    assert_eq!(blend_factor(6), B::ONE_MINUS_SRC_ALPHA);
+    assert_eq!(blend_factor(12), B::CONSTANT_COLOR);
+    assert_eq!(blend_factor(13), B::ONE_MINUS_CONSTANT_COLOR);
+    assert_eq!(blend_factor(14), B::SRC1_COLOR);
+    assert_eq!(blend_factor(17), B::ONE_MINUS_SRC1_ALPHA);
+    assert_eq!(blend_factor(18), B::CONSTANT_ALPHA);
+    assert_eq!(blend_factor(0), B::ONE, "invalid");
+    assert!(dual_source(14) && dual_source(17) && !dual_source(12) && !dual_source(18));
 }

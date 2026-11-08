@@ -15,7 +15,7 @@
 #       [--kvm-cpu] [--guest-tools] [--guestinfo 'KEY=VALUE;...'] [--no-3d] \
 #       [-- EXTRA QEMU ARGUMENTS...]
 #
-# 3D is on: Direct3D 9, 10 and 11 (feature level 10_1) run on the host GPU
+# 3D is on: Direct3D 9, 10 and 11 (feature level 11_0) run on the host GPU
 # through Vulkan, with VMware's driver in WDDM 2.0. --no-3d (or RSVGA_3D=0)
 # keeps the device 2D: the driver runs display-only and Windows renders 3D
 # in software. Without a Vulkan GPU, rsvga stays 2D by itself.

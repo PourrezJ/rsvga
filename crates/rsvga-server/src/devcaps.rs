@@ -4,8 +4,9 @@
 //! objects) or from a record in the FIFO 3D caps area. Without 3D the table
 //! is empty, so `SVGA3D_DEVCAP_3D` reads 0 everywhere.
 //!
-//! The 3D table describes a DirectX 10.1 device (shader model 4.1), the
-//! level DWM and most DirectX 10/11 programs need. Format support follows
+//! The 3D table describes a DirectX 11 device (shader model 5, feature level
+//! 11_0; `RSVGA_PROBE_DEVCAPS="258=0"` takes shader model 5 away, back to
+//! 10_1). Format support follows
 //! what Direct3D 11 hardware reports (`CheckFormatSupport`), which is also
 //! what a VMware host reports. The VMware drivers check it both ways:
 //!
@@ -332,6 +333,7 @@ const CAPS: &[(u32, u32)] = &[
     (devcap::DX_MAX_CONSTANT_BUFFERS, 14),
     (devcap::DX_PROVOKING_VERTEX, 1),
     (devcap::SM41, 1),
+    (devcap::SM5, 1),
     (devcap::MULTISAMPLE_2X, 1),
     (devcap::MULTISAMPLE_4X, 1),
     (devcap::MS_FULL_QUALITY, 1),
@@ -630,6 +632,37 @@ mod tests {
         (143, 0x1),
         (142, 0x1),
     ];
+
+    /// What feature level 11_0 adds to 10_1 in the same driver's table
+    /// (11_1 asks for the same): 16K textures, BC6H and BC7, shader model 5
+    /// and 8 samples (for the DirectX 11.0 interface and later).
+    const FEATURE_LEVEL_11_0_MORE: &[(u32, u32)] = &[
+        (19, 0x4000),
+        (20, 0x4000),
+        (22, 0x4000),
+        (251, 0xe1),
+        (252, 0xe3),
+        (253, 0xe3),
+        (254, 0xe1),
+        (255, 0xe3),
+        (256, 0xe3),
+        (258, 0x1),
+        (259, 0x1),
+    ];
+
+    #[test]
+    fn the_vmware_driver_gets_feature_level_11_0() {
+        let t = table(true);
+        for &(index, need) in FEATURE_LEVEL_11_0_MORE {
+            let have = t[index as usize];
+            let enough = if (251..=256).contains(&index) {
+                have & need == need
+            } else {
+                have >= need
+            };
+            assert!(enough, "devcap {index}: {have:#x}, needs {need:#x}");
+        }
+    }
 
     #[test]
     fn the_vmware_driver_gets_feature_level_10_1() {

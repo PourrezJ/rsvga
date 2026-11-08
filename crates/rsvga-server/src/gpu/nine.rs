@@ -121,11 +121,11 @@ fn vertex_count(primitive: u32, count: u32) -> Option<u32> {
     })
 }
 
-/// `SVGA3dBlendOp` as `D3D10_BLEND`.
+/// An `SVGA3dBlendOp` render state, as the renderer takes it (invalid
+/// values: one).
 fn blend_factor(op: u32) -> u8 {
     match op {
-        1..=11 => op as u8,
-        12..=19 => (op + 2) as u8,
+        1..=19 => op as u8,
         _ => 2,
     }
 }
@@ -837,6 +837,8 @@ impl Gpu {
             vs: &vs.shader,
             ps: Some(&ps.shader),
             gs: None,
+            tessellation: None,
+            stream_output: None,
             attributes,
             buffers,
             index: None,

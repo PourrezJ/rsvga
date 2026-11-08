@@ -41,6 +41,7 @@ impl Gpu {
         stid: u32,
         rect: Rect,
     ) -> Result<(), String> {
+        self.dump_frame(gb);
         let Some((image, area)) = gb.screen_area(stid, rect)? else {
             return Ok(());
         };

@@ -31,8 +31,8 @@ pub mod format;
 
 pub use compute::{Dispatch, Groups};
 pub use draw::{
-    Bound, Call, Draw, Resource, Target, VertexAttribute, VertexBuffer, default_blend,
-    default_depth_stencil, default_rasterizer,
+    Bound, Call, Draw, Resource, StreamOut, Target, VertexAttribute, VertexBuffer, default_blend,
+    default_depth_stencil, default_rasterizer, dual_source,
 };
 
 use std::collections::HashMap;
@@ -111,6 +111,9 @@ struct Surface {
     views: HashMap<ViewKey, vk::ImageView>,
     /// Buffer views (format, offset, bytes), likewise.
     buffer_views: HashMap<(i32, u64, u64), vk::BufferView>,
+    /// Bytes stream output wrote to the buffer, kept by the GPU (for
+    /// appends and `DrawAuto`), once used.
+    counter: Option<(vk::Buffer, vk::DeviceMemory)>,
 }
 
 struct Staging {
@@ -194,6 +197,8 @@ pub struct Renderer {
     a8: bool,
     features: Features,
     push: Option<ash::khr::push_descriptor::Device>,
+    /// Transform feedback (stream output), if the device has it.
+    xfb: Option<ash::ext::transform_feedback::Device>,
     draw: draw::Caches,
     /// The occlusion query pool and the slots in use.
     occlusion: Option<(vk::QueryPool, u32)>,
@@ -250,6 +255,8 @@ struct Features {
     mirror_once: bool,
     /// Exact sample counts in occlusion queries.
     precise_occlusion: bool,
+    /// Transform feedback (stream output).
+    transform_feedback: bool,
 }
 
 /// Occlusion queries of draws (see [`Renderer::occlusion_slot`]).
@@ -377,6 +384,8 @@ impl Renderer {
         };
         let push = has(ash::khr::push_descriptor::NAME);
         let maintenance5 = has(ash::khr::maintenance5::NAME);
+        let xfb_ext = has(ash::ext::transform_feedback::NAME);
+        let mut xfb_features = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -387,6 +396,9 @@ impl Renderer {
             .push_next(&mut v13);
         if maintenance5 {
             query = query.push_next(&mut m5);
+        }
+        if xfb_ext {
+            query = query.push_next(&mut xfb_features);
         }
         // SAFETY: a device of this instance; the chain is well formed.
         unsafe { instance.get_physical_device_features2(physical, &mut query) };
@@ -413,6 +425,7 @@ impl Renderer {
             shader_storage_image_write_without_format: have
                 .shader_storage_image_write_without_format,
             shader_image_gather_extended: have.shader_image_gather_extended,
+            tessellation_shader: have.tessellation_shader,
             ..Default::default()
         };
         let features = Features {
@@ -423,6 +436,7 @@ impl Renderer {
             anisotropy: have.sampler_anisotropy == vk::TRUE,
             precise_occlusion: have.occlusion_query_precise == vk::TRUE,
             mirror_once: v12.sampler_mirror_clamp_to_edge == vk::TRUE,
+            transform_feedback: xfb_ext && xfb_features.transform_feedback == vk::TRUE,
         };
         let mut v11_on = vk::PhysicalDeviceVulkan11Features::default()
             .shader_draw_parameters(features.draw_parameters);
@@ -444,6 +458,12 @@ impl Renderer {
         if features.maintenance5 {
             names.push(ash::khr::maintenance5::NAME.as_ptr());
             info = info.push_next(&mut m5_on);
+        }
+        let mut xfb_on =
+            vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default().transform_feedback(true);
+        if features.transform_feedback {
+            names.push(ash::ext::transform_feedback::NAME.as_ptr());
+            info = info.push_next(&mut xfb_on);
         }
         let info = info.enabled_extension_names(&names);
         // SAFETY: a valid device create info for this physical device: only
@@ -515,6 +535,9 @@ impl Renderer {
         let push = features
             .draw
             .then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let xfb = features
+            .transform_feedback
+            .then(|| ash::ext::transform_feedback::Device::new(&instance, &device));
         // SAFETY: a device of this instance.
         let limits = unsafe { instance.get_physical_device_properties(physical) }.limits;
         let uniform_align = limits.min_uniform_buffer_offset_alignment.max(16);
@@ -554,6 +577,7 @@ impl Renderer {
             a8,
             features,
             push,
+            xfb,
             draw: draw::Caches::default(),
             occlusion: None,
             pass: None,
@@ -1185,6 +1209,7 @@ impl Renderer {
                 layout: layout.clone(),
                 views: HashMap::new(),
                 buffer_views: HashMap::new(),
+                counter: None,
             },
         );
         Ok(())
@@ -1201,7 +1226,12 @@ impl Renderer {
                 | U::UNIFORM_TEXEL_BUFFER
                 | U::STORAGE_BUFFER
                 | U::STORAGE_TEXEL_BUFFER
-                | U::INDIRECT_BUFFER,
+                | U::INDIRECT_BUFFER
+                | if self.features.transform_feedback {
+                    U::TRANSFORM_FEEDBACK_BUFFER_EXT
+                } else {
+                    U::empty()
+                },
         );
         // SAFETY: a valid create info on a live device.
         let buffer = unsafe { self.device.create_buffer(&info, None) }?;
@@ -1394,6 +1424,10 @@ impl Renderer {
                 }
                 for view in surface.buffer_views.into_values() {
                     self.device.destroy_buffer_view(view, None);
+                }
+                if let Some((buffer, memory)) = surface.counter {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
                 }
                 match surface.resource {
                     Storage::Buffer { buffer, memory, .. } => {

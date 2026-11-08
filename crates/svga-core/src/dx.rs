@@ -356,6 +356,30 @@ pub struct DepthStencilView {
     pub flags: u8,
 }
 
+/// Bytes of a [`StreamOutputDecl`] in memory.
+pub const STREAM_OUTPUT_DECL_BYTES: usize = 16;
+
+/// The first `count` stream-output declarations of `bytes` (as a MOB of
+/// `DX_BIND_STREAMOUTPUT` holds them; fewer if `bytes` ends first).
+pub fn stream_output_decls(bytes: &[u8], count: usize) -> Vec<StreamOutputDecl> {
+    bytes
+        .chunks_exact(STREAM_OUTPUT_DECL_BYTES)
+        .take(count.min(dx::MAX_STREAMOUT_DECLS))
+        .map(|e| {
+            let mut f = Fields::new(e);
+            StreamOutputDecl {
+                slot: f.u32(),
+                register: f.u32(),
+                mask: f.u8(),
+                stream: {
+                    f.skip(3);
+                    f.u32()
+                },
+            }
+        })
+        .collect()
+}
+
 /// One stream-output declaration (`SVGA3dStreamOutputDeclarationEntry`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamOutputDecl {
@@ -907,6 +931,30 @@ pub enum DxCommand {
         /// Stream sent to the rasterizer.
         rasterized_stream: u32,
     },
+    /// Creates a stream-output object whose declarations come later from
+    /// a MOB (`DX_BIND_STREAMOUTPUT`).
+    DefineStreamOutputMob {
+        /// Object.
+        id: u32,
+        /// Declarations the MOB will hold.
+        declared: u32,
+        /// Bytes per vertex of each target.
+        strides: [u32; dx::MAX_SOTARGETS],
+        /// Stream sent to the rasterizer.
+        rasterized_stream: u32,
+    },
+    /// Gives a stream-output object its declarations: `size` bytes at
+    /// `offset` in a MOB.
+    BindStreamOutput {
+        /// Object.
+        id: u32,
+        /// MOB.
+        mob: u32,
+        /// Byte offset.
+        offset: u32,
+        /// Bytes.
+        size: u32,
+    },
     /// Destroys a stream-output object.
     DestroyStreamOutput {
         /// Object.
@@ -1270,6 +1318,9 @@ fn layout(id: u32) -> Option<(usize, usize, usize)> {
         DX_COND_BIND_ALL_SHADER => none(12),
         // soid, count, 64 declarations of 16 bytes, 4 strides, stream.
         DX_DEFINE_STREAMOUTPUT => none(1052),
+        // soid, entries, strides used, 4 strides, rasterized stream.
+        DX_DEFINE_STREAMOUTPUT_WITH_MOB => none(32),
+        DX_BIND_STREAMOUTPUT => none(16),
         DX_SET_COTABLE | DX_GROW_COTABLE => none(16),
         DX_READBACK_COTABLE => none(8),
         DX_BUFFER_COPY => none(20),
@@ -1974,6 +2025,30 @@ fn decode(id: u32, mut f: Fields<'_>, elements: &[&[u8]]) -> Result<DxCommand, D
                 rasterized_stream: f.u32(),
             }
         }
+        DX_DEFINE_STREAMOUTPUT_WITH_MOB => {
+            let so = f.u32();
+            let declared = f.u32();
+            if usize::try_from(declared).unwrap_or(usize::MAX) > dx::MAX_STREAMOUT_DECLS {
+                return Err(DxError::TooMany {
+                    id,
+                    count: declared,
+                    max: u32::try_from(dx::MAX_STREAMOUT_DECLS).unwrap_or(u32::MAX),
+                });
+            }
+            f.skip(4);
+            C::DefineStreamOutputMob {
+                id: so,
+                declared,
+                strides: [f.u32(), f.u32(), f.u32(), f.u32()],
+                rasterized_stream: f.u32(),
+            }
+        }
+        DX_BIND_STREAMOUTPUT => C::BindStreamOutput {
+            id: f.u32(),
+            mob: f.u32(),
+            offset: f.u32(),
+            size: f.u32(),
+        },
         DX_DESTROY_STREAMOUTPUT => C::DestroyStreamOutput { id: f.u32() },
         DX_SET_STREAMOUTPUT => C::SetStreamOutput { id: f.u32() },
         DX_SET_COTABLE | DX_GROW_COTABLE => {

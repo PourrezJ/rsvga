@@ -22,13 +22,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::decode::{Index, Instruction, Modifier, Operand, Program, Select, Stage};
+use crate::decode::{Index, Instruction, Modifier, Operand, Program, Select, Signatures, Stage};
 use crate::opcode as o;
 use crate::spirv::{Module, Scalar, glsl, op};
 
 mod bits;
 mod geometry;
 mod memory;
+mod tessellation;
+mod xfb;
+
+pub use xfb::Capture;
 
 /// Why a program cannot be translated.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +55,14 @@ pub struct Options {
     pub inputs: [Scalar; 32],
     /// Type of each pixel shader render target (from the view formats).
     pub outputs: [Scalar; 8],
+    /// Stream output of the shader (the last stage before the
+    /// rasterizer).
+    pub stream_output: Vec<Capture>,
+    /// Bytes per vertex of each stream-output buffer.
+    pub so_strides: [u32; 4],
+    /// Dual-source blending: the pixel shader's `o1` is the second color
+    /// of target 0, not a target of its own.
+    pub dual_source: bool,
 }
 
 impl Default for Options {
@@ -58,6 +70,9 @@ impl Default for Options {
         Self {
             inputs: [Scalar::Float; 32],
             outputs: [Scalar::Float; 8],
+            stream_output: Vec::new(),
+            so_strides: [0; 4],
+            dual_source: false,
         }
     }
 }
@@ -172,6 +187,7 @@ const STORAGE_UNIFORM: u32 = 2;
 const STORAGE_OUTPUT: u32 = 3;
 const STORAGE_UNIFORM_CONSTANT: u32 = 0;
 const STORAGE_FUNCTION: u32 = 7;
+const STORAGE_PRIVATE: u32 = 6;
 const DECORATION_BLOCK: u32 = 2;
 const DECORATION_ARRAY_STRIDE: u32 = 6;
 const DECORATION_BUILTIN: u32 = 11;
@@ -180,6 +196,7 @@ const DECORATION_FLAT: u32 = 14;
 const DECORATION_CENTROID: u32 = 16;
 const DECORATION_SAMPLE: u32 = 17;
 const DECORATION_LOCATION: u32 = 30;
+const DECORATION_INDEX: u32 = 32;
 const DECORATION_BINDING: u32 = 33;
 const DECORATION_DESCRIPTOR_SET: u32 = 34;
 const DECORATION_OFFSET: u32 = 35;
@@ -213,6 +230,7 @@ const IMAGE_LOD: u32 = 0x2;
 const IMAGE_GRAD: u32 = 0x4;
 const IMAGE_CONST_OFFSET: u32 = 0x8;
 const IMAGE_OFFSET: u32 = 0x10;
+const IMAGE_SAMPLE: u32 = 0x40;
 
 // Operand types (`VGPU10_OPERAND_TYPE_*`).
 const T_TEMP: u32 = 0;
@@ -258,6 +276,8 @@ enum InputSource {
     /// An array of `vec4`s (geometry shader inputs), of this type, copied
     /// whole into a local array.
     Array(u32, u32),
+    /// A `vec3` float builtin (the tessellation coordinates), w = 0.
+    Float3(u32),
 }
 
 struct Resource {
@@ -324,16 +344,23 @@ struct Tx<'a> {
     vertex_inputs: HashMap<u32, u32>,
     /// Scalar integer outputs (layer, viewport): variable and register.
     int_sinks: Vec<(u32, u32)>,
+    /// Storage class of registers: `Function`, or `Private` when the code
+    /// spans functions.
+    reg_class: u32,
+    /// Tessellation state (hull and domain shaders).
+    tess: tessellation::Tess,
+    /// The signatures appended to the program.
+    signatures: Signatures,
+    /// The output register of the position, and its variable.
+    position_register: Option<u32>,
+    position_var: Option<u32>,
+    /// Stream output variables: variable, register, first component and
+    /// count.
+    xfb_sinks: Vec<(u32, u32, u32, u32)>,
 }
 
 /// Translates `program` to SPIR-V.
 pub fn translate(program: &Program, options: &Options) -> Result<Shader, TranslateError> {
-    if !matches!(
-        program.stage,
-        Stage::Vertex | Stage::Pixel | Stage::Compute | Stage::Geometry
-    ) {
-        return unsupported(format_args!("{:?} shaders", program.stage));
-    }
     // Typed views used by atomics: their declarations need a format.
     let atomic_uavs: HashSet<u32> = program
         .instructions
@@ -385,6 +412,16 @@ pub fn translate(program: &Program, options: &Options) -> Result<Shader, Transla
         geometry: geometry::Geometry::default(),
         vertex_inputs: HashMap::new(),
         int_sinks: Vec::new(),
+        reg_class: if program.stage == Stage::Hull {
+            STORAGE_PRIVATE
+        } else {
+            STORAGE_FUNCTION
+        },
+        tess: tessellation::Tess::default(),
+        signatures: program.signatures.clone(),
+        position_register: None,
+        position_var: None,
+        xfb_sinks: Vec::new(),
     };
     let function = tx.m.id();
     let entry = tx.m.id();
@@ -392,9 +429,17 @@ pub fn translate(program: &Program, options: &Options) -> Result<Shader, Transla
     for i in &program.instructions {
         tx.declare(i)?;
     }
+    tx.declare_captures()?;
     tx.load_inputs();
-    for i in &program.instructions {
-        tx.instruction(i)?;
+    if tx.stage == Stage::Hull {
+        tx.hull_body(program)?;
+    } else {
+        if tx.stage == Stage::Domain {
+            tx.load_patch_constants()?;
+        }
+        for i in &program.instructions {
+            tx.instruction(i)?;
+        }
     }
     if !tx.flow.is_empty() {
         return Err(TranslateError("unterminated if or loop".into()));
@@ -412,10 +457,21 @@ pub fn translate(program: &Program, options: &Options) -> Result<Shader, Transla
             tx.m.capability(CAP_GEOMETRY);
             (geometry::MODEL_GEOMETRY, tx.geometry_modes()?)
         }
+        Stage::Hull => (
+            tessellation::MODEL_TESS_CONTROL,
+            tx.tessellation_modes(true)?,
+        ),
+        Stage::Domain => (
+            tessellation::MODEL_TESS_EVALUATION,
+            tx.tessellation_modes(false)?,
+        ),
         _ => (MODEL_FRAGMENT, vec![vec![MODE_ORIGIN_UPPER_LEFT]]),
     };
     if tx.depth.is_some() {
         modes.push(vec![MODE_DEPTH_REPLACING]);
+    }
+    if !tx.options.stream_output.is_empty() {
+        modes.push(vec![xfb::MODE_XFB]);
     }
     if tx.early_tests && tx.stage == Stage::Pixel {
         modes.push(vec![MODE_EARLY_FRAGMENT_TESTS]);
@@ -504,15 +560,26 @@ impl Tx<'_> {
         var
     }
 
+    /// A register variable of pointer type `p` (of class `reg_class`):
+    /// function-local, or private to the invocation when the shader's code
+    /// spans functions (hull shader phases).
+    fn reg_var(&mut self, p: u32) -> u32 {
+        if self.reg_class == STORAGE_PRIVATE {
+            self.m.global(p, STORAGE_PRIVATE)
+        } else {
+            self.m.local(p)
+        }
+    }
+
     fn register_var(&mut self) -> u32 {
-        let p = self.ptr(STORAGE_FUNCTION, self.f4);
-        self.m.local(p)
+        let p = self.ptr(self.reg_class, self.f4);
+        self.reg_var(p)
     }
 
     // ---- declarations ---------------------------------------------------
 
     fn declare(&mut self, i: &Instruction) -> Result<(), TranslateError> {
-        if self.declare_geometry(i)? {
+        if self.declare_geometry(i)? || self.declare_tessellation(i)? {
             return Ok(());
         }
         let reg = |i: &Instruction| -> Result<u32, TranslateError> {
@@ -541,8 +608,8 @@ impl Tx<'_> {
                     return unsupported(format_args!("indexable temporary of {len} registers"));
                 }
                 let array = self.m.array(self.f4, len);
-                let p = self.ptr(STORAGE_FUNCTION, array);
-                let var = self.m.local(p);
+                let p = self.ptr(self.reg_class, array);
+                let var = self.reg_var(p);
                 self.indexable.insert(reg, (var, len));
             }
             o::DCL_GLOBAL_FLAGS => self.early_tests = i.token & (1 << 13) != 0,
@@ -624,6 +691,9 @@ impl Tx<'_> {
             }
             o::DCL_INPUT | o::DCL_INPUT_PS => {
                 let operand = self.operand(i, 0)?;
+                if self.declare_tessellation_input(operand)? {
+                    return Ok(());
+                }
                 if operand.kind == T_INPUT_PRIMITIVEID {
                     return self.declare_builtin_input(u32::MAX, 7);
                 }
@@ -680,6 +750,9 @@ impl Tx<'_> {
                 self.input_locations.push(r);
             }
             o::DCL_INPUT_SGV | o::DCL_INPUT_SIV | o::DCL_INPUT_PS_SGV | o::DCL_INPUT_PS_SIV => {
+                if self.declare_tessellation_input(self.operand(i, 0)?)? {
+                    return Ok(());
+                }
                 let name = i.raw.first().copied().unwrap_or(0) & 0xffff;
                 if let [Index::Imm(vertices), Index::Imm(r)] =
                     self.operand(i, 0)?.indices.as_slice()
@@ -702,6 +775,14 @@ impl Tx<'_> {
                     return unsupported(format_args!("output operand type {}", operand.kind));
                 }
                 let r = reg(i)?;
+                if self.stage == Stage::Hull {
+                    let name = if i.opcode == o::DCL_OUTPUT {
+                        0
+                    } else {
+                        i.raw.first().copied().unwrap_or(0) & 0xffff
+                    };
+                    return self.declare_hull_output(r, name, u32::from(mask_of(operand)));
+                }
                 if self.outputs.contains_key(&r) {
                     return Ok(());
                 }
@@ -728,9 +809,11 @@ impl Tx<'_> {
                     return Ok(());
                 }
                 let (var, ty) = if name == 1
-                    && matches!(self.stage, Stage::Vertex | Stage::Geometry)
+                    && matches!(self.stage, Stage::Vertex | Stage::Geometry | Stage::Domain)
                 {
                     let var = self.output_var(self.f4, &[&[DECORATION_BUILTIN, BUILTIN_POSITION]]);
+                    self.position_register = Some(r);
+                    self.position_var = Some(var);
                     (var, Scalar::Float)
                 } else {
                     // Other system values travel as plain varyings for now.
@@ -744,8 +827,13 @@ impl Tx<'_> {
                         Scalar::Float
                     };
                     let vty = self.vec(ty);
-                    let var = self.output_var(vty, &[&[DECORATION_LOCATION, r]]);
-                    self.output_locations.push(r);
+                    let var = if self.stage == Stage::Pixel && self.options.dual_source && r == 1 {
+                        // The second color of target 0.
+                        self.output_var(vty, &[&[DECORATION_LOCATION, 0], &[DECORATION_INDEX, 1]])
+                    } else {
+                        self.output_locations.push(r);
+                        self.output_var(vty, &[&[DECORATION_LOCATION, r]])
+                    };
                     (var, ty)
                 };
                 self.output_sinks.push((var, local, ty));
@@ -764,8 +852,8 @@ impl Tx<'_> {
                 let array = self.m.array(self.f4, len);
                 let value = self.m.id();
                 // A constant array, stored into a variable at entry.
-                let p = self.ptr(STORAGE_FUNCTION, array);
-                let var = self.m.local(p);
+                let p = self.ptr(self.reg_class, array);
+                let var = self.reg_var(p);
                 let mut operands = vec![array, value];
                 operands.extend(elements);
                 self.composite_constant(operands);
@@ -807,7 +895,7 @@ impl Tx<'_> {
                 let v = self.input_var(b, &[&[DECORATION_BUILTIN, BUILTIN_FRONT_FACING]]);
                 InputSource::FrontFacing(v)
             }
-            (Stage::Pixel | Stage::Geometry, 7) => {
+            (Stage::Pixel | Stage::Geometry | Stage::Hull | Stage::Domain, 7) => {
                 self.m.capability(CAP_GEOMETRY);
                 let v = self.input_var(
                     int,
@@ -914,6 +1002,17 @@ impl Tx<'_> {
                     self.splat_int(v)
                 }
                 InputSource::Array(var, ty) => self.m.emit(op::LOAD, ty, &[var]),
+                InputSource::Float3(var) => {
+                    let f = self.m.scalar(Scalar::Float);
+                    let f3 = self.m.vector(Scalar::Float, 3);
+                    let v = self.m.emit(op::LOAD, f3, &[var]);
+                    let zero = self.m.constant_f32_bits(0);
+                    let parts: Vec<u32> = (0..3)
+                        .map(|c| self.m.emit(op::COMPOSITE_EXTRACT, f, &[v, c]))
+                        .chain([zero])
+                        .collect();
+                    self.m.emit(op::COMPOSITE_CONSTRUCT, self.f4, &parts)
+                }
                 InputSource::Uint3(var) => {
                     let u = self.m.scalar(Scalar::Uint);
                     let u3 = self.m.vector(Scalar::Uint, 3);
@@ -957,8 +1056,9 @@ impl Tx<'_> {
 
     /// Copies output registers to the interface, then returns.
     fn ret(&mut self) {
-        // Geometry shaders write their outputs at each emit.
-        if self.stage != Stage::Geometry {
+        // Geometry shaders write their outputs at each emit, hull shaders
+        // as they go.
+        if !matches!(self.stage, Stage::Geometry | Stage::Hull) {
             self.write_outputs();
         }
         self.m.emit_void(op::RETURN, &[]);
@@ -985,6 +1085,7 @@ impl Tx<'_> {
             let x = self.m.emit(op::COMPOSITE_EXTRACT, f, &[v, 0]);
             self.m.emit_void(op::STORE, &[var, x]);
         }
+        self.write_captures();
     }
 
     /// Starts a new block (after a terminator).
@@ -1034,6 +1135,9 @@ impl Tx<'_> {
 
     /// A pointer to the `vec4` register an operand names.
     fn register(&mut self, operand: &Operand) -> Result<u32, TranslateError> {
+        if let Some(r) = self.tessellation_register(operand) {
+            return r;
+        }
         let missing =
             |what: &str| TranslateError(format!("{what} {:?} is not declared", operand.indices));
         match operand.kind {
@@ -1088,7 +1192,7 @@ impl Tx<'_> {
                     .get(1)
                     .ok_or_else(|| missing("indexable temporary"))?;
                 let i = self.index(index)?;
-                let p = self.ptr(STORAGE_FUNCTION, self.f4);
+                let p = self.ptr(self.reg_class, self.f4);
                 Ok(self.m.emit(op::ACCESS_CHAIN, p, &[var, i]))
             }
             T_CONSTANT_BUFFER => {
@@ -1115,7 +1219,7 @@ impl Tx<'_> {
                     .first()
                     .ok_or_else(|| missing("immediate constant buffer"))?;
                 let i = self.index(index)?;
-                let p = self.ptr(STORAGE_FUNCTION, self.f4);
+                let p = self.ptr(self.reg_class, self.f4);
                 Ok(self.m.emit(op::ACCESS_CHAIN, p, &[var, i]))
             }
             other => unsupported(format_args!("operand type {other}")),
@@ -1523,16 +1627,21 @@ impl Tx<'_> {
         let Some((dim, coords, _, ms)) = dimension_info(dimension) else {
             return unsupported(format_args!("ld from dimension {dimension}"));
         };
-        if ms {
-            return unsupported("ld_ms");
+        if ms != (i.opcode == o::LD_MS) {
+            return unsupported("ld on a multisampled image, or ld_ms on another");
         }
         let address = self.src(self.operand(i, 1)?, Scalar::Int)?;
         let coord = self.first(address, Scalar::Int, coords);
         let image = self.m.emit(op::LOAD, image_ty, &[var]);
         let rty = self.vec(ret);
         let mut operands = vec![image, coord];
-        if dim != 5 {
-            let int = self.m.scalar(Scalar::Int);
+        let int = self.m.scalar(Scalar::Int);
+        if ms {
+            // ld_ms: the sample index is an operand of its own.
+            let sample = self.src(self.operand(i, 3)?, Scalar::Int)?;
+            let sample = self.m.emit(op::COMPOSITE_EXTRACT, int, &[sample, 0]);
+            operands.extend([IMAGE_SAMPLE, sample]);
+        } else if dim != 5 {
             let lod = self.m.emit(op::COMPOSITE_EXTRACT, int, &[address, 3]);
             operands.extend([IMAGE_LOD, lod]);
         }
@@ -1557,8 +1666,8 @@ impl Tx<'_> {
         let Some((dim, coords, arrayed, ms)) = dimension_info(dimension) else {
             return unsupported(format_args!("resinfo on dimension {dimension}"));
         };
-        if dim == 5 || ms {
-            return unsupported("resinfo on buffers or multisampled images");
+        if dim == 5 {
+            return unsupported("resinfo on buffers");
         }
         // Size components: cube maps report 2, arrays one more.
         let size_n = match dim {
@@ -1566,14 +1675,20 @@ impl Tx<'_> {
             _ => coords,
         };
         let int = self.m.scalar(Scalar::Int);
-        let mip = self.src(self.operand(i, 1)?, Scalar::Int)?;
-        let mip = self.m.emit(op::COMPOSITE_EXTRACT, int, &[mip, 0]);
         let image = self.m.emit(op::LOAD, image_ty, &[var]);
         let size_ty = self.m.vector(Scalar::Int, size_n);
-        let size = self
-            .m
-            .emit(op::IMAGE_QUERY_SIZE_LOD, size_ty, &[image, mip]);
-        let levels = self.m.emit(op::IMAGE_QUERY_LEVELS, int, &[image]);
+        let (size, levels) = if ms {
+            // Multisampled images have one level, and no level to ask about.
+            let size = self.m.emit(op::IMAGE_QUERY_SIZE, size_ty, &[image]);
+            (size, self.m.constant_i32(1))
+        } else {
+            let mip = self.src(self.operand(i, 1)?, Scalar::Int)?;
+            let mip = self.m.emit(op::COMPOSITE_EXTRACT, int, &[mip, 0]);
+            let size = self
+                .m
+                .emit(op::IMAGE_QUERY_SIZE_LOD, size_ty, &[image, mip]);
+            (size, self.m.emit(op::IMAGE_QUERY_LEVELS, int, &[image]))
+        };
         let zero = self.m.constant_i32(0);
         let mut lanes = Vec::new();
         for n in 0..3 {
@@ -1787,7 +1902,7 @@ impl Tx<'_> {
             | o::GATHER4_C
             | o::GATHER4_PO
             | o::GATHER4_PO_C => self.compare_or_gather(i)?,
-            o::LD => self.load(i)?,
+            o::LD | o::LD_MS => self.load(i)?,
             o::RESINFO => self.resinfo(i)?,
             o::LD_RAW | o::LD_STRUCTURED => self.load_words(i)?,
             o::STORE_RAW | o::STORE_STRUCTURED => self.store_words(i)?,

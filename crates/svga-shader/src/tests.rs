@@ -228,10 +228,6 @@ fn corpora() -> Vec<PathBuf> {
     dirs
 }
 
-/// Stages whose translation is still to come: their shaders are counted,
-/// not failed.
-const NOT_YET: [&str; 2] = ["Hull shaders", "Domain shaders"];
-
 #[test]
 fn captured_shaders_translate_and_validate() {
     let dirs = corpora();
@@ -241,7 +237,6 @@ fn captured_shaders_translate_and_validate() {
     }
     let mut failures = Vec::new();
     let mut count = 0;
-    let mut later = 0;
     for dir in &dirs {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -253,7 +248,6 @@ fn captured_shaders_translate_and_validate() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             count += 1;
             match translate_words(&words, &Options::default()) {
-                Err(e) if NOT_YET.iter().any(|s| e.0.contains(s)) => later += 1,
                 Err(e) => failures.push(format!("{name}: {e}")),
                 Ok(shader) => {
                     // RSVGA_SPV_DUMP=DIR keeps the SPIR-V, to inspect it.
@@ -279,7 +273,7 @@ fn captured_shaders_translate_and_validate() {
         failures.len(),
         failures.join("\n")
     );
-    eprintln!("{count} captured shaders: translated and validated, {later} of stages to come");
+    eprintln!("{count} captured shaders translated and validated");
 }
 
 #[test]
@@ -315,4 +309,241 @@ fn a_geometry_shader_emits_a_strip_from_a_point() {
             .count()
     };
     assert_eq!((count(218), count(219)), (2, 1));
+}
+
+/// VMware's signature block: inputs, outputs, patch constants, as
+/// (register, system value, mask).
+fn signatures(
+    inputs: &[(u32, u32, u32)],
+    outputs: &[(u32, u32, u32)],
+    patch: &[(u32, u32, u32)],
+) -> Vec<u32> {
+    let mut words = vec![
+        0x08a9_2d12,
+        inputs.len() as u32,
+        outputs.len() as u32,
+        patch.len() as u32,
+    ];
+    for &(register, name, mask) in inputs.iter().chain(outputs).chain(patch) {
+        words.extend([register, name, mask, 0, 0]);
+    }
+    words
+}
+
+const TRI_EDGES: [(u32, u32, u32); 4] = [(0, 17, 1), (1, 18, 1), (2, 19, 1), (3, 20, 1)];
+
+#[test]
+fn a_hull_shader_runs_its_phases_and_writes_the_levels() {
+    // Triangles of 3 control points, copied through (no control point
+    // phase); a fork phase of 3 instances writes the edges through an
+    // index register, another the inside factor.
+    let x = MASK | (1 << 4);
+    let r0x = operand(0, x, 1);
+    let mut body = vec![
+        instr(op::HS_DECLS, &[]),
+        instr(op::DCL_INPUT_CONTROL_POINT_COUNT | (3 << 11), &[]),
+        instr(op::DCL_OUTPUT_CONTROL_POINT_COUNT | (3 << 11), &[]),
+        instr(op::DCL_TESS_DOMAIN | (2 << 11), &[]),
+        instr(op::DCL_TESS_PARTITIONING | (1 << 11), &[]),
+        instr(op::DCL_TESS_OUTPUT_PRIMITIVE | (3 << 11), &[]),
+        instr(op::HS_FORK_PHASE, &[]),
+        instr(op::DCL_HS_FORK_PHASE_INSTANCE_COUNT, &[3]),
+        instr(op::DCL_INPUT, &[operand(23, 0, 0)]),
+    ];
+    for (r, name) in [(0, 17), (1, 18), (2, 19)] {
+        body.push(instr(op::DCL_OUTPUT_SIV, &[operand(2, x, 1), r, name]));
+    }
+    body.extend([
+        instr(op::DCL_TEMPS, &[1]),
+        instr(op::MOV, &[r0x, 0, operand(23, sel(0), 0)]),
+        // mov o[r0.x].x, l(4.0)
+        instr(
+            op::MOV,
+            &[
+                operand(2, x, 1) | (2 << 22),
+                operand(0, sel(0), 1),
+                0,
+                operand(4, 1, 0),
+                0x4080_0000,
+            ],
+        ),
+        instr(op::RET, &[]),
+        instr(op::HS_FORK_PHASE, &[]),
+        instr(op::DCL_HS_FORK_PHASE_INSTANCE_COUNT, &[1]),
+        instr(op::DCL_OUTPUT_SIV, &[operand(2, x, 1), 3, 20]),
+        instr(
+            op::MOV,
+            &[operand(2, x, 1), 3, operand(4, 1, 0), 0x4080_0000],
+        ),
+        instr(op::RET, &[]),
+    ]);
+    let mut words = program(3, &body);
+    words.extend(signatures(&[(0, 0, 0xf)], &[(0, 0, 0xf)], &TRI_EDGES));
+    let shader = check("hull", &words);
+    assert_eq!(shader.stage, Stage::Hull);
+    let count = |opcode: u32, len: u32| {
+        shader
+            .spirv
+            .iter()
+            .filter(|&&w| w == (len << 16) | opcode)
+            .count()
+    };
+    // Four phase calls (OpFunctionCall: result type, result, function).
+    assert_eq!(count(57, 4), 4, "phase calls");
+    // TessLevelOuter (11) and TessLevelInner (12) are written.
+    let builtins: Vec<u32> = shader
+        .spirv
+        .windows(4)
+        .filter(|w| w[0] == (4 << 16) | 71 && w[2] == 11)
+        .map(|w| w[3])
+        .collect();
+    assert!(
+        builtins.contains(&11) && builtins.contains(&12),
+        "{builtins:?}"
+    );
+}
+
+#[test]
+fn a_domain_shader_reads_the_domain_point_and_control_points() {
+    let all = MASK | (0xf << 4);
+    let r0 = operand(0, all, 1);
+    let mut words = program(
+        4,
+        &[
+            instr(op::DCL_INPUT_CONTROL_POINT_COUNT | (3 << 11), &[]),
+            instr(op::DCL_TESS_DOMAIN | (2 << 11), &[]),
+            instr(op::DCL_INPUT, &[operand(28, MASK | (7 << 4), 0)]),
+            instr(op::DCL_INPUT, &[operand(25, all, 2), 3, 0]),
+            instr(op::DCL_OUTPUT_SIV, &[operand(2, all, 1), 0, SIV_POSITION]),
+            instr(op::DCL_TEMPS, &[1]),
+            // add r0, vicp[2][0], vDomain.xyzx; mov o0, r0
+            instr(
+                op::ADD,
+                &[
+                    r0,
+                    0,
+                    operand(25, SWZ, 2),
+                    2,
+                    0,
+                    operand(28, 2 | (1 << 2) | (0x24 << 4), 0),
+                ],
+            ),
+            instr(op::MOV, &[operand(2, all, 1), 0, operand(0, SWZ, 1), 0]),
+            instr(op::RET, &[]),
+        ],
+    );
+    words.extend(signatures(&[(0, 0, 0xf)], &[(0, 1, 0xf)], &TRI_EDGES));
+    let shader = check("domain", &words);
+    assert_eq!(shader.stage, Stage::Domain);
+    // The TessCoord builtin (13) is read.
+    assert!(
+        shader
+            .spirv
+            .windows(4)
+            .any(|w| w[0] == (4 << 16) | 71 && w[2] == 11 && w[3] == 13),
+        "TessCoord"
+    );
+}
+
+#[test]
+fn stream_output_captures_registers_and_the_position() {
+    // vs: o0 (position) = v0; o1 = v1. Captured: o1.xy at 0 and the
+    // position at 8 in buffer 0 (24-byte vertices).
+    let all = MASK | (0xf << 4);
+    let words = program(
+        1,
+        &[
+            instr(op::DCL_INPUT, &[operand(1, all, 1), 0]),
+            instr(op::DCL_INPUT, &[operand(1, all, 1), 1]),
+            instr(op::DCL_OUTPUT_SIV, &[operand(2, all, 1), 0, SIV_POSITION]),
+            instr(op::DCL_OUTPUT, &[operand(2, all, 1), 1]),
+            instr(op::MOV, &[operand(2, all, 1), 0, operand(1, SWZ, 1), 0]),
+            instr(op::MOV, &[operand(2, all, 1), 1, operand(1, SWZ, 1), 1]),
+            instr(op::RET, &[]),
+        ],
+    );
+    let options = Options {
+        stream_output: vec![
+            Capture {
+                buffer: 0,
+                register: 1,
+                mask: 0x3,
+                offset: 0,
+            },
+            Capture {
+                buffer: 0,
+                register: 0,
+                mask: 0xf,
+                offset: 8,
+            },
+        ],
+        so_strides: [24, 0, 0, 0],
+        ..Options::default()
+    };
+    let shader = translate_words(&words, &options).unwrap();
+    if let Some(result) = validate("xfb", &shader.spirv) {
+        result.unwrap_or_else(|e| panic!("spirv-val: {e}"));
+    }
+    // OpExecutionMode main Xfb, and two Offset decorations.
+    assert!(
+        shader
+            .spirv
+            .windows(3)
+            .any(|w| w[0] == (3 << 16) | 16 && w[2] == 11)
+    );
+    let offsets = shader
+        .spirv
+        .windows(4)
+        .filter(|w| w[0] == (4 << 16) | 71 && w[2] == 35)
+        .count();
+    assert_eq!(offsets, 2);
+    // Other locations are left alone: o1 keeps location 1.
+    assert_eq!(shader.outputs, [1]);
+}
+
+#[test]
+fn multisampled_textures_load_samples_and_report_their_size() {
+    // dcl_resource_texture2dms t0; ld_ms o0, l(1, 2, 0, 0), t0, l(3);
+    // resinfo_uint o0, l(0), t0.
+    let all = MASK | (0xf << 4);
+    let t0 = operand(7, SWZ, 1);
+    let o0 = operand(2, all, 1);
+    let words = program(
+        0,
+        &[
+            instr(op::DCL_RESOURCE | (4 << 11), &[t0, 0, 0x5555]),
+            instr(op::DCL_OUTPUT, &[o0, 0]),
+            instr(
+                op::LD_MS,
+                &[
+                    o0,
+                    0,
+                    operand(4, 2, 0),
+                    1,
+                    2,
+                    0,
+                    0,
+                    t0,
+                    0,
+                    operand(4, 1, 0),
+                    3,
+                ],
+            ),
+            instr(
+                op::RESINFO | (2 << 11),
+                &[o0, 0, operand(4, 1, 0), 0, t0, 0],
+            ),
+            instr(op::RET, &[]),
+        ],
+    );
+    let shader = check("ld_ms", &words);
+    // OpImageFetch (7 words) with the Sample operand (0x40), then
+    // OpImageQuerySize.
+    assert!(
+        shader
+            .spirv
+            .windows(7)
+            .any(|w| w[0] == (7 << 16) | 95 && w[5] == 0x40)
+    );
+    assert!(shader.spirv.contains(&((4 << 16) | 104)));
 }

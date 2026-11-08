@@ -26,7 +26,8 @@ use std::time::Instant;
 
 use svga_core::cotable::{self, Object, QUERY_ACTIVE, QUERY_FINISHED, Query};
 use svga_core::dx::{
-    DxCommand, ScissorRect, ShaderStage, SoTarget, VertexBuffer, Viewport, WHOLE_SIZE,
+    DxCommand, STREAM_OUTPUT_DECL_BYTES, ScissorRect, ShaderStage, SoTarget, VertexBuffer,
+    Viewport, WHOLE_SIZE,
 };
 use svga_core::gb::{GbCommand, ImageId};
 use svga_core::layout::Box3;
@@ -218,6 +219,26 @@ impl Context {
     /// The SPIR-V of shader `id`, once bound (an error: why there is none).
     pub fn shader_spirv(&self, id: u32) -> Option<&Result<Arc<svga_shader::Shader>, String>> {
         self.spirv.get(&id)
+    }
+
+    /// The declarations of stream-output object `id`: its own, or those
+    /// of its MOB.
+    pub fn stream_output_decls(
+        &self,
+        id: u32,
+        gb: &Gb,
+        guest: &GuestMemory,
+    ) -> Result<Vec<svga_core::dx::StreamOutputDecl>, String> {
+        let Some(Object::StreamOutput(so)) = self.object(dx::cotable::STREAMOUTPUT, id) else {
+            return Err(format!("stream output {id} is not defined"));
+        };
+        let Some((mob, offset)) = so.mob else {
+            return Ok(so.decls.clone());
+        };
+        let count = (so.declared as usize).min(dx::MAX_STREAMOUT_DECLS);
+        let mut bytes = vec![0u8; count.saturating_mul(STREAM_OUTPUT_DECL_BYTES)];
+        gb.read_mob(guest, mob, u64::from(offset), &mut bytes)?;
+        Ok(svga_core::dx::stream_output_decls(&bytes, count))
     }
 
     fn query_mut(&mut self, id: u32) -> Result<&mut Query, String> {
@@ -459,6 +480,7 @@ impl DxContexts {
             | C::DefineRasterizerState { .. }
             | C::DefineSamplerState { .. }
             | C::DefineStreamOutput { .. }
+            | C::DefineStreamOutputMob { .. }
             | C::DefineQuery { .. }
             | C::DefineShader { .. }
             | C::DefineUaView { .. }) => {
@@ -659,6 +681,30 @@ impl DxContexts {
                 b.so_targets[..targets.len()].copy_from_slice(&targets);
             }
             C::SetStreamOutput { id } => self.bindings(cid()?)?.stream_output = id,
+            C::BindStreamOutput {
+                id,
+                mob,
+                offset,
+                size,
+            } => {
+                let context = self.context_mut(cid()?)?;
+                match context.tables[dx::cotable::STREAMOUTPUT as usize]
+                    .objects
+                    .get_mut(&id)
+                {
+                    Some(Object::StreamOutput(so)) => {
+                        let needed =
+                            u64::from(so.declared).saturating_mul(STREAM_OUTPUT_DECL_BYTES as u64);
+                        if mob != INVALID_ID && u64::from(size) < needed {
+                            return Err(format!(
+                                "stream output {id}: {size} bytes of declarations"
+                            ));
+                        }
+                        so.mob = (mob != INVALID_ID).then_some((mob, offset));
+                    }
+                    _ => return Err(format!("stream output {id} is not defined")),
+                }
+            }
             C::SetPredication { query, value } => {
                 self.bindings(cid()?)?.predication = (query, value);
             }

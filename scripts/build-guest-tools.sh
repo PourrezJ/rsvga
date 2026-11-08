@@ -26,7 +26,7 @@ for f in "$root"/target/unigine/download/*.exe; do
   [[ -f $f && ! -f $out/$(basename "$f") ]] && cp "$f" "$out/"
 done
 # CRLF line ends for cmd.exe.
-for script in run.cmd diag.cmd info.cmd events.cmd probe.cmd nine.cmd umd.cmd dxg.cmd trace.cmd retrace.cmd ninetest.cmd heaven.cmd heavenrun.cmd modes.cmd reboot.cmd videoprobe.cmd; do
+for script in run.cmd diag.cmd info.cmd events.cmd probe.cmd nine.cmd umd.cmd dxg.cmd trace.cmd retrace.cmd ninetest.cmd heaven.cmd heavenrun.cmd heaveneleven.cmd modes.cmd reboot.cmd videoprobe.cmd; do
   sed 's/$/\r/' "$root/guest/$script" > "$out/$script"
 done
 echo "built $out: d3dprobe.exe, d3dtest.exe, d3d9test.exe, hostcat.exe, wininfo.exe, umdcaps.exe, d3d9trace.exe, modes.exe, videoprobe.exe and their .cmd scripts"
